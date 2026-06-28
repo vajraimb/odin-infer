@@ -1,0 +1,4 @@
+*.gguf
+*.dSYM/
+*.log
+.DS_Store
