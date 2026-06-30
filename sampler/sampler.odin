@@ -19,6 +19,8 @@ Sampler :: struct {
 	temperature: f32,
 	topp:        f32,
 	rng_state:   u64,
+	repeat_penalty: f32,      // 1.0 = off; >1 penalises tokens seen in last_tokens
+	last_tokens:    [dynamic]int, // recent token ids (prompt + generated) to penalise
 }
 
 build_sampler :: proc(s: ^Sampler, vocab_size: int, temperature, topp: f32, rng_seed: u64) {
@@ -26,11 +28,33 @@ build_sampler :: proc(s: ^Sampler, vocab_size: int, temperature, topp: f32, rng_
 	s.temperature = temperature
 	s.topp = topp
 	s.rng_state = rng_seed
+	s.repeat_penalty = 1.0
 	s.probindex = make([]Prob_Index, vocab_size)
+}
+
+// Enable CTRL-style repetition penalty: any token present in the recent window
+// has its logit divided (if positive) or multiplied (if negative) by `penalty`.
+enable_repeat_penalty :: proc(s: ^Sampler, penalty: f32) {
+	p := penalty < 1.0 ? 1.0 : penalty
+	s.repeat_penalty = p
+	if s.last_tokens == nil {
+		s.last_tokens = make([dynamic]int, 0, 128)
+	}
+}
+
+record_token :: proc(s: ^Sampler, token: int, window: int = 64) {
+	if s.repeat_penalty == 1.0 do return
+	append(&s.last_tokens, token)
+	for len(s.last_tokens) > window {
+		ordered_remove(&s.last_tokens, 0)
+	}
 }
 
 free_sampler :: proc(s: ^Sampler) {
 	delete(s.probindex)
+	if s.last_tokens != nil {
+		delete(s.last_tokens)
+	}
 }
 
 random_u32 :: proc(state: ^u64) -> u32 {
@@ -107,6 +131,29 @@ sample_topp :: proc(probabilities: []f32, topp: f32, probindex: []Prob_Index, co
 }
 
 sample :: proc(s: ^Sampler, logits: []f32) -> int {
+	// CTRL repetition penalty: penalise each unique token in the recent window.
+	if s.repeat_penalty != 1.0 && len(s.last_tokens) > 0 {
+		seen := make([dynamic]int, 0, 64, allocator = context.temp_allocator)
+		defer delete(seen)
+		for tok in s.last_tokens {
+			if tok < 0 || tok >= s.vocab_size do continue
+			dup := false
+			for st in seen {
+				if st == tok {
+					dup = true
+					break
+				}
+			}
+			if dup do continue
+			append(&seen, tok)
+			if logits[tok] > 0 {
+				logits[tok] /= s.repeat_penalty
+			} else {
+				logits[tok] *= s.repeat_penalty
+			}
+		}
+	}
+
 	if s.temperature == 0.0 {
 		return sample_argmax(logits)
 	}
