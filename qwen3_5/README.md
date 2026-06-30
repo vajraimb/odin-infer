@@ -5,6 +5,11 @@ Independent Qwen3.5 inference package for the odin-infer library. Targets the
 text-only. Sibling to the Qwen3-only `infer` package; reuses the shared `ggml`
 collection for GGUF parsing and quantized dot products.
 
+> **Porting a new architecture?** Read [`PITFALLS.md`](./PITFALLS.md) first —
+> it logs every bug hit while building this package (RMSNorm baking, `ssm_a`
+> precompute, V-head tiled reorder, Metal buffer zeroing, etc.) with symptoms,
+> root causes, and a checklist.
+
 ## Status
 
 **Validated end-to-end against the real `deepreinforce-ai/Ornith-1.0-9B-GGUF`
