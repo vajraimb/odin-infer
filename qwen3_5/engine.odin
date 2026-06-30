@@ -55,3 +55,29 @@ engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
 engine_config :: proc(e: ^Engine) -> ^Config {
 	return &e.transformer.config
 }
+
+// Reset all position-evolving state (conv_state, recurrent state, KV cache) to
+// zero so a brand-new prompt can be prefilled from pos 0. Needed because the
+// gated-delta recurrent state is not rewindable -- a divergent prompt requires
+// a full recompute from scratch.
+engine_reset_state :: proc(e: ^Engine) {
+	when ODIN_OS == .Darwin {
+		if e.metal_ready {
+			metal_reset_state()
+			return
+		}
+	}
+	s := &e.transformer.state
+	for i in 0 ..< len(s.conv_states) {
+		s.conv_states[i] = 0
+	}
+	for i in 0 ..< len(s.recurrent_states) {
+		s.recurrent_states[i] = 0
+	}
+	for i in 0 ..< len(s.key_cache) {
+		s.key_cache[i] = 0
+	}
+	for i in 0 ..< len(s.value_cache) {
+		s.value_cache[i] = 0
+	}
+}

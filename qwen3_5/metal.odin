@@ -360,6 +360,20 @@ m_b_conv_states, m_b_rec_states: ^MTL.Buffer
 
 metal_ready :: proc() -> bool { return metal_enabled }
 
+// Zero the per-request-evolving GPU state (conv_state, recurrent state, KV
+// cache) so a fresh prompt can be processed from pos 0. Shared Metal buffers
+// are CPU-writable; called between requests (after the previous cmd buffer
+// committed), so no race.
+metal_reset_state :: proc() {
+	if !metal_enabled do return
+	for b in ([]^MTL.Buffer{m_b_conv_states, m_b_rec_states, m_b_kc, m_b_vc}) {
+		s := b->contentsAsSlice([]u8)
+		for i in 0 ..< len(s) {
+			s[i] = 0
+		}
+	}
+}
+
 @(private = "file")
 make_pso :: proc(lib: ^MTL.Library, name: string) -> ^MTL.ComputePipelineState {
 	ns_name := NS.String.alloc()->initWithOdinString(name)
