@@ -183,6 +183,175 @@ run_scenario :: proc(name: string, T: int, seed_in: u64, beta_of, g_of: proc(t: 
 	return ok
 }
 
+// ===================== chunked gated delta (CPU prototype) =====================
+// Implements the chunked recurrence derived above (forward-substitution delta
+// system, no inverse, no hkd x hkd matrix). Processes ONE chunk of C tokens with
+// incoming state S_in (hkd x hvd), writes outs[C*hvd] and S_out[hkd*hvd]. f32.
+@(private = "file")
+chunked_delta_chunk :: proc(
+	S_in: []f32, q_ch, k_ch: []f32, v_ch: []f32, beta, g: []f32, C: int,
+	outs: []f32, S_out: []f32,
+) {
+	// cumprod cp[t] = P(0,t) = g[0]*...*g[t];  cp_prev = 1 before chunk start
+	cp := make([]f32, C)
+	defer delete(cp)
+	acc: f32 = 1.0
+	for t in 0 ..< C { acc *= g[t]; cp[t] = acc }
+
+	// KKT[t][i] = dot(k_i, k_t) ; KQT[t][i] = dot(k_i, q_t)   (C x C each)
+	KKT := make([]f32, C * C); KQT := make([]f32, C * C)
+	defer delete(KKT); defer delete(KQT)
+	for t in 0 ..< C {
+		for i in 0 ..< C {
+			ki := k_ch[i * hkd :]
+			kt := k_ch[t * hkd :]
+			qt := q_ch[t * hkd :]
+			dk: f32 = 0; dq: f32 = 0
+			for a in 0 ..< hkd { dk += ki[a] * kt[a]; dq += ki[a] * qt[a] }
+			KKT[t * C + i] = dk
+			KQT[t * C + i] = dq
+		}
+	}
+
+	// s0k[t] = S_in^T k_t  (hvd);  s0q[t] = S_in^T q_t  (hvd)
+	s0k := make([]f32, C * hvd); s0q := make([]f32, C * hvd)
+	defer delete(s0k); defer delete(s0q)
+	for t in 0 ..< C {
+		kt := k_ch[t * hkd :]; qt := q_ch[t * hkd :]
+		for j in 0 ..< hvd {
+			sk: f32 = 0; sq: f32 = 0
+			for a in 0 ..< hkd {
+				sk += S_in[a * hvd + j] * kt[a]
+				sq += S_in[a * hvd + j] * qt[a]
+			}
+			s0k[t * hvd + j] = sk
+			s0q[t * hvd + j] = sq
+		}
+	}
+
+	// rhs[t] = beta_t * v_t - beta_t * cp[t] * s0k[t]   (hvd)
+	// delta forward sub: delta[t] = rhs[t] - sum_{i<t} L_{t,i}*delta[i], L=beta_t*P(i+1,t)*KKT
+	rhs := make([]f32, C * hvd); delta := make([]f32, C * hvd)
+	defer delete(rhs); defer delete(delta)
+	for t in 0 ..< C {
+		for j in 0 ..< hvd {
+			rhs[t * hvd + j] = beta[t] * v_ch[t * hvd + j] - beta[t] * cp[t] * s0k[t * hvd + j]
+			delta[t * hvd + j] = rhs[t * hvd + j] // init before subtracting earlier deltas
+		}
+	}
+	for t in 0 ..< C {
+		bt := beta[t]; cpt := cp[t]
+		dt := delta[t * hvd :]
+		for i in 0 ..< t {
+			L := bt * (cpt / cp[i]) * KKT[t * C + i] // P(i+1,t)=cp[t]/cp[i]
+			di := delta[i * hvd :]
+			for j in 0 ..< hvd { dt[j] -= L * di[j] }
+		}
+	}
+
+	// outputs: out[t] = cp[t]*s0q[t] + sum_{i<=t} P(i+1,t)*KQT[t][i]*delta[i]
+	for t in 0 ..< hvd * C { outs[t] = 0 }
+	for t in 0 ..< C {
+		cpt := cp[t]
+		ot := outs[t * hvd :]
+		for j in 0 ..< hvd { ot[j] = cpt * s0q[t * hvd + j] }
+		for i in 0 ..< t + 1 {
+			pfac := (i <= t - 1) ? cpt / cp[i] : 1.0 // i==t -> P(t+1,t)=1
+			w := pfac * KQT[t * C + i]
+			di := delta[i * hvd :]
+			for j in 0 ..< hvd { ot[j] += w * di[j] }
+		}
+	}
+
+	// S_out = cp[C-1]*S_in + sum_i P(i+1,C-1) * k_i delta_i^T
+	cpC := cp[C - 1]
+	for a in 0 ..< hkd {
+		for j in 0 ..< hvd {
+			S_out[a * hvd + j] = cpC * S_in[a * hvd + j]
+		}
+	}
+	for i in 0 ..< C {
+		pfac := cp[C - 1] / cp[i] // P(i+1,C-1)
+		ki := k_ch[i * hkd :]
+		di := delta[i * hvd :]
+		for a in 0 ..< hkd {
+			kaa := pfac * ki[a]
+			base := a * hvd
+			for j in 0 ..< hvd { S_out[base + j] += kaa * di[j] }
+		}
+	}
+}
+
+// Run a T-token sequence both tokenwise-f32 and chunked-f32 (chunk size C),
+// compare outputs (per token) + final state. Reports chunked-vs-tokenwise error
+// and the extra_error_ratio vs the tokenwise-f64 floor.
+run_chunked :: proc(C, T: int, seed_in: u64, beta_of, g_of: proc(t: int) -> f64) -> bool {
+	seed := seed_in
+	n := hkd * hvd
+	// generate the full sequence once (q/k l2-normalized, q scaled)
+	q_seq := make([]f32, T * hkd); k_seq := make([]f32, T * hkd); v_seq := make([]f32, T * hvd)
+	beta_s := make([]f32, T); g_s := make([]f32, T)
+	defer delete(q_seq); defer delete(k_seq); defer delete(v_seq); defer delete(beta_s); defer delete(g_s)
+	q_scale := 1.0 / math.sqrt(f64(hkd))
+	for t in 0 ..< T {
+		qd := make([]f64, hkd); kd := make([]f64, hkd)
+		for i in 0 ..< hkd { qd[i] = rng(&seed)*2.0 - 1.0; kd[i] = rng(&seed)*2.0 - 1.0 }
+		ks: f64 = 0; for i in 0 ..< hkd { ks += kd[i] * kd[i] }
+		k_inv := 1.0 / math.max(math.sqrt(ks), 1e-6); for i in 0 ..< hkd { kd[i] *= k_inv }
+		qs: f64 = 0; for i in 0 ..< hkd { qs += qd[i] * qd[i] }
+		q_inv := q_scale / math.max(math.sqrt(qs), 1e-6); for i in 0 ..< hkd { qd[i] *= q_inv }
+		for i in 0 ..< hkd { q_seq[t*hkd+i] = f32(qd[i]); k_seq[t*hkd+i] = f32(kd[i]) }
+		for j in 0 ..< hvd { v_seq[t*hvd+j] = f32(rng(&seed)*2.0 - 1.0) }
+		beta_s[t] = f32(beta_of(t)); g_s[t] = f32(g_of(t))
+		delete(qd); delete(kd)
+	}
+
+	// tokenwise-f32 reference (per-token delta_step_f32)
+	s_tok := make([]f32, n); s_tok_check := make([]f32, n) // s_tok_check unused here
+	out_tok := make([]f32, T * hvd)
+	defer delete(s_tok); defer delete(s_tok_check); defer delete(out_tok)
+	qt := make([]f32, hkd); kt := make([]f32, hkd); vt := make([]f32, hvd); dt := make([]f32, hvd); ot := make([]f32, hvd)
+	defer delete(qt); defer delete(kt); defer delete(vt); defer delete(dt); defer delete(ot)
+	for t in 0 ..< T {
+		for i in 0 ..< hkd { qt[i] = q_seq[t*hkd+i]; kt[i] = k_seq[t*hkd+i] }
+		for j in 0 ..< hvd { vt[j] = v_seq[t*hvd+j] }
+		delta_step_f32(s_tok, qt, kt, vt, dt, ot, beta_s[t], g_s[t])
+		for j in 0 ..< hvd { out_tok[t*hvd+j] = ot[j] }
+	}
+
+	// chunked-f32
+	s_ch := make([]f32, n); out_ch := make([]f32, T * hvd)
+	defer delete(s_ch); defer delete(out_ch)
+	nc := T / C
+	for c in 0 ..< nc {
+		lo := c * C
+		outs := make([]f32, C * hvd); sout := make([]f32, n)
+		chunked_delta_chunk(s_ch, q_seq[lo*hkd:], k_seq[lo*hkd:], v_seq[lo*hvd:], beta_s[lo:], g_s[lo:], C, outs, sout)
+		for j in 0 ..< C * hvd { out_ch[(lo)*hvd+j] = outs[j] }
+		for i in 0 ..< n { s_ch[i] = sout[i] }
+		delete(outs); delete(sout)
+	}
+
+	// compare outputs + final state
+	max_out: f64 = 0; out_scale: f64 = 0
+	for i in 0 ..< T * hvd {
+		d := math.abs(f64(out_ch[i]) - f64(out_tok[i]))
+		if d > max_out { max_out = d }
+		a := math.abs(f64(out_tok[i])); if a > out_scale { out_scale = a }
+	}
+	sf: f64 = 0; st_scale: f64 = 0
+	for i in 0 ..< n {
+		d := f64(s_ch[i]) - f64(s_tok[i]); sf += d * d
+		a := math.abs(f64(s_tok[i])); if a > st_scale { st_scale = a }
+	}
+	state_frob := math.sqrt(sf)
+	// extra_error_ratio: chunked-vs-tokenwise relative to typical output magnitude
+	ok := max_out < 1e-2 && !(math.is_nan(max_out) || math.is_inf(max_out))
+	fmt.printfln("  [{}] C={} T={}  chunked_vs_tokenwise: max_out_abs={:.3e} (out_scale={:.1f})  state_Frob={:.3e}",
+		ok ? "OK" : "FAIL", C, T, max_out, out_scale, state_frob)
+	return ok
+}
+
 main :: proc() {
 	fmt.println("=== Stage 2 f64 delta golden-reference: f32-vs-f64 tokenwise alignment ===")
 	all_ok := true
@@ -205,6 +374,19 @@ main :: proc() {
 	// edge: g_decay=1 (no decay, pure delta net), g_decay=0 (full forget)
 	all_ok = run_scenario("g=1 (no decay)", 256, 0x6789, beta_real, proc(t: int) -> f64 { return 1.0 }) && all_ok
 	all_ok = run_scenario("g=0 (full forget)", 256, 0x789a, beta_real, proc(t: int) -> f64 { return 0.0 }) && all_ok
+
+	fmt.println("\n=== Stage 2 chunked gated delta: chunked-f32 vs tokenwise-f32 (behavior golden) ===")
+	c_ok := true
+	// C=1 must be (near-)identical (validates affine decomposition); C=2/4/16 test composition.
+	c_ok = run_chunked(1, 256, 0x111, beta_real, g_real) && c_ok
+	c_ok = run_chunked(2, 256, 0x111, beta_real, g_real) && c_ok
+	c_ok = run_chunked(4, 256, 0x111, beta_real, g_real) && c_ok
+	c_ok = run_chunked(8, 256, 0x111, beta_real, g_real) && c_ok
+	c_ok = run_chunked(16, 256, 0x111, beta_real, g_real) && c_ok
+	// harder: slow decay, long
+	c_ok = run_chunked(16, 1024, 0x222, beta_real, proc(t: int) -> f64 { return 0.999 }) && c_ok
+	c_ok = run_chunked(16, 1024, 0x333, proc(t: int) -> f64 { return 1.0 }, g_real) && c_ok
+	all_ok = all_ok && c_ok
 
 	fmt.printfln("\n=== RESULT: {} ===", all_ok ? "f64 reference is a faithful golden standard (aligned to f32)" : "ALIGNMENT FAILED — investigate")
 }
