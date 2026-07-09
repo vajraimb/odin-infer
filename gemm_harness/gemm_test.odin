@@ -129,6 +129,156 @@ kernel void gemm_q4k_f32(
     simdgroup_store(acc, C + (ulong)row0 * N + col0, N);
 }
 
+// ===================== Q4_K MMQ v2: multi-simdgroup + TG staging =====================
+// Threadgroup = 4 simdgroups (128 threads). Computes a BM=32 (M-rows) x BN=8
+// (N-cols) output tile. sa[32x32] = dequantized A (shared across the 4 M-row
+// simdgroups); sb[32x8] = B activation tile (loaded once, shared). Dequant cost
+// is amortized over 4x more output rows than the 1-sg/tile v1.
+kernel void gemm_q4k_f32_v2(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[32 * 32];   // [32 rows x 32 cols], stride 32 (dequant A)
+    threadgroup half sb[32 * 8];    // [32 K-rows x 8 N-cols], stride 8 (B)
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;  // this simdgroup owns M-rows [sg_row:sg_row+8]
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint t = tiitg; t < 32 * 32; t += 128) {           // dequant sa cooperatively
+            uint row = t >> 5, col = t & 31, e = k + col;
+            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e / 256) * 144;
+            sa[t] = (half)k4_dequant_elem(blk, e & 255);
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {            // load sb from global half B
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {                       // 4 K-tiles of 8x8
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// v3: same tile/staging as v2, but the dequant reads each block ONCE per thread
+// and computes the Q4_K scale/min ONCE per 8-element chunk (all 8 share one
+// super-block half -> one scale). ~32x fewer scale computations than v2.
+kernel void gemm_q4k_f32_v3(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // dequant sa[32 x 32]: 128 threads = 4 per row; each thread owns 8 cols
+        // (col_base = (tid%4)*8) and they all share one Q4_K super-block half.
+        for (uint tt = 0; tt < 1; tt++) {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;     // 0..31, 0/8/16/24
+            uint e_base = k + col_base;
+            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
+            int sup = int(e_base & 255) >> 6;                        // (e%256)/64
+            int hf = (int(e_base & 255) >> 5) & 1;                   // (e%256)%64 / 32
+            int is = sup * 2 + hf;
+            float d = (float)(*(device const half *)(blk));
+            float dmin = (float)(*(device const half *)(blk + 2));
+            device const uchar * scales = blk + 4;
+            device const uchar * qs = blk + 16;
+            uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+            float dl = d * (float)sc, ml = dmin * (float)m;
+            int qoff = sup * 32, shift = 4 * hf;
+            for (uint j = 0; j < 8; j++) {
+                uchar nib = (qs[qoff + col_base + j] >> shift) & 0xF;
+                sa[row * 32 + col_base + j] = (half)(dl * (float)nib - ml);
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// v3 Q6_K: multi-simdgroup + TG staging + 1 scale per 8-element chunk (Q6_K has
+// no min; hf/sub/is are constant across a chunk -> one scale). Matches v1 bit-for-bit.
+kernel void gemm_q6k_f32_v3(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 210;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint tt = 0; tt < 1; tt++) {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            uint e_base = k + col_base;
+            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 210;
+            int ew = int(e_base & 255);
+            int hf = ew >> 7, sub = (ew >> 5) & 3, is = (ew >> 4) & 1; // = within/32, l/16 (constant over chunk)
+            float d = (float)(*(device const half *)(blk + 208));
+            device const uchar * ql = blk;
+            device const uchar * qh = blk + 128;
+            device const char  * sc = (device const char *)(blk + 192);
+            float dl = d * (float)sc[hf * 8 + is + 2 * sub];
+            int qloff = hf * 64, qhoff = hf * 32;
+            for (uint j = 0; j < 8; j++) {
+                int l = int(col_base) + int(j);
+                int q;
+                if (sub == 0)      q = ((ql[qloff + l]      & 0xF) | (((qh[qhoff + l] >> 0) & 3) << 4)) - 32;
+                else if (sub == 1) q = ((ql[qloff + l + 32] & 0xF) | (((qh[qhoff + l] >> 2) & 3) << 4)) - 32;
+                else if (sub == 2) q = ((ql[qloff + l] >> 4)       | (((qh[qhoff + l] >> 4) & 3) << 4)) - 32;
+                else               q = ((ql[qloff + l + 32] >> 4)  | (((qh[qhoff + l] >> 6) & 3) << 4)) - 32;
+                sa[row * 32 + col_base + j] = (half)(dl * (float)q);
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
 // ===================== Q6_K MMQ (ffn_down / output / qkv are Q6_K) =====================
 inline float k6_dequant_elem(device const uchar * blk, int e) {
     float d = (float)(*(device const half *)(blk + 208));
@@ -200,8 +350,11 @@ g_pso: ^MTL.ComputePipelineState
 @(private = "file")
 g_pso_k16: ^MTL.ComputePipelineState  // diagnostic: K-step 16
 @(private = "file")
-g_pso_q4k: ^MTL.ComputePipelineState  // Q4_K MMQ
+g_pso_q4k: ^MTL.ComputePipelineState  // Q4_K MMQ (1-sg/tile)
+g_pso_q4k_v2: ^MTL.ComputePipelineState // Q4_K MMQ (4-sg/tg + TG staging)
+g_pso_q4k_v3: ^MTL.ComputePipelineState // Q4_K MMQ (v2 + dequant: 1 scale/8 elems)
 g_pso_q6k: ^MTL.ComputePipelineState  // Q6_K MMQ
+g_pso_q6k_v3: ^MTL.ComputePipelineState // Q6_K MMQ v3 (tuned)
 
 GemmDims :: struct {
 	M, N, K: u32,
@@ -290,6 +443,22 @@ setup_metal :: proc() -> bool {
 		return false
 	}
 	g_pso_q4k = pso3
+	fn3b := lib->newFunctionWithName(NS.String.alloc()->initWithOdinString("gemm_q4k_f32_v2"))
+	defer fn3b->release()
+	pso3b, err3b := g_dev->newComputePipelineStateWithFunction(fn3b)
+	if err3b != nil {
+		fmt.eprintfln("metal: q4k_v2 pipeline failed: %s", err3b->localizedDescription()->odinString())
+		return false
+	}
+	g_pso_q4k_v2 = pso3b
+	fn3c := lib->newFunctionWithName(NS.String.alloc()->initWithOdinString("gemm_q4k_f32_v3"))
+	defer fn3c->release()
+	pso3c, err3c := g_dev->newComputePipelineStateWithFunction(fn3c)
+	if err3c != nil {
+		fmt.eprintfln("metal: q4k_v3 pipeline failed: %s", err3c->localizedDescription()->odinString())
+		return false
+	}
+	g_pso_q4k_v3 = pso3c
 	fn4 := lib->newFunctionWithName(NS.String.alloc()->initWithOdinString("gemm_q6k_f32"))
 	defer fn4->release()
 	pso4, err4 := g_dev->newComputePipelineStateWithFunction(fn4)
@@ -298,6 +467,14 @@ setup_metal :: proc() -> bool {
 		return false
 	}
 	g_pso_q6k = pso4
+	fn4b := lib->newFunctionWithName(NS.String.alloc()->initWithOdinString("gemm_q6k_f32_v3"))
+	defer fn4b->release()
+	pso4b, err4b := g_dev->newComputePipelineStateWithFunction(fn4b)
+	if err4b != nil {
+		fmt.eprintfln("metal: q6k_v3 pipeline failed: %s", err4b->localizedDescription()->odinString())
+		return false
+	}
+	g_pso_q6k_v3 = pso4b
 	return true
 }
 
@@ -542,6 +719,91 @@ run_q4k :: proc(bufA, bufB, bufC: ^MTL.Buffer, M, N, K: int) {
 	cmd->waitUntilCompleted()
 }
 
+@(private = "file")
+run_q4k_v2 :: proc(bufA, bufB, bufC: ^MTL.Buffer, M, N, K: int) {
+	cmd := g_queue->commandBuffer()
+	enc := cmd->computeCommandEncoder()
+	enc->setComputePipelineState(g_pso_q4k_v2)
+	enc->setBuffer(bufA, 0, 0); enc->setBuffer(bufB, 0, 1); enc->setBuffer(bufC, 0, 2)
+	dims := GemmDims{u32(M), u32(N), u32(K)}
+	enc->setBytes(bytes_of(&dims, size_of(GemmDims)), 3)
+	// grid: N/8 (x) x M/32 (y); 4 simdgroups = 128 threads/tg
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 32), 1}, MTL.Size{128, 1, 1})
+	enc->endEncoding(); cmd->commit(); cmd->waitUntilCompleted()
+}
+
+@(private = "file")
+run_q4k_v3 :: proc(bufA, bufB, bufC: ^MTL.Buffer, M, N, K: int) {
+	cmd := g_queue->commandBuffer()
+	enc := cmd->computeCommandEncoder()
+	enc->setComputePipelineState(g_pso_q4k_v3)
+	enc->setBuffer(bufA, 0, 0); enc->setBuffer(bufB, 0, 1); enc->setBuffer(bufC, 0, 2)
+	dims := GemmDims{u32(M), u32(N), u32(K)}
+	enc->setBytes(bytes_of(&dims, size_of(GemmDims)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 32), 1}, MTL.Size{128, 1, 1})
+	enc->endEncoding(); cmd->commit(); cmd->waitUntilCompleted()
+}
+
+// v1-vs-v2: correctness (v2 vs CPU ref) + head-to-head perf on the same data.
+q4k_v2_compare :: proc(name: string, M, N, K: int, seed_in: u32, tol: f64) -> bool {
+	nb := K / 256
+	a_bytes := make([]u8, M * nb * 144)
+	b_h := make([]f16, K * N)
+	defer delete(a_bytes); defer delete(b_h)
+	seed := seed_in
+	for b in 0 ..< M * nb {
+		base := b * 144
+		write_f16_le(a_bytes, base, rng_f(&seed)*0.18 + 0.02)
+		write_f16_le(a_bytes, base + 2, rng_f(&seed)*0.05)
+		for s in 0 ..< 12 { a_bytes[base + 4 + s] = u8(rng_f(&seed) * 256.0) }
+		for q in 0 ..< 128 { a_bytes[base + 16 + q] = u8(rng_f(&seed) * 256.0) }
+	}
+	for i in 0 ..< K * N { b_h[i] = f16(rng_f(&seed)*2.0 - 1.0) }
+	a_ref := make([]f32, M * K); defer delete(a_ref)
+	ggml.dequant_row(.Q4_K, a_bytes, M * K, a_ref)
+	for i in 0 ..< M * K { a_ref[i] = f32(f16(a_ref[i])) }
+	b_ref := make([]f32, K * N); defer delete(b_ref)
+	for i in 0 ..< K * N { b_ref[i] = f32(b_h[i]) }
+	c_ref := make([]f64, M * N); defer delete(c_ref)
+	for m in 0 ..< M { for n in 0 ..< N { s: f64 = 0; for k in 0 ..< K { s += f64(a_ref[m*K+k]) * f64(b_ref[k*N+n]) }; c_ref[m*N+n] = s } }
+	bufA := new_buf(M * nb * 144); bufB := new_buf(K * N * 2); bufC1 := new_buf(M * N * 4); bufC2 := new_buf(M * N * 4)
+	defer bufA->release(); defer bufB->release(); defer bufC1->release(); defer bufC2->release()
+	copy_bytes(bufA, a_bytes); copy_to(bufB, b_h)
+	// correctness: v2 vs CPU ref
+	run_q4k_v2(bufA, bufB, bufC2, M, N, K)
+	c2 := bufC2->contentsAsSlice([]f32)[: M * N]
+	max_abs, scale: f64 = 0, 0
+	for i in 0 ..< M * N {
+		d := math.abs(f64(c2[i]) - c_ref[i]); if d > max_abs { max_abs = d }
+		a := math.abs(c_ref[i]); if a > scale { scale = a }
+	}
+	scaled := scale > 1e-6 ? max_abs / scale : max_abs
+	correct := scaled <= tol
+	// v1-vs-v2 max diff (should be ~0: same math, same half staging)
+	run_q4k(bufA, bufB, bufC1, M, N, K)
+	c1 := bufC1->contentsAsSlice([]f32)[: M * N]
+	vdiff: f64 = 0
+	for i in 0 ..< M * N { d := math.abs(f64(c1[i]) - f64(c2[i])); if d > vdiff { vdiff = d } }
+	// perf head-to-head
+	perf :: proc(bufA, bufB, bufC: ^MTL.Buffer, M, N, K: int, run: proc(bA, bB, bC: ^MTL.Buffer, m, n, k: int), iters: int) -> f64 {
+		for _ in 0 ..< 3 { run(bufA, bufB, bufC, M, N, K) }
+		best: time.Duration = cast(time.Duration)0x7FFFFFFFFFFFFFFF
+		for _ in 0 ..< iters { t0 := time.tick_now(); run(bufA, bufB, bufC, M, N, K); dt := time.tick_since(t0); if dt < best { best = dt } }
+		return f64(2) * f64(M) * f64(N) * f64(K) / (f64(i64(best)) / 1e9) / 1e9
+	}
+	g1 := perf(bufA, bufB, bufC1, M, N, K, run_q4k, 10)
+	g2 := perf(bufA, bufB, bufC2, M, N, K, run_q4k_v2, 10)
+	// v3
+	run_q4k_v3(bufA, bufB, bufC2, M, N, K)
+	c3 := bufC2->contentsAsSlice([]f32)[: M * N]
+	v3diff: f64 = 0
+	for i in 0 ..< M * N { d := math.abs(f64(c1[i]) - f64(c3[i])); if d > v3diff { v3diff = d } }
+	g3 := perf(bufA, bufB, bufC2, M, N, K, run_q4k_v3, 10)
+	fmt.printfln("  [{}] {} M={} N={} K={}  scaled={:.2e}  v1={:.0f} v2={:.0f} v3={:.0f} GFLOPS  v3v1_diff={:.2e} ({:.2f}x)",
+		correct ? "OK" : "FAIL", name, M, N, K, scaled, g1, g2, g3, v3diff, g3 / max(g1, 1e-9))
+	return correct
+}
+
 q4k_test :: proc(name: string, M, N, K: int, seed_in: u32, tol: f64) -> bool {
 	nb := K / 256
 	a_bytes := make([]u8, M * nb * 144)
@@ -682,6 +944,69 @@ run_q6k :: proc(bufA, bufB, bufC: ^MTL.Buffer, M, N, K: int) {
 	enc->endEncoding(); cmd->commit(); cmd->waitUntilCompleted()
 }
 
+@(private = "file")
+run_q6k_v3 :: proc(bufA, bufB, bufC: ^MTL.Buffer, M, N, K: int) {
+	cmd := g_queue->commandBuffer()
+	enc := cmd->computeCommandEncoder()
+	enc->setComputePipelineState(g_pso_q6k_v3)
+	enc->setBuffer(bufA, 0, 0); enc->setBuffer(bufB, 0, 1); enc->setBuffer(bufC, 0, 2)
+	dims := GemmDims{u32(M), u32(N), u32(K)}
+	enc->setBytes(bytes_of(&dims, size_of(GemmDims)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 32), 1}, MTL.Size{128, 1, 1})
+	enc->endEncoding(); cmd->commit(); cmd->waitUntilCompleted()
+}
+
+// Q6_K v1-vs-v3: correctness (v3 vs CPU ref) + head-to-head perf + v3v1 diff.
+q6k_v3_compare :: proc(name: string, M, N, K: int, seed_in: u32, tol: f64) -> bool {
+	nb := K / 256
+	a_bytes := make([]u8, M * nb * 210)
+	b_h := make([]f16, K * N)
+	defer delete(a_bytes); defer delete(b_h)
+	seed := seed_in
+	for b in 0 ..< M * nb {
+		base := b * 210
+		write_f16_le(a_bytes, base + 208, rng_f(&seed)*0.18 + 0.02)
+		for i in 0 ..< 128 { a_bytes[base + i] = u8(rng_f(&seed) * 256.0) }
+		for i in 0 ..< 64 { a_bytes[base + 128 + i] = u8(rng_f(&seed) * 256.0) }
+		for i in 0 ..< 16 { a_bytes[base + 192 + i] = u8(rng_f(&seed) * 256.0) }
+	}
+	for i in 0 ..< K * N { b_h[i] = f16(rng_f(&seed)*2.0 - 1.0) }
+	a_ref := make([]f32, M * K); defer delete(a_ref)
+	ggml.dequant_row(.Q6_K, a_bytes, M * K, a_ref)
+	for i in 0 ..< M * K { a_ref[i] = f32(f16(a_ref[i])) }
+	b_ref := make([]f32, K * N); defer delete(b_ref)
+	for i in 0 ..< K * N { b_ref[i] = f32(b_h[i]) }
+	c_ref := make([]f64, M * N); defer delete(c_ref)
+	for m in 0 ..< M { for n in 0 ..< N { s: f64 = 0; for k in 0 ..< K { s += f64(a_ref[m*K+k]) * f64(b_ref[k*N+n]) }; c_ref[m*N+n] = s } }
+	bufA := new_buf(M * nb * 210); bufB := new_buf(K * N * 2); bufC1 := new_buf(M * N * 4); bufC2 := new_buf(M * N * 4)
+	defer bufA->release(); defer bufB->release(); defer bufC1->release(); defer bufC2->release()
+	copy_bytes(bufA, a_bytes); copy_to(bufB, b_h)
+	run_q6k_v3(bufA, bufB, bufC2, M, N, K)
+	c2 := bufC2->contentsAsSlice([]f32)[: M * N]
+	max_abs, scale: f64 = 0, 0
+	for i in 0 ..< M * N {
+		d := math.abs(f64(c2[i]) - c_ref[i]); if d > max_abs { max_abs = d }
+		a := math.abs(c_ref[i]); if a > scale { scale = a }
+	}
+	scaled := scale > 1e-6 ? max_abs / scale : max_abs
+	correct := scaled <= tol
+	run_q6k(bufA, bufB, bufC1, M, N, K)
+	c1 := bufC1->contentsAsSlice([]f32)[: M * N]
+	v3diff: f64 = 0
+	for i in 0 ..< M * N { d := math.abs(f64(c1[i]) - f64(c2[i])); if d > v3diff { v3diff = d } }
+	perf :: proc(bufA, bufB, bufC: ^MTL.Buffer, M, N, K: int, run: proc(bA, bB, bC: ^MTL.Buffer, m, n, k: int), iters: int) -> f64 {
+		for _ in 0 ..< 3 { run(bufA, bufB, bufC, M, N, K) }
+		best: time.Duration = cast(time.Duration)0x7FFFFFFFFFFFFFFF
+		for _ in 0 ..< iters { t0 := time.tick_now(); run(bufA, bufB, bufC, M, N, K); dt := time.tick_since(t0); if dt < best { best = dt } }
+		return f64(2) * f64(M) * f64(N) * f64(K) / (f64(i64(best)) / 1e9) / 1e9
+	}
+	g1 := perf(bufA, bufB, bufC1, M, N, K, run_q6k, 10)
+	g3 := perf(bufA, bufB, bufC2, M, N, K, run_q6k_v3, 10)
+	fmt.printfln("  [{}] {} M={} N={} K={}  scaled={:.2e}  v1={:.0f} v3={:.0f} GFLOPS  v3v1_diff={:.2e} ({:.2f}x)",
+		correct ? "OK" : "FAIL", name, M, N, K, scaled, g1, g3, v3diff, g3 / max(g1, 1e-9))
+	return correct
+}
+
 q6k_test :: proc(name: string, M, N, K: int, seed_in: u32, tol: f64) -> bool {
 	nb := K / 256
 	a_bytes := make([]u8, M * nb * 210)
@@ -766,8 +1091,21 @@ main :: proc() {
 	q6 = q6k_test("Q6K 4096x64x12288 (w2 shape)", 4096, 64, 12288, 0x703, 1e-2) && q6
 	all_ok = all_ok && q6
 
+	fmt.println("\n=== Q6_K MMQ tile-tuning: v1 (1-sg/tile) vs v3 (4-sg/tg + tuned dequant) ===")
+	v3q6 := true
+	v3q6 = q6k_v3_compare("Q6K 256x64x4096", 256, 64, 4096, 0x901, 5e-3) && v3q6
+	v3q6 = q6k_v3_compare("Q6K 4096x64x12288 (w2 shape)", 4096, 64, 12288, 0x902, 1e-2) && v3q6
+	all_ok = all_ok && v3q6
+
 	fmt.println("\n=== Q4_K MMQ perf ===")
 	q4k_perf("real prefill projection", 4096, 64, 4096, 10)
+
+	fmt.println("\n=== Q4_K MMQ tile-tuning: v1 (1-sg/tile) vs v2 (4-sg/tg + TG staging) ===")
+	v2ok := true
+	v2ok = q4k_v2_compare("Q4K 256x64x4096", 256, 64, 4096, 0x801, 5e-3) && v2ok
+	v2ok = q4k_v2_compare("Q4K 4096x64x4096 (w1 shape)", 4096, 64, 4096, 0x802, 1e-2) && v2ok
+	v2ok = q4k_v2_compare("Q4K 12288x64x4096 (hidden x T)", 12288, 64, 4096, 0x803, 1e-2) && v2ok
+	all_ok = all_ok && v2ok
 
 	fmt.println("\n=== perf (Stage 1a F16 target >= 300 GFLOPS) ===")
 	perf_test("prefill projection shape", 4096, 64, 4096, 20)
