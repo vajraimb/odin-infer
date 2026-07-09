@@ -643,6 +643,14 @@ m_device: ^MTL.Device
 @(private = "file")
 m_queue: ^MTL.CommandQueue
 @(private = "file")
+g_fast_math: bool    // shader fast-math (env QFASTMATH=0 to disable for precision debugging)
+@(private = "file")
+g_timing: bool       // print per-prefill GPU ms (env QTIMING=1)
+@(private = "file")
+g_prof_nolin: bool   // ablation: skip linear-layer per-token stateful loop (env QPROF_NOLIN=1; output garbage, GPU time valid)
+@(private = "file")
+g_prof_nofull: bool  // ablation: skip full-attention per-token block (env QPROF_NOFULL=1)
+@(private = "file")
 m_weights: ^MTL.Buffer
 @(private = "file")
 m_mmap_base: uintptr
@@ -792,9 +800,22 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	fmt.printf("metal: %s\n", m_device->name()->odinString())
 	m_queue = m_device->newCommandQueue()
 
+	// profiling/debug toggles (env). QFASTMATH=0 -> precise shaders (for f32 drift
+	// debugging, e.g. the Stage 2 chunked-delta C=16 case). QTIMING=1 -> per-prefill
+	// GPU ms. QPROF_NOLIN=1 -> ablation: skip linear-layer per-token stateful loop.
+	g_fast_math = os.get_env("QFASTMATH", context.temp_allocator) != "0"
+	g_timing = os.get_env("QTIMING", context.temp_allocator) == "1"
+	g_prof_nolin = os.get_env("QPROF_NOLIN", context.temp_allocator) == "1"
+	g_prof_nofull = os.get_env("QPROF_NOFULL", context.temp_allocator) == "1"
+	fmt.printfln("metal: shader fastMath={} (QFASTMATH=0 to disable)", g_fast_math)
+	fmt.printfln("metal: maxThreadgroupMemoryLength={} bytes", m_device->maxThreadgroupMemoryLength())
+
 	src := NS.String.alloc()->initWithOdinString(MSL_SRC)
 	defer src->release()
-	lib, err := m_device->newLibraryWithSource(src, nil)
+	opts := MTL.CompileOptions.alloc()->init()
+	defer opts->release()
+	opts->setFastMathEnabled(g_fast_math)
+	lib, err := m_device->newLibraryWithSource(src, opts)
 	if err != nil {
 		fmt.eprintfln("metal: shader compile failed: %s", err->localizedDescription()->odinString())
 		return false
@@ -1309,6 +1330,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			slot := transformer.full_slot[l]
 			kv_loff := NS.UInteger(slot) * kv_layer_bytes
 			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
+			if !g_prof_nofull { // QPROF_NOFULL ablation
 			for t in 0 ..< T {
 				pos := pos_start + t
 				oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
@@ -1348,6 +1370,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
 				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
 			}
+			} // end QPROF_NOFULL guard
 			// batched wo -> residual
 			enc_proj_fwd(enc, fa.wo.kind, raw_data(fa.wo.data), m_b_xb3t, dim, T, att_head_dim, m_b_xb2t)
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
@@ -1368,6 +1391,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			// bit-identical, and C=16 had an unresolved failure. It is reverted to the
 			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
+			if !g_prof_nolin { // QPROF_NOLIN ablation: skip to measure linear per-token stateful share
 			for t in 0 ..< T {
 				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
 				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim)
@@ -1398,6 +1422,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
+			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, T, kernel)
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
@@ -1424,5 +1449,12 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 	enc->endEncoding()
 	cmd->commit()
 	cmd->waitUntilCompleted()
+	if g_timing {
+		gpu_ms := f64(cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0
+		tag := ""
+		if g_prof_nolin { tag = " [QPROF_NOLIN]" }
+		if g_prof_nofull { tag = " [QPROF_NOFULL]" }
+		fmt.eprintfln("[timing] forward_gpu_batch T={} GPU={:.2f} ms ({:.2f} ms/tok){}", len(tokens), gpu_ms, gpu_ms / f64(len(tokens)), tag)
+	}
 	return m_b_logits->contentsAsSlice([]f32)[:p.vocab_size]
 }
