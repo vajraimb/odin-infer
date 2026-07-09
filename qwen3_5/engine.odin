@@ -52,6 +52,49 @@ engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
 	return forward(&e.transformer, token, pos)
 }
 
+// Batched prefill (Metal only): process `tokens` from position `pos`, batching
+// the MLP projections. Chunks into <=MAX_BATCH_T blocks (multiples of 8); the
+// trailing 1-7 tokens run through the per-token path. Returns the logits for the
+// LAST token (the one used to predict the next token). CPU path falls back to
+// per-token forward.
+engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
+	when ODIN_OS == .Darwin {
+		if e.metal_ready {
+			i := 0
+			n := len(tokens)
+			logits: []f32 = nil
+			for i < n {
+				rem := n - i
+				if rem >= 8 {
+					chunk := min(MAX_BATCH_T, rem)
+					chunk -= chunk % 8
+					logits = forward_gpu_batch(&e.transformer, tokens[i : i + chunk], pos_start + i)
+					i += chunk
+				} else {
+					logits = forward_gpu(&e.transformer, tokens[i], pos_start + i)
+					i += 1
+				}
+			}
+			return logits
+		}
+	}
+	// CPU fallback: per-token
+	logits: []f32 = nil
+	for t in 0 ..< len(tokens) {
+		logits = forward(&e.transformer, tokens[t], pos_start + t)
+	}
+	return logits
+}
+
+// Max tokens the Metal batch path handles per chunk (multiples of 8). 0 on CPU.
+engine_batch_max :: proc() -> int {
+	when ODIN_OS == .Darwin {
+		return MAX_BATCH_T
+	} else {
+		return 0
+	}
+}
+
 engine_config :: proc(e: ^Engine) -> ^Config {
 	return &e.transformer.config
 }

@@ -18,6 +18,7 @@ import MTL "vendor:darwin/Metal"
 PAGE_SIZE :: 16384
 GEMV_ROWS :: 8
 GEMV_TG :: 256
+MAX_BATCH_T :: 512 // max tokens per batched-prefill chunk (Stage 1a)
 
 MSL_SRC := `
 #include <metal_stdlib>
@@ -325,6 +326,120 @@ kernel void rmsnorm_gated(device float *out [[buffer(0)]], device const float *i
         oi[j] = normed * gz;
     }
 }
+
+// ---------- batched prefill: Q4_K MMQ + helpers (BATCHED_PREFILL Stage 1a) ----------
+// Q4_K dequant matches ggml dequant_q4_k (ggml/quant.odin) exactly.
+inline void k4_get_scale_min(int j, device const uchar * q, thread uchar & d, thread uchar & m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+inline float k4_dequant_elem(device const uchar * blk, int e) {
+    float d = (float)(*(device const half *)(blk));
+    float dmin = (float)(*(device const half *)(blk + 2));
+    device const uchar * scales = blk + 4;
+    device const uchar * qs = blk + 16;
+    int sup = e >> 6, ws = e & 63, hf = ws >> 5, l = ws & 31;
+    int is = sup * 2 + hf, qoff = sup * 32;
+    uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+    uchar nib = (qs[qoff + l] >> (4 * hf)) & 0xF;
+    return d * (float)sc * (float)nib - dmin * (float)m;
+}
+struct GemmDims { uint M; uint N; uint K; };
+// C[M,N] = A[M,K](Q4_K) @ B[K,N](half). A row r at A + r*(K/256)*144. M,N,K % 8, K % 256.
+kernel void gemm_q4k_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint row0 = tgpig.y * 8, col0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[64];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    for (uint k = 0; k < K; k += 8) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint t = tid; t < 64; t += 32) {
+            uint i = t >> 3, j = t & 7, e = k + j;
+            device const uchar * blk = A + (ulong)(row0 + i) * row_bytes + (uint)(e / 256) * 144;
+            sa[t] = (half)k4_dequant_elem(blk, e & 255);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(a_tile, sa, 8);
+        simdgroup_load(b_tile, B + (ulong)k * N + col0, N);
+        simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+    }
+    simdgroup_store(acc, C + (ulong)row0 * N + col0, N);
+}
+
+// Q6_K MMQ (matches ggml dequant_q6_k). Q6_K block = 210 bytes: ql[128],qh[64],sc[16](int8),d(half).
+inline float k6_dequant_elem(device const uchar * blk, int e) {
+    float d = (float)(*(device const half *)(blk + 208));
+    device const uchar * ql = blk;
+    device const uchar * qh = blk + 128;
+    device const char  * sc = (device const char *)(blk + 192);
+    int hf = e >> 7, within = e & 127, l = within & 31, sub = within >> 5, is = l >> 4;
+    int qloff = hf * 64, qhoff = hf * 32, scoff = hf * 8;
+    int q, scidx;
+    if (sub == 0)      { q = ((ql[qloff + l] & 0xF)      | (((qh[qhoff + l] >> 0) & 3) << 4)) - 32; scidx = scoff + is + 0; }
+    else if (sub == 1) { q = ((ql[qloff + l + 32] & 0xF) | (((qh[qhoff + l] >> 2) & 3) << 4)) - 32; scidx = scoff + is + 2; }
+    else if (sub == 2) { q = ((ql[qloff + l] >> 4)       | (((qh[qhoff + l] >> 4) & 3) << 4)) - 32; scidx = scoff + is + 4; }
+    else               { q = ((ql[qloff + l + 32] >> 4)  | (((qh[qhoff + l] >> 6) & 3) << 4)) - 32; scidx = scoff + is + 6; }
+    return d * (float)sc[scidx] * (float)q;
+}
+// C[M,N] = A[M,K](Q6_K) @ B[K,N](half). A row r at A + r*(K/256)*210.
+kernel void gemm_q6k_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint row0 = tgpig.y * 8, col0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 210;
+    threadgroup half sa[64];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    for (uint k = 0; k < K; k += 8) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint t = tid; t < 64; t += 32) {
+            uint i = t >> 3, j = t & 7, e = k + j;
+            device const uchar * blk = A + (ulong)(row0 + i) * row_bytes + (uint)(e / 256) * 210;
+            sa[t] = (half)k6_dequant_elem(blk, e & 255);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(a_tile, sa, 8);
+        simdgroup_load(b_tile, B + (ulong)k * N + col0, N);
+        simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+    }
+    simdgroup_store(acc, C + (ulong)row0 * N + col0, N);
+}
+
+// elementwise f32 -> f16 cast (activations must be half for simdgroup_load B)
+kernel void cast_f32_f16(device const float * src [[buffer(0)]], device half * dst [[buffer(1)]],
+    constant uint &n [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = (half)src[gid];
+}
+// elementwise f32 copy (load/store a token's residual between batch and scratch)
+kernel void copy_f32(device const float * src [[buffer(0)]], device float * dst [[buffer(1)]],
+    constant uint &n [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = src[gid];
+}
+// token-major [T x dim] f32  ->  feature-major [dim x T] f16  (MLP activation staging)
+//   dst[i*T + t] = (half) src[t*dim + i];   td = (T, dim)
+kernel void transpose_to_f16(device const float * src [[buffer(0)]], device half * dst [[buffer(1)]],
+    constant uint2 &td [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    uint T = td.x, dim = td.y;
+    if (gid >= T * dim) return;
+    uint t = gid / dim, i = gid % dim;
+    dst[i * T + t] = (half)src[gid];
+}
+// feature-major [dim x T] f32  ->  token-major [T x dim] f32  (w2 output back to residual stream)
+//   dst[t*dim + i] = src[i*T + t];   td = (dim, T)
+kernel void transpose_f32(device const float * src [[buffer(0)]], device float * dst [[buffer(1)]],
+    constant uint2 &td [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    uint dim = td.x, T = td.y;
+    if (gid >= dim * T) return;
+    uint i = gid / T, t = gid % T;
+    dst[t * dim + i] = src[gid];
+}
 `
 
 // ---------- metal state ----------
@@ -345,6 +460,8 @@ m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
+@(private = "file")
+m_pso_q4k, m_pso_q6k, m_pso_cast, m_pso_copy, m_pso_tr_h16, m_pso_tr_f32: ^MTL.ComputePipelineState // Stage 1a
 
 // activation buffers
 @(private = "file")
@@ -357,6 +474,14 @@ m_b_kc, m_b_vc: ^MTL.Buffer
 m_b_qkv, m_b_qkv2, m_b_z, m_b_b, m_b_a, m_b_qlin, m_b_klin, m_b_lout: ^MTL.Buffer
 @(private = "file")
 m_b_conv_states, m_b_rec_states: ^MTL.Buffer
+
+// batched-prefill activation buffers ([MAX_BATCH_T x dim/hidden_dim])
+@(private = "file")
+m_batch_dim, m_batch_hidden, m_batch_max_t: int
+@(private = "file")
+m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout: ^MTL.Buffer // [T*dim] x(resid), rmsnorm(x), half(x), w2-out
+@(private = "file")
+m_b_bhb, m_b_bhb2, m_b_bhb2h: ^MTL.Buffer        // [T*hidden] w1-out, w3/swiglu-out, half(swiglu-out)
 
 metal_ready :: proc() -> bool { return metal_enabled }
 
@@ -425,6 +550,9 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_swiglu = make_pso(lib, "swiglu"); m_pso_residual = make_pso(lib, "residual")
 	m_pso_conv = make_pso(lib, "conv1d_step_silu"); m_pso_l2norm = make_pso(lib, "l2norm_scale")
 	m_pso_delta = make_pso(lib, "delta_recurrent"); m_pso_rmsgated = make_pso(lib, "rmsnorm_gated")
+	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
+	m_pso_cast = make_pso(lib, "cast_f32_f16"); m_pso_copy = make_pso(lib, "copy_f32")
+	m_pso_tr_h16 = make_pso(lib, "transpose_to_f16"); m_pso_tr_f32 = make_pso(lib, "transpose_f32")
 
 	base := raw_data(g.mmap)
 	m_mmap_base = uintptr(base)
@@ -456,6 +584,21 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	zero_f32_buffer(m_b_conv_states)
 	zero_f32_buffer(m_b_rec_states)
 
+	// batched-prefill buffers (Stage 1a: MLP projections). MAX_BATCH_T tokens
+	// at once; longer prompts are chunked by the caller. hidden_dim/dim are both
+	// multiples of 256 (Q4_K block) and 8 (simdgroup tile).
+	m_batch_dim = c.dim
+	m_batch_hidden = c.hidden_dim
+	m_batch_max_t = MAX_BATCH_T
+	mt := MAX_BATCH_T
+	m_b_bx = new_shared_bytes(mt * c.dim * 4)
+	m_b_bxb = new_shared_bytes(mt * c.dim * 4)
+	m_b_bxbh = new_shared_bytes(mt * c.dim * 2)   // half
+	m_b_bxout = new_shared_bytes(mt * c.dim * 4)
+	m_b_bhb = new_shared_bytes(mt * c.hidden_dim * 4)
+	m_b_bhb2 = new_shared_bytes(mt * c.hidden_dim * 4)
+	m_b_bhb2h = new_shared_bytes(mt * c.hidden_dim * 2) // half
+
 	metal_enabled = true
 	return true
 }
@@ -475,6 +618,7 @@ metal_destroy :: proc() {
 		m_b_ktmp, m_b_vtmp, m_b_logits, m_b_kc, m_b_vc,
 		m_b_qkv, m_b_qkv2, m_b_z, m_b_b, m_b_a, m_b_qlin, m_b_klin, m_b_lout,
 		m_b_conv_states, m_b_rec_states,
+		m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout, m_b_bhb, m_b_bhb2, m_b_bhb2h,
 	}) {
 		b->release()
 	}
@@ -529,6 +673,75 @@ enc_elementwise :: proc(enc: ^MTL.ComputeCommandEncoder, pso: ^MTL.ComputePipeli
 	enc->setComputePipelineState(pso); enc->setBuffer(a, 0, 0); enc->setBuffer(b, 0, 1)
 	tg := min(count, 256)
 	enc->dispatchThreads(MTL.Size{NS.Integer(count), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
+}
+
+// ---- batched-prefill encoder helpers (Stage 1a) ----
+GemmDims :: struct { M, N, K: u32 }
+
+@(private = "file")
+enc_cast :: proc(enc: ^MTL.ComputeCommandEncoder, src, dst: ^MTL.Buffer, n: int) {
+	enc->setComputePipelineState(m_pso_cast); enc->setBuffer(src, 0, 0); enc->setBuffer(dst, 0, 1)
+	nu := u32(n); enc->setBytes(bytes_of(&nu, size_of(nu)), 2)
+	tg := min(n, 256)
+	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
+}
+
+@(private = "file")
+enc_copy :: proc(enc: ^MTL.ComputeCommandEncoder, src: ^MTL.Buffer, src_off: NS.UInteger, dst: ^MTL.Buffer, dst_off: NS.UInteger, n: int) {
+	enc->setComputePipelineState(m_pso_copy); enc->setBuffer(src, src_off, 0); enc->setBuffer(dst, dst_off, 1)
+	nu := u32(n); enc->setBytes(bytes_of(&nu, size_of(nu)), 2)
+	tg := min(n, 256)
+	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
+}
+
+// Q4_K MMQ: C[M,N] = A[M,K] @ B[K,N]. A = Q4_K weights (mmap), B = half activations.
+@(private = "file")
+enc_q4k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
+	enc->setComputePipelineState(m_pso_q4k)
+	enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+	dims := GemmDims{u32(M), u32(N), u32(K)}
+	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 8), 1}, MTL.Size{32, 1, 1})
+}
+
+// Q6_K MMQ variant (Q4_K_M stores ffn_down/output/qkv as Q6_K).
+@(private = "file")
+enc_q6k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
+	enc->setComputePipelineState(m_pso_q6k)
+	enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+	dims := GemmDims{u32(M), u32(N), u32(K)}
+	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 8), 1}, MTL.Size{32, 1, 1})
+}
+
+// dispatch batched GEMM by weight quant kind (Q4_K or Q6_K).
+@(private = "file")
+enc_mm :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
+	#partial switch kind {
+	case .Q4_K: enc_q4k(enc, w, B, B_off, C, C_off, M, N, K)
+	case .Q6_K: enc_q6k(enc, w, B, B_off, C, C_off, M, N, K)
+	case:
+		fmt.eprintf("enc_mm: unsupported batched quant type %v (need Q4_K/Q6_K)\n", kind)
+		os.exit(1)
+	}
+}
+
+@(private = "file")
+enc_tr_h16 :: proc(enc: ^MTL.ComputeCommandEncoder, src, dst: ^MTL.Buffer, T, dim: int) {
+	enc->setComputePipelineState(m_pso_tr_h16); enc->setBuffer(src, 0, 0); enc->setBuffer(dst, 0, 1)
+	td := [2]u32{u32(T), u32(dim)}
+	enc->setBytes(bytes_of(&td, size_of(td)), 2)
+	n := T * dim; tg := min(n, 256)
+	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
+}
+
+@(private = "file")
+enc_tr_f32 :: proc(enc: ^MTL.ComputeCommandEncoder, src, dst: ^MTL.Buffer, dim, T: int) {
+	enc->setComputePipelineState(m_pso_tr_f32); enc->setBuffer(src, 0, 0); enc->setBuffer(dst, 0, 1)
+	td := [2]u32{u32(dim), u32(T)}
+	enc->setBytes(bytes_of(&td, size_of(td)), 2)
+	n := dim * T; tg := min(n, 256)
+	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
 }
 
 forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
@@ -666,6 +879,169 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 		enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb, dim)
 	}
 
+	enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, eps)
+	enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)
+
+	enc->endEncoding()
+	cmd->commit()
+	cmd->waitUntilCompleted()
+	return m_b_logits->contentsAsSlice([]f32)[:p.vocab_size]
+}
+
+// Batched prefill (BATCHED_PREFILL Stage 1a): process T tokens at once, batching
+// the MLP projections (w1/w3/w2) via Q4_K MMQ. Attention (full + linear) still
+// runs per-token on single-token scratch (its projections are GEMV; batching them
+// is Stage 1b). T must be a multiple of 8 and <= MAX_BATCH_T (caller chunks; the
+// trailing <8 remainder goes through forward_gpu). Returns the LAST token's logits.
+forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: int) -> []f32 {
+	NS.scoped_autoreleasepool()
+	p := &transformer.config
+	w := &transformer.weights
+
+	T := len(tokens)
+	if T == 0 { fmt.eprintln("forward_gpu_batch: empty"); os.exit(1) }
+	if T > MAX_BATCH_T || (T % 8) != 0 {
+		fmt.eprintf("forward_gpu_batch: T=%d must be in (0,%d] and %%8==0\n", T, MAX_BATCH_T)
+		os.exit(1)
+	}
+
+	dim := p.dim; hidden_dim := p.hidden_dim; head_dim := p.head_dim
+	n_heads := p.n_heads; n_kv_heads := p.n_kv_heads
+	kv_dim := n_kv_heads * head_dim; kv_mul := n_heads / n_kv_heads
+	att_head_dim := n_heads * head_dim; seq_len := p.seq_len; eps := p.rms_eps
+	rotary_dim := p.rotary_dim
+	key_dim := p.lin_n_k_heads * p.lin_head_k_dim
+	value_dim := p.lin_n_v_heads * p.lin_head_v_dim
+	conv_dim := key_dim * 2 + value_dim
+	kernel := p.lin_conv_kernel
+	head_k_dim := p.lin_head_k_dim; head_v_dim := p.lin_head_v_dim
+	n_vh := p.lin_n_v_heads; n_kh := p.lin_n_k_heads
+	l2_scale := 1.0 / math.sqrt_f32(f32(head_k_dim))
+
+	// CPU: token embeddings into batch residual (token-major [T x dim])
+	bx := m_b_bx->contentsAsSlice([]f32)
+	for t in 0 ..< T {
+		get_embedding_row(&w.token_embedding, tokens[t], dim, bx[t * dim : (t + 1) * dim])
+	}
+
+	cmd := m_queue->commandBuffer()
+	enc := cmd->computeCommandEncoder()
+	kv_layer_bytes := NS.UInteger(seq_len * kv_dim * 2)
+	conv_state_stride := conv_dim * (kernel - 1)
+	rec_state_stride := n_vh * head_k_dim * head_v_dim
+	dim_bytes := NS.UInteger(dim * 4)
+
+	for l in 0 ..< p.n_layers {
+		lw := &w.layers[l]
+
+		// ---- Phase A: per-token attention on single-token scratch ----
+		for t in 0 ..< T {
+			pos := pos_start + t
+			off := NS.UInteger(t) * dim_bytes
+			enc_copy(enc, m_b_bx, off, m_b_x, 0, dim)                          // batch_x[t] -> x
+			enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.attn_norm), dim, 1, eps)
+
+			switch lw.layer_type {
+			case .Full_Attention:
+				fa := &lw.full
+				slot := transformer.full_slot[l]
+				kv_loff := NS.UInteger(slot) * kv_layer_bytes
+				enc_gemv(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), m_b_xb, 0, m_b_qproj, 0, dim, n_heads * head_dim * 2)
+				enc_gemv(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), m_b_xb, 0, m_b_ktmp, 0, dim, kv_dim)
+				enc_gemv(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), m_b_xb, 0, m_b_vtmp, 0, dim, kv_dim)
+				enc->setComputePipelineState(m_pso_qnorm)
+				enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
+				qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
+				enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
+				enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
+				rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+				half_r := rotary_dim / 2
+				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_q, 0, 0)
+				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
+				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+				enc->setComputePipelineState(m_pso_store_kv)
+				enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
+				enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
+				store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
+				enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
+				enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
+				enc->setComputePipelineState(m_pso_attn)
+				enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
+				attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
+				enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
+				enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
+				enc->setComputePipelineState(m_pso_attn_gate)
+				enc->setBuffer(m_b_xb3, 0, 0); enc->setBuffer(m_b_qproj, 0, 1)
+				hd_u32 := u32(head_dim)
+				enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
+				enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+				enc_gemv(enc, fa.wo.kind, woff(raw_data(fa.wo.data)), m_b_xb3, 0, m_b_xb2, 0, att_head_dim, dim)
+				enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb2, dim)
+
+			case .Linear_Attention:
+				la := &lw.linear
+				slot := transformer.lin_slot[l]
+				conv_off := NS.UInteger(slot * conv_state_stride * 4)
+				rec_off := NS.UInteger(slot * rec_state_stride * 4)
+				enc_gemv(enc, la.in_qkv.kind, woff(raw_data(la.in_qkv.data)), m_b_xb, 0, m_b_qkv, 0, dim, conv_dim)
+				enc_gemv(enc, la.in_z.kind, woff(raw_data(la.in_z.data)), m_b_xb, 0, m_b_z, 0, dim, value_dim)
+				enc_gemv(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), m_b_xb, 0, m_b_b, 0, dim, n_vh)
+				enc_gemv(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), m_b_xb, 0, m_b_a, 0, dim, n_vh)
+				enc->setComputePipelineState(m_pso_conv)
+				enc->setBuffer(m_b_qkv2, 0, 0); enc->setBuffer(m_b_qkv, 0, 1)
+				enc->setBuffer(m_b_conv_states, conv_off, 2); enc->setBuffer(m_weights, woff(raw_data(la.conv.data)), 3)
+				cp := [2]u32{u32(kernel), 0}
+				enc->setBytes(bytes_of(&cp, size_of(cp)), 4)
+				enc->dispatchThreads(MTL.Size{NS.Integer(conv_dim), 1, 1}, MTL.Size{NS.Integer(min(conv_dim, 256)), 1, 1})
+				enc->setComputePipelineState(m_pso_l2norm)
+				enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
+				enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
+				l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
+				enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
+				enc->setComputePipelineState(m_pso_delta)
+				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
+				enc->setBuffer(m_b_qlin, 0, 2); enc->setBuffer(m_b_klin, 0, 3)
+				enc->setBuffer(m_b_qkv2, NS.UInteger(2 * key_dim * 4), 4)
+				enc->setBuffer(m_b_b, 0, 5); enc->setBuffer(m_b_a, 0, 6)
+				enc->setBuffer(m_weights, woff(raw_data(la.a_decay)), 7)
+				enc->setBuffer(m_weights, woff(raw_data(la.dt_bias)), 8)
+				dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
+				enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
+				enc->setComputePipelineState(m_pso_rmsgated)
+				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_lout, 0, 1)
+				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_z, 0, 3)
+				ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
+				enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
+				enc_gemv(enc, la.out.kind, woff(raw_data(la.out.data)), m_b_lout, 0, m_b_xb2, 0, value_dim, dim)
+				enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb2, dim)
+			}
+
+			enc_copy(enc, m_b_x, 0, m_b_bx, off, dim)                          // x -> batch_x[t]
+		}
+
+		// ---- Phase B: batched MLP over all T tokens (Q4_K/Q6_K MMQ by weight kind) ----
+		enc_rmsnorm(enc, m_b_bx, m_b_bxb, raw_data(lw.ffn_norm), dim, T, eps)            // [T x dim] token-major
+		enc_tr_h16(enc, m_b_bxb, m_b_bxbh, T, dim)                                      // -> [dim x T] half
+		enc_mm(enc, lw.w1.kind, raw_data(lw.w1.data), m_b_bxbh, 0, m_b_bhb, 0, hidden_dim, T, dim)   // [hidden x T]
+		enc_mm(enc, lw.w3.kind, raw_data(lw.w3.data), m_b_bxbh, 0, m_b_bhb2, 0, hidden_dim, T, dim)  // [hidden x T]
+		enc_elementwise(enc, m_pso_swiglu, m_b_bhb, m_b_bhb2, T * hidden_dim)           // hb = silu(hb)*hb2
+		enc_cast(enc, m_b_bhb, m_b_bhb2h, T * hidden_dim)                               // [hidden x T] f32 -> half
+		enc_mm(enc, lw.w2.kind, raw_data(lw.w2.data), m_b_bhb2h, 0, m_b_bxout, 0, dim, T, hidden_dim) // [dim x T]
+		enc_tr_f32(enc, m_b_bxout, m_b_bxb, dim, T)                                     // -> [T x dim] token-major
+		enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_bxb, T * dim)                  // batch_x += mlp_out
+	}
+
+	// final norm + output projection: LAST token only
+	last_off := NS.UInteger(T - 1) * dim_bytes
+	enc_copy(enc, m_b_bx, last_off, m_b_x, 0, dim)
 	enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, eps)
 	enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)
 
