@@ -260,6 +260,41 @@ kernel void conv1d_step_silu(device float *qkv_out [[buffer(0)]], device const f
     conv_state[c * km1 + km1 - 1] = qkv_in[c];
 }
 
+// Batched depthwise causal conv1d + silu over T tokens (Stage 2 step 1). Each
+// (t,c) is independent. Left-pads with conv_state (the prefix's last km1 inputs)
+// so token t only sees inputs [t-km1, t] -- no future. Matches conv1d_step_silu
+// exactly: out[t,c] = silu(sum_i w[c*k+i] * src(t-km1+i, c)), src(j,c)=history if j<0.
+// P = (conv_dim, T, kernel, km1). Does NOT modify conv_state (read-only here).
+kernel void conv1d_batch_silu(
+    device const float * x [[buffer(0)]], device float * out [[buffer(1)]],
+    device const float * conv_state [[buffer(2)]], device const float * weight [[buffer(3)]],
+    constant uint4 & P [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    uint conv_dim = P.x, T = P.y, k = P.z, km1 = P.w;
+    if (gid >= T * conv_dim) return;
+    uint t = gid / conv_dim, c = gid - t * conv_dim;
+    device const float * wc = weight + c * k;
+    // Match conv1d_step_silu's summation order EXACTLY (current tap first, then
+    // history oldest->newest) so the batched output is bit-identical to per-token.
+    float acc = wc[km1] * x[t * conv_dim + c];          // i = km1 (current input)
+    for (uint i = 0; i < km1; i++) {                      // i = 0..km1-1 (history, oldest->newest)
+        int si = int(t) - int(km1) + int(i);
+        float xv = (si < 0) ? conv_state[(uint)c * km1 + uint(si + int(km1))] : x[uint(si) * conv_dim + c];
+        acc += wc[i] * xv;
+    }
+    out[gid] = acc / (1.0f + exp(-acc));
+}
+// After a batched conv chunk, slide conv_state to hold the chunk's last km1
+// inputs (next chunk / prefix-cache resumes correctly). T >= km1 assumed (true:
+// chunks are multiples of 8, km1=3). P = (conv_dim, T, kernel, km1).
+kernel void conv1d_update_state(
+    device const float * x [[buffer(0)]], device float * conv_state [[buffer(1)]],
+    constant uint4 & P [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    uint conv_dim = P.x, T = P.y, km1 = P.w;
+    if (gid >= conv_dim * km1) return;
+    uint c = gid / km1, i = gid - c * km1;
+    conv_state[gid] = x[(T - km1 + i) * conv_dim + c];
+}
+
 struct L2P { uint head_k_dim; float eps; float scale; };
 // Per key-head: l2norm q and k, scale q by 1/sqrt(head_k_dim). q_in/k_in -> q_out/k_out.
 kernel void l2norm_scale(device float *q_out [[buffer(0)]], device float *k_out [[buffer(1)]],
@@ -518,6 +553,8 @@ m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_g
 m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_q4k, m_pso_q6k, m_pso_cast, m_pso_copy, m_pso_tr_h16, m_pso_tr_f32: ^MTL.ComputePipelineState // Stage 1a
+@(private = "file")
+m_pso_conv_batch, m_pso_conv_update: ^MTL.ComputePipelineState // Stage 2 batched conv1d
 
 // activation buffers
 @(private = "file")
@@ -545,6 +582,7 @@ m_b_proj_half: ^MTL.Buffer                         // [dim x T] half transpose s
 m_b_proj_outf: ^MTL.Buffer                         // [max_out x T] f32 MMQ output (feature-major) scratch
 @(private = "file")
 m_b_qproj_t, m_b_qkv_t: ^MTL.Buffer               // [T x 8192] wq / in_qkv output (token-major)
+m_b_qkv2_t: ^MTL.Buffer                            // [T x conv_dim] batched conv1d output (Stage 2)
 @(private = "file")
 m_b_kt, m_b_vt: ^MTL.Buffer                        // [T x kv_dim] wk / wv output
 @(private = "file")
@@ -670,6 +708,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
 	m_pso_cast = make_pso(lib, "cast_f32_f16"); m_pso_copy = make_pso(lib, "copy_f32")
 	m_pso_tr_h16 = make_pso(lib, "transpose_to_f16"); m_pso_tr_f32 = make_pso(lib, "transpose_f32")
+	m_pso_conv_batch = make_pso(lib, "conv1d_batch_silu"); m_pso_conv_update = make_pso(lib, "conv1d_update_state")
 
 	base := raw_data(g.mmap)
 	m_mmap_base = uintptr(base)
@@ -723,6 +762,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_b_proj_outf = new_shared_bytes(proj_max_out * mt * 4)       // f32 [max_out x T]
 	m_b_qproj_t = new_shared_bytes(qproj_dim * mt * 4)
 	m_b_qkv_t = new_shared_bytes(conv_dim * mt * 4)
+	m_b_qkv2_t = new_shared_bytes(conv_dim * mt * 4) // Stage 2 batched conv1d output
 	m_b_kt = new_shared_bytes(kv_dim * mt * 4)
 	m_b_vt = new_shared_bytes(kv_dim * mt * 4)
 	m_b_zt = new_shared_bytes(value_dim * mt * 4)
@@ -754,7 +794,7 @@ metal_destroy :: proc() {
 		m_b_qkv, m_b_qkv2, m_b_z, m_b_b, m_b_a, m_b_qlin, m_b_klin, m_b_lout,
 		m_b_conv_states, m_b_rec_states,
 		m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout, m_b_bhb, m_b_bhb2, m_b_bhb2h,
-		m_b_proj_half, m_b_proj_outf, m_b_qproj_t, m_b_qkv_t, m_b_kt, m_b_vt,
+		m_b_proj_half, m_b_proj_outf, m_b_qproj_t, m_b_qkv_t, m_b_qkv2_t, m_b_kt, m_b_vt,
 		m_b_zt, m_b_loutt, m_b_bt, m_b_at, m_b_xb3t, m_b_xb2t,
 	}) {
 		b->release()
@@ -873,6 +913,29 @@ enc_proj_fwd :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: r
 	enc_tr_h16(enc, in_tok, m_b_proj_half, T, K_in)                              // [T x K] -> [K x T] half
 	enc_mm(enc, kind, w, m_b_proj_half, 0, m_b_proj_outf, 0, M_out, T, K_in)     // -> [M_out x T] feat-major
 	enc_tr_f32(enc, m_b_proj_outf, out_tok, M_out, T)                            // -> [T x M_out] token-major
+}
+
+// Batched depthwise causal conv1d + silu (Stage 2). x/out token-major [T x conv_dim].
+@(private = "file")
+enc_conv1d_batch :: proc(enc: ^MTL.ComputeCommandEncoder, x, out: ^MTL.Buffer, conv_state: ^MTL.Buffer, conv_state_off: NS.UInteger, weight: rawptr, conv_dim, T, kernel: int) {
+	enc->setComputePipelineState(m_pso_conv_batch)
+	enc->setBuffer(x, 0, 0); enc->setBuffer(out, 0, 1)
+	enc->setBuffer(conv_state, conv_state_off, 2); enc->setBuffer(m_weights, woff(weight), 3)
+	P := [4]u32{u32(conv_dim), u32(T), u32(kernel), u32(kernel - 1)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 4)
+	n := T * conv_dim; tg := min(n, 256)
+	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
+}
+
+// Slide conv_state to the chunk's last km1 inputs.
+@(private = "file")
+enc_conv1d_update :: proc(enc: ^MTL.ComputeCommandEncoder, x, conv_state: ^MTL.Buffer, conv_state_off: NS.UInteger, conv_dim, T, kernel: int) {
+	enc->setComputePipelineState(m_pso_conv_update)
+	enc->setBuffer(x, 0, 0); enc->setBuffer(conv_state, conv_state_off, 1)
+	P := [4]u32{u32(conv_dim), u32(T), u32(kernel), u32(kernel - 1)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 2)
+	n := conv_dim * (kernel - 1); tg := min(n, 256)
+	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
 }
 
 @(private = "file")
@@ -1146,23 +1209,19 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			enc_proj_fwd(enc, la.in_z.kind, raw_data(la.in_z.data), m_b_bxb, value_dim, T, dim, m_b_zt)
 			enc_proj_fwd(enc, la.in_b.kind, raw_data(la.in_b.data), m_b_bxb, n_vh, T, dim, m_b_bt)
 			enc_proj_fwd(enc, la.in_a.kind, raw_data(la.in_a.data), m_b_bxb, n_vh, T, dim, m_b_at)
-			// per-token stateful: conv1d / l2norm / delta / gated-rmsnorm
+			// batched conv1d (Stage 2): all T tokens at once, causal left-pad from conv_state
 			slot := transformer.lin_slot[l]
 			conv_off := NS.UInteger(slot * conv_state_stride * 4)
 			rec_off := NS.UInteger(slot * rec_state_stride * 4)
+			enc_conv1d_batch(enc, m_b_qkv_t, m_b_qkv2_t, m_b_conv_states, conv_off, raw_data(la.conv.data), conv_dim, T, kernel)
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
+			// per-token stateful: l2norm / delta / gated-rmsnorm (conv is batched above)
 			for t in 0 ..< T {
 				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
-				enc_copy(enc, m_b_qkv_t, oqkv, m_b_qkv, 0, conv_dim)
+				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim) // batched conv out[t] -> scratch
 				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
 				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
 				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
-				enc->setComputePipelineState(m_pso_conv)
-				enc->setBuffer(m_b_qkv2, 0, 0); enc->setBuffer(m_b_qkv, 0, 1)
-				enc->setBuffer(m_b_conv_states, conv_off, 2); enc->setBuffer(m_weights, woff(raw_data(la.conv.data)), 3)
-				cp := [2]u32{u32(kernel), 0}
-				enc->setBytes(bytes_of(&cp, size_of(cp)), 4)
-				enc->dispatchThreads(MTL.Size{NS.Integer(conv_dim), 1, 1}, MTL.Size{NS.Integer(min(conv_dim, 256)), 1, 1})
 				enc->setComputePipelineState(m_pso_l2norm)
 				enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
 				enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
@@ -1187,6 +1246,8 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
+			// slide conv_state to this chunk's last km1 inputs (prefix-cache / next-chunk resume)
+			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, T, kernel)
 			// batched out -> residual
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)

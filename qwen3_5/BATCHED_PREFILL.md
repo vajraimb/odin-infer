@@ -171,6 +171,33 @@ MMQ 调优已把投影层榨干(4.9×)。逐 token 只剩**有状态部分**:全
    转成 chunk 内并行 GEMM + chunk 间少量状态传递。分步降险:先单独批量 conv1d(低风险 causal
    local op)→ 建 float64 CPU reference 对拍 → 最后才接 chunked scan。推导 WY 展开 + 处理数值
    稳定性,silent-error 风险最高。
+
+### Stage 2 进展(本轮:conv1d 批量 + f64 golden reference)
+
+**conv1d 批量(done)**:`conv1d_batch_silu`(depthwise causal,左 padding 来自 conv_state)+
+  `conv1d_update_state`(chunk 末滑动 conv_state)。接入 `forward_gpu_batch` 线性层。
+  - 关键:求和顺序必须与 per-token `conv1d_step_silu` **完全一致**(current tap 先,再
+    history oldest→newest),否则 f32 rounding 偶发翻转贪心解码 → 输出不再逐位一致。
+  - 验证:贪心解码与 conv-批量前**逐位一致**(`2+2=4`、`Paris`、1062-token 摘要逐字相同)。
+  - **诊断**:ms/token 几乎不变(23.3→24.9,噪声内)→ **delta 递推是唯一剩余串行靶子**
+    (与"prefill ms/token 随 T 平坦"独立印证)。
+
+**f64 golden reference(done,`delta_harness/delta_ref.odin`)**:tokenwise delta 递推的 f32
+  与 f64 实现(同公式),跑 T-token 轨迹,报 max_abs / cosine / state-Frobenius / NaN-Inf。
+  - 输入须 **l2-normalize q/k**(并 q×=1/√hkd)匹配真实引擎喂给递归的量;否则状态发散。
+  - **数值发现(关键)**:递推**数值敏感** —— f32 相对 f64 漂移随 T / decay 减小而增大:
+    | 场景 | T | max_out_abs | min_cos |
+    |---|---|---|---|
+    | strong decay g=0.1 | 256 | 7.3e-5 | 0.9999 |
+    | realistic g=0.99 | 256 | 2.8e-2 | 0.926 |
+    | long g=0.999 | 1024 | 0.17 | 0.57 |
+    - 无 NaN/Inf(归一化输入下稳定,不爆炸)。
+  - **对 chunked scan 的含义**:f64 不能作 1e-5 级金标准(f32 自身就离 f64 ~0.03/T=256)。
+    **chunked 必须对拍 tokenwise-f32(紧,同精度)**,或对拍 f64 但容差放宽(cos>0.9 / abs<0.1)。
+    且 chunked 算法必须保持 f32 级精度(不能再引入额外误差)。
+
+**GO/no-go**:chunked scan 放行,但 (a) 参考用 tokenwise-f32 做紧对拍;(b) 高度警惕数值稳定性。
+下一步:推导 chunked WY 展开,小 chunk(16)起步,逐 chunk 对拍 tokenwise-f32 的 state checkpoint。
 2. **分解式批量 attention**(可选,排最后)。全注意力 score 只占 ~5%,且 Rigel 论文实测:Apple
    统一内存上分解式路径(simdgroup GEMM + device-memory S×S)反而比融合 flash 快数倍——融合
    softmax 会把计算赶离矩阵单元。如未来 profiler 证明 attn core 占比高再做,且走分解式而非全融合。
