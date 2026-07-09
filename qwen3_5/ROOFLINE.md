@@ -49,3 +49,14 @@ GPU f32 ~2.15 TFLOPS / fp16 ~4.3 TFLOPS。
 4.9× prefill + bit-identical + 完整 profiling 工具链 + roofline 封顶 = 优化项目闭环完成。
 是否继续推 MMQ 到 ~1.5 TFLOPS(再 ~2×、硬工程)是一个**有数据支撑的收工/继续决策**,
 非直觉押注。
+
+## v1.0 Release Status(收工基线)
+- **主线交付**:prefill 122→23 ms/tok(**4.9×**),贪心解码 **bit-identical**
+  (`2+2=4`、`Paris`、1062-token 摘要逐字一致),三仓库(origin/main)同步。
+- 端到端体感:1500-tok prefill + 500-tok 生成 ≈ 78s(原 ~6 分钟)。继续死磕 MMQ 极限
+  仅换 ~15% 端到端(78→67s),且 decode 已在带宽墙 → **杠杆率极低,决定收工**。
+- profiling 工具(`QFASTMATH`/`QTIMING`/`QPROF_*`)保留,**默认关闭**(env 门控)。
+- **C=16 chunked-delta 悬案**(挂起):engine 在 C=16 出 `!!!!!`,C≤8 正常;math 在 harness
+  C=16(含变 beta/g)全过。**重启条件**:若未来做 fused sequence-wise kernel,第一件事是用
+  `QFASTMATH=0` 跑 engine C=16,排查是否 fast-math;若否,转 host-side dispatch/buffer layout。
+  chunked delta 整体只值 ~2ms/tok,非优先。
