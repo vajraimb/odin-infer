@@ -482,8 +482,69 @@ m_batch_dim, m_batch_hidden, m_batch_max_t: int
 m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout: ^MTL.Buffer // [T*dim] x(resid), rmsnorm(x), half(x), w2-out
 @(private = "file")
 m_b_bhb, m_b_bhb2, m_b_bhb2h: ^MTL.Buffer        // [T*hidden] w1-out, w3/swiglu-out, half(swiglu-out)
+// Stage 1b: batched attention projections (per-token stateful ops stay per-token)
+@(private = "file")
+m_b_proj_half: ^MTL.Buffer                         // [dim x T] half transpose scratch (B for MMQ)
+@(private = "file")
+m_b_proj_outf: ^MTL.Buffer                         // [max_out x T] f32 MMQ output (feature-major) scratch
+@(private = "file")
+m_b_qproj_t, m_b_qkv_t: ^MTL.Buffer               // [T x 8192] wq / in_qkv output (token-major)
+@(private = "file")
+m_b_kt, m_b_vt: ^MTL.Buffer                        // [T x kv_dim] wk / wv output
+@(private = "file")
+m_b_zt, m_b_loutt: ^MTL.Buffer                     // [T x value_dim] in_z / linear-out
+@(private = "file")
+m_b_bt, m_b_at: ^MTL.Buffer                        // [T x n_vh] in_b / in_a
+@(private = "file")
+m_b_xb3t: ^MTL.Buffer                              // [T x att_head_dim] wo input
+@(private = "file")
+m_b_xb2t: ^MTL.Buffer                              // [T x dim] post-proj output (residual add)
 
 metal_ready :: proc() -> bool { return metal_enabled }
+
+// Print the quant type of each projection tensor for the first linear and first
+// full-attention layer. Makes non-Q4_K tensors (e.g. Q6_K ffn_down/wv/in_qkv in
+// Q4_K_M) visible at startup so the batched MMQ dispatch (Q4_K vs Q6_K) is
+// obviously covered. Cheap regression guard against the Q6_K-as-Q4_K class of bug.
+@(private = "file")
+kstr :: proc(k: ggml.GGML_Type) -> string {
+	r: string
+	#partial switch k {
+	case .Q4_K: r = "Q4_K"
+	case .Q6_K: r = "Q6_K"
+	case .F16: r = "F16"
+	case .F32: r = "F32"
+	case .Q8_0: r = "Q8_0"
+	case: r = "?"
+	}
+	return r
+}
+
+@(private = "file")
+print_quant_summary :: proc(t: ^Transformer) {
+	w := &t.weights
+	for l in 0 ..< t.config.n_layers {
+		lw := &w.layers[l]
+		if lw.layer_type == .Linear_Attention && t.config.n_linear > 0 {
+			la := &lw.linear
+			fmt.printf("metal: quant (linear)  w1=%s w3=%s w2=%s  qkv=%s z=%s b=%s a=%s out=%s\n",
+				kstr(lw.w1.kind), kstr(lw.w3.kind), kstr(lw.w2.kind),
+				kstr(la.in_qkv.kind), kstr(la.in_z.kind), kstr(la.in_b.kind),
+				kstr(la.in_a.kind), kstr(la.out.kind))
+			break
+		}
+	}
+	for l in 0 ..< t.config.n_layers {
+		lw := &w.layers[l]
+		if lw.layer_type == .Full_Attention {
+			fa := &lw.full
+			fmt.printf("metal: quant (full)    w1=%s w3=%s w2=%s  wq=%s wk=%s wv=%s wo=%s\n",
+				kstr(lw.w1.kind), kstr(lw.w3.kind), kstr(lw.w2.kind),
+				kstr(fa.wq.kind), kstr(fa.wk.kind), kstr(fa.wv.kind), kstr(fa.wo.kind))
+			break
+		}
+	}
+}
 
 // Zero the per-request-evolving GPU state (conv_state, recurrent state, KV
 // cache) so a fresh prompt can be processed from pos 0. Shared Metal buffers
@@ -599,6 +660,24 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_b_bhb2 = new_shared_bytes(mt * c.hidden_dim * 4)
 	m_b_bhb2h = new_shared_bytes(mt * c.hidden_dim * 2) // half
 
+	// Stage 1b batched attention-projection buffers
+	qproj_dim := c.n_heads * c.head_dim * 2 // wq output (q+gate interleaved)
+	proj_max_out := max(max(qproj_dim, conv_dim), max(c.dim, value_dim))
+	m_b_proj_half = new_shared_bytes(c.dim * mt * 2)              // half [dim x T]
+	m_b_proj_outf = new_shared_bytes(proj_max_out * mt * 4)       // f32 [max_out x T]
+	m_b_qproj_t = new_shared_bytes(qproj_dim * mt * 4)
+	m_b_qkv_t = new_shared_bytes(conv_dim * mt * 4)
+	m_b_kt = new_shared_bytes(kv_dim * mt * 4)
+	m_b_vt = new_shared_bytes(kv_dim * mt * 4)
+	m_b_zt = new_shared_bytes(value_dim * mt * 4)
+	m_b_loutt = new_shared_bytes(value_dim * mt * 4)
+	m_b_bt = new_shared_bytes(c.lin_n_v_heads * mt * 4)
+	m_b_at = new_shared_bytes(c.lin_n_v_heads * mt * 4)
+	m_b_xb3t = new_shared_bytes(att_head_dim * mt * 4)
+	m_b_xb2t = new_shared_bytes(c.dim * mt * 4)
+
+	print_quant_summary(t)
+
 	metal_enabled = true
 	return true
 }
@@ -619,6 +698,8 @@ metal_destroy :: proc() {
 		m_b_qkv, m_b_qkv2, m_b_z, m_b_b, m_b_a, m_b_qlin, m_b_klin, m_b_lout,
 		m_b_conv_states, m_b_rec_states,
 		m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout, m_b_bhb, m_b_bhb2, m_b_bhb2h,
+		m_b_proj_half, m_b_proj_outf, m_b_qproj_t, m_b_qkv_t, m_b_kt, m_b_vt,
+		m_b_zt, m_b_loutt, m_b_bt, m_b_at, m_b_xb3t, m_b_xb2t,
 	}) {
 		b->release()
 	}
@@ -724,6 +805,17 @@ enc_mm :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: rawptr,
 		fmt.eprintf("enc_mm: unsupported batched quant type %v (need Q4_K/Q6_K)\n", kind)
 		os.exit(1)
 	}
+}
+
+// Batched projection: out_tok[T x M_out] = W[M_out x K_in] @ in_tok[T x K_in].
+// in_tok and out_tok are token-major f32. Internally transposes to the feature-
+// major half layout the MMQ needs, then back. Uses shared scratch buffers.
+@(private = "file")
+enc_proj_fwd :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: rawptr,
+	in_tok: ^MTL.Buffer, M_out, T, K_in: int, out_tok: ^MTL.Buffer) {
+	enc_tr_h16(enc, in_tok, m_b_proj_half, T, K_in)                              // [T x K] -> [K x T] half
+	enc_mm(enc, kind, w, m_b_proj_half, 0, m_b_proj_outf, 0, M_out, T, K_in)     // -> [M_out x T] feat-major
+	enc_tr_f32(enc, m_b_proj_outf, out_tok, M_out, T)                            // -> [T x M_out] token-major
 }
 
 @(private = "file")
@@ -934,21 +1026,26 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 	for l in 0 ..< p.n_layers {
 		lw := &w.layers[l]
 
-		// ---- Phase A: per-token attention on single-token scratch ----
-		for t in 0 ..< T {
-			pos := pos_start + t
-			off := NS.UInteger(t) * dim_bytes
-			enc_copy(enc, m_b_bx, off, m_b_x, 0, dim)                          // batch_x[t] -> x
-			enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.attn_norm), dim, 1, eps)
+		// ---- batched attn_norm + attention projections (Stage 1b) ----
+		enc_rmsnorm(enc, m_b_bx, m_b_bxb, raw_data(lw.attn_norm), dim, T, eps) // [T x dim]
 
-			switch lw.layer_type {
-			case .Full_Attention:
-				fa := &lw.full
-				slot := transformer.full_slot[l]
-				kv_loff := NS.UInteger(slot) * kv_layer_bytes
-				enc_gemv(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), m_b_xb, 0, m_b_qproj, 0, dim, n_heads * head_dim * 2)
-				enc_gemv(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), m_b_xb, 0, m_b_ktmp, 0, dim, kv_dim)
-				enc_gemv(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), m_b_xb, 0, m_b_vtmp, 0, dim, kv_dim)
+		switch lw.layer_type {
+		case .Full_Attention:
+			fa := &lw.full
+			qproj_dim := n_heads * head_dim * 2
+			enc_proj_fwd(enc, fa.wq.kind, raw_data(fa.wq.data), m_b_bxb, qproj_dim, T, dim, m_b_qproj_t)
+			enc_proj_fwd(enc, fa.wk.kind, raw_data(fa.wk.data), m_b_bxb, kv_dim, T, dim, m_b_kt)
+			enc_proj_fwd(enc, fa.wv.kind, raw_data(fa.wv.data), m_b_bxb, kv_dim, T, dim, m_b_vt)
+			// per-token stateful: qnorm / rope / store_kv / attention / gate
+			slot := transformer.full_slot[l]
+			kv_loff := NS.UInteger(slot) * kv_layer_bytes
+			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
+			for t in 0 ..< T {
+				pos := pos_start + t
+				oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
+				enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
+				enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
+				enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
 				enc->setComputePipelineState(m_pso_qnorm)
 				enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
 				qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
@@ -980,18 +1077,29 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				hd_u32 := u32(head_dim)
 				enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
 				enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
-				enc_gemv(enc, fa.wo.kind, woff(raw_data(fa.wo.data)), m_b_xb3, 0, m_b_xb2, 0, att_head_dim, dim)
-				enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb2, dim)
+				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
+			}
+			// batched wo -> residual
+			enc_proj_fwd(enc, fa.wo.kind, raw_data(fa.wo.data), m_b_xb3t, dim, T, att_head_dim, m_b_xb2t)
+			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 
-			case .Linear_Attention:
-				la := &lw.linear
-				slot := transformer.lin_slot[l]
-				conv_off := NS.UInteger(slot * conv_state_stride * 4)
-				rec_off := NS.UInteger(slot * rec_state_stride * 4)
-				enc_gemv(enc, la.in_qkv.kind, woff(raw_data(la.in_qkv.data)), m_b_xb, 0, m_b_qkv, 0, dim, conv_dim)
-				enc_gemv(enc, la.in_z.kind, woff(raw_data(la.in_z.data)), m_b_xb, 0, m_b_z, 0, dim, value_dim)
-				enc_gemv(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), m_b_xb, 0, m_b_b, 0, dim, n_vh)
-				enc_gemv(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), m_b_xb, 0, m_b_a, 0, dim, n_vh)
+		case .Linear_Attention:
+			la := &lw.linear
+			enc_proj_fwd(enc, la.in_qkv.kind, raw_data(la.in_qkv.data), m_b_bxb, conv_dim, T, dim, m_b_qkv_t)
+			enc_proj_fwd(enc, la.in_z.kind, raw_data(la.in_z.data), m_b_bxb, value_dim, T, dim, m_b_zt)
+			enc_proj_fwd(enc, la.in_b.kind, raw_data(la.in_b.data), m_b_bxb, n_vh, T, dim, m_b_bt)
+			enc_proj_fwd(enc, la.in_a.kind, raw_data(la.in_a.data), m_b_bxb, n_vh, T, dim, m_b_at)
+			// per-token stateful: conv1d / l2norm / delta / gated-rmsnorm
+			slot := transformer.lin_slot[l]
+			conv_off := NS.UInteger(slot * conv_state_stride * 4)
+			rec_off := NS.UInteger(slot * rec_state_stride * 4)
+			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
+			for t in 0 ..< T {
+				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
+				enc_copy(enc, m_b_qkv_t, oqkv, m_b_qkv, 0, conv_dim)
+				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
+				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
+				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
 				enc->setComputePipelineState(m_pso_conv)
 				enc->setBuffer(m_b_qkv2, 0, 0); enc->setBuffer(m_b_qkv, 0, 1)
 				enc->setBuffer(m_b_conv_states, conv_off, 2); enc->setBuffer(m_weights, woff(raw_data(la.conv.data)), 3)
@@ -1020,14 +1128,14 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
 				enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
-				enc_gemv(enc, la.out.kind, woff(raw_data(la.out.data)), m_b_lout, 0, m_b_xb2, 0, value_dim, dim)
-				enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb2, dim)
+				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
-
-			enc_copy(enc, m_b_x, 0, m_b_bx, off, dim)                          // x -> batch_x[t]
+			// batched out -> residual
+			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
+			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 		}
 
-		// ---- Phase B: batched MLP over all T tokens (Q4_K/Q6_K MMQ by weight kind) ----
+		// ---- batched MLP over all T tokens (Stage 1a) ----
 		enc_rmsnorm(enc, m_b_bx, m_b_bxb, raw_data(lw.ffn_norm), dim, T, eps)            // [T x dim] token-major
 		enc_tr_h16(enc, m_b_bxb, m_b_bxbh, T, dim)                                      // -> [dim x T] half
 		enc_mm(enc, lw.w1.kind, raw_data(lw.w1.data), m_b_bxbh, 0, m_b_bhb, 0, hidden_dim, T, dim)   // [hidden x T]
