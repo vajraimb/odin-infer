@@ -201,7 +201,8 @@ test_one_chunk :: proc(C: int, seed_in: u64) -> bool {
 		q_inv := q_scale / f32(math.max(math.sqrt(qs), 1e-6)); for i in 0 ..< hkd { qd[i] *= f64(q_inv) }
 		for i in 0 ..< hkd { q[t*hkd+i] = f32(qd[i]); k[t*hkd+i] = f32(kd[i]) }
 		for j in 0 ..< hvd { v[t*hvd+j] = f32(rng(&seed) * 2.0 - 1.0) }
-		beta[t] = 0.55; g[t] = 0.99
+		beta[t] = f32(0.2 + rng(&seed) * 0.6) // VARYING beta (was constant 0.55)
+		g[t] = f32(0.3 + rng(&seed) * 0.65)   // VARYING g in [0.3,0.95] (was constant 0.99)
 		delete(qd); delete(kd)
 	}
 	S_in := make([]f32, n)
