@@ -362,6 +362,110 @@ kernel void rmsnorm_gated(device float *out [[buffer(0)]], device const float *i
     }
 }
 
+// ---------- Stage 2 batched linear-attention kernels ----------
+// Batched l2norm+scale over [T tokens x n_kh key-heads]. q_in/k_in are the
+// per-token conv output [T x conv_dim]; q slice = [0,key_dim), k = [key_dim,2*key_dim).
+// Dispatch (T*n_kh) threadgroups of 32 threads. q_out/k_out are [T x key_dim].
+struct L2B { uint head_k_dim; uint key_dim; uint conv_dim; float eps; float scale; };
+kernel void l2norm_scale_batch(
+    device float * q_out [[buffer(0)]], device float * k_out [[buffer(1)]],
+    device const float * qkv [[buffer(2)]], constant L2B & P [[buffer(3)]],
+    uint g [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint hkd = P.head_k_dim, key_dim = P.key_dim, conv_dim = P.conv_dim;
+    uint n_kh = key_dim / hkd;
+    uint kh = g % n_kh;
+    uint tok = g / n_kh;
+    device const float *qi = qkv + (ulong)tok * conv_dim + (ulong)kh * hkd;
+    device const float *ki = qkv + (ulong)tok * conv_dim + (ulong)key_dim + (ulong)kh * hkd;
+    device float *qo = q_out + (ulong)tok * key_dim + (ulong)kh * hkd;
+    device float *ko = k_out + (ulong)tok * key_dim + (ulong)kh * hkd;
+    float sq = 0.0, sk = 0.0;
+    for (uint j = tid; j < hkd; j += 32) { sq += qi[j]*qi[j]; sk += ki[j]*ki[j]; }
+    sq = simd_sum(sq); sk = simd_sum(sk);
+    float iq = 1.0/max(sqrt(sq), P.eps)*P.scale, ik = 1.0/max(sqrt(sk), P.eps);
+    for (uint j = tid; j < hkd; j += 32) { qo[j] = qi[j]*iq; ko[j] = ki[j]*ik; }
+}
+
+// Batched RMSNormGated over [T tokens x n_vh value-heads]. in/gate are [T x value_dim].
+kernel void rmsnorm_gated_batch(
+    device float * out [[buffer(0)]], device const float * inp [[buffer(1)]],
+    device const float * weight [[buffer(2)]], device const float * gate [[buffer(3)]],
+    constant NormP & P [[buffer(4)]],
+    uint g [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint n = P.size;
+    device const float *xi = inp + (ulong)g * n; device float *oi = out + (ulong)g * n;
+    device const float *zi = gate + (ulong)g * n;
+    float ss = 0.0; for (uint j = tid; j < n; j += 32) ss += xi[j]*xi[j];
+    ss = simd_sum(ss); ss = ss/(float)n + P.eps; ss = rsqrt(ss);
+    for (uint j = tid; j < n; j += 32) {
+        float normed = weight[j]*(ss*xi[j]);
+        float gz = zi[j]*(1.0/(1.0+exp(-zi[j])));
+        oi[j] = normed*gz;
+    }
+}
+
+// Engine chunked gated-delta. One threadgroup per value-head (vh = grid x); TG = hvd
+// threads (one per v-col). Processes one chunk of C tokens starting at chunk_start.
+// q/k read strided from qlin_t/klin_t [T x key_dim] (k-head = vh % n_kh); v from
+// qkv2 [T x conv_dim] (v slice = 2*key_dim + vh*hvd); beta/g computed per token from
+// bt/at [T x n_vh] + a_decay/dt_bias [n_vh]. State S in rec_states [n_linear x n_vh x
+// hkd x hvd]. Writes outs to lout [T x value_dim] and the updated state. Matches the
+// validated delta_harness chunked_delta math (forward-sub, no inverse).
+struct ChunkP { uint hkd; uint hvd; uint C; uint key_dim; uint conv_dim; uint value_dim; uint n_vh; uint n_kh; uint chunk_start; uint slot; };
+kernel void chunked_delta(
+    device const float * qlin [[buffer(0)]], device const float * klin [[buffer(1)]],
+    device const float * qkv2 [[buffer(2)]], device const float * bt [[buffer(3)]],
+    device const float * at [[buffer(4)]], device const float * a_decay [[buffer(5)]],
+    device const float * dt_bias [[buffer(6)]], device float * rec_states [[buffer(7)]],
+    device float * lout [[buffer(8)]], constant ChunkP & P [[buffer(9)]],
+    uint vh [[threadgroup_position_in_grid]], uint vc [[thread_position_in_threadgroup]]) {
+    const uint hkd=P.hkd, hvd=P.hvd, C=P.C, key_dim=P.key_dim, conv_dim=P.conv_dim;
+    const uint value_dim=P.value_dim, n_vh=P.n_vh, kh = vh % P.n_kh, cs = P.chunk_start;
+    device float * S = rec_states + (ulong)P.slot * n_vh * hkd * hvd + (ulong)vh * hkd * hvd;
+    threadgroup float KKT[256]; threadgroup float KQT[256];
+    for (uint idx = vc; idx < C*C; idx += hvd) {
+        uint t = idx/C, i = idx - t*C;
+        device const float * ki = klin + (ulong)(cs+i)*key_dim + (ulong)kh*hkd;
+        device const float * kt = klin + (ulong)(cs+t)*key_dim + (ulong)kh*hkd;
+        device const float * qt = qlin + (ulong)(cs+t)*key_dim + (ulong)kh*hkd;
+        float dk=0, dq=0;
+        for (uint a=0;a<hkd;a++){ dk+=ki[a]*kt[a]; dq+=ki[a]*qt[a]; }
+        KKT[idx]=dk; KQT[idx]=dq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (vc >= hvd) return;
+    float beta[16], cp[16];
+    float a_dec = a_decay[vh], dtb = dt_bias[vh];
+    for (uint t=0;t<C;t++) {
+        float bv = bt[(ulong)(cs+t)*n_vh + vh];
+        float av = at[(ulong)(cs+t)*n_vh + vh];
+        beta[t] = 1.0f/(1.0f+exp(-bv));
+        float sp = av + dtb;
+        float softplus = sp > 20.0f ? sp : (sp < -20.0f ? 0.0f : log(1.0f+exp(sp)));
+        cp[t] = (t==0) ? exp(a_dec*softplus) : cp[t-1]*exp(a_dec*softplus);
+    }
+    float delta[16];
+    for (uint t=0;t<C;t++) {
+        device const float * kt = klin + (ulong)(cs+t)*key_dim + (ulong)kh*hkd;
+        float sik=0; for (uint a=0;a<hkd;a++) sik += S[a*hvd+vc]*kt[a];
+        float vval = qkv2[(ulong)(cs+t)*conv_dim + 2ull*key_dim + (ulong)vh*hvd + vc];
+        float d = beta[t]*vval - beta[t]*cp[t]*sik;
+        for (uint i=0;i<t;i++){ float L = beta[t]*(cp[t]/cp[i])*KKT[t*C+i]; d -= L*delta[i]; }
+        delta[t]=d;
+        device const float * qt = qlin + (ulong)(cs+t)*key_dim + (ulong)kh*hkd;
+        float siq=0; for (uint a=0;a<hkd;a++) siq += S[a*hvd+vc]*qt[a];
+        float o = cp[t]*siq;
+        for (uint i=0;i<=t;i++){ float pfac = (i<t)?cp[t]/cp[i]:1.0f; o += pfac*KQT[t*C+i]*delta[i]; }
+        lout[(ulong)(cs+t)*value_dim + (ulong)vh*hvd + vc] = o;
+    }
+    float cpC = cp[C-1];
+    for (uint a=0;a<hkd;a++){
+        float s = cpC*S[a*hvd+vc];
+        for (uint i=0;i<C;i++) s += (cpC/cp[i])*klin[(ulong)(cs+i)*key_dim+(ulong)kh*hkd+a]*delta[i];
+        S[a*hvd+vc] = s;
+    }
+}
+
 // ---------- batched prefill: Q4_K MMQ + helpers (BATCHED_PREFILL Stage 1a) ----------
 // Q4_K dequant matches ggml dequant_q4_k (ggml/quant.odin) exactly.
 inline void k4_get_scale_min(int j, device const uchar * q, thread uchar & d, thread uchar & m) {
@@ -555,6 +659,8 @@ m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 m_pso_q4k, m_pso_q6k, m_pso_cast, m_pso_copy, m_pso_tr_h16, m_pso_tr_f32: ^MTL.ComputePipelineState // Stage 1a
 @(private = "file")
 m_pso_conv_batch, m_pso_conv_update: ^MTL.ComputePipelineState // Stage 2 batched conv1d
+@(private = "file")
+m_pso_l2norm_batch, m_pso_rmsgated_batch, m_pso_chunked_delta: ^MTL.ComputePipelineState // Stage 2 chunked delta
 
 // activation buffers
 @(private = "file")
@@ -583,6 +689,7 @@ m_b_proj_outf: ^MTL.Buffer                         // [max_out x T] f32 MMQ outp
 @(private = "file")
 m_b_qproj_t, m_b_qkv_t: ^MTL.Buffer               // [T x 8192] wq / in_qkv output (token-major)
 m_b_qkv2_t: ^MTL.Buffer                            // [T x conv_dim] batched conv1d output (Stage 2)
+m_b_qlin_t, m_b_klin_t: ^MTL.Buffer                // [T x key_dim] batched l2norm'd q/k (Stage 2 chunked delta)
 @(private = "file")
 m_b_kt, m_b_vt: ^MTL.Buffer                        // [T x kv_dim] wk / wv output
 @(private = "file")
@@ -709,6 +816,9 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_cast = make_pso(lib, "cast_f32_f16"); m_pso_copy = make_pso(lib, "copy_f32")
 	m_pso_tr_h16 = make_pso(lib, "transpose_to_f16"); m_pso_tr_f32 = make_pso(lib, "transpose_f32")
 	m_pso_conv_batch = make_pso(lib, "conv1d_batch_silu"); m_pso_conv_update = make_pso(lib, "conv1d_update_state")
+	m_pso_l2norm_batch = make_pso(lib, "l2norm_scale_batch")
+	m_pso_rmsgated_batch = make_pso(lib, "rmsnorm_gated_batch")
+	m_pso_chunked_delta = make_pso(lib, "chunked_delta")
 
 	base := raw_data(g.mmap)
 	m_mmap_base = uintptr(base)
@@ -763,6 +873,8 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_b_qproj_t = new_shared_bytes(qproj_dim * mt * 4)
 	m_b_qkv_t = new_shared_bytes(conv_dim * mt * 4)
 	m_b_qkv2_t = new_shared_bytes(conv_dim * mt * 4) // Stage 2 batched conv1d output
+	m_b_qlin_t = new_shared_bytes(key_dim * mt * 4)
+	m_b_klin_t = new_shared_bytes(key_dim * mt * 4)
 	m_b_kt = new_shared_bytes(kv_dim * mt * 4)
 	m_b_vt = new_shared_bytes(kv_dim * mt * 4)
 	m_b_zt = new_shared_bytes(value_dim * mt * 4)
@@ -794,7 +906,7 @@ metal_destroy :: proc() {
 		m_b_qkv, m_b_qkv2, m_b_z, m_b_b, m_b_a, m_b_qlin, m_b_klin, m_b_lout,
 		m_b_conv_states, m_b_rec_states,
 		m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout, m_b_bhb, m_b_bhb2, m_b_bhb2h,
-		m_b_proj_half, m_b_proj_outf, m_b_qproj_t, m_b_qkv_t, m_b_qkv2_t, m_b_kt, m_b_vt,
+		m_b_proj_half, m_b_proj_outf, m_b_qproj_t, m_b_qkv_t, m_b_qkv2_t, m_b_qlin_t, m_b_klin_t, m_b_kt, m_b_vt,
 		m_b_zt, m_b_loutt, m_b_bt, m_b_at, m_b_xb3t, m_b_xb2t,
 	}) {
 		b->release()
@@ -936,6 +1048,43 @@ enc_conv1d_update :: proc(enc: ^MTL.ComputeCommandEncoder, x, conv_state: ^MTL.B
 	enc->setBytes(bytes_of(&P, size_of(P)), 2)
 	n := conv_dim * (kernel - 1); tg := min(n, 256)
 	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
+}
+
+// Stage 2: batched l2norm+scale over [T x n_kh] (q,k slices of conv output)
+@(private = "file")
+enc_l2norm_batch :: proc(enc: ^MTL.ComputeCommandEncoder, qkv, q_out, k_out: ^MTL.Buffer, hkd, key_dim, conv_dim, T, n_kh: int, scale: f32) {
+	enc->setComputePipelineState(m_pso_l2norm_batch)
+	enc->setBuffer(q_out, 0, 0); enc->setBuffer(k_out, 0, 1); enc->setBuffer(qkv, 0, 2)
+	P := struct { hkd: u32, key_dim: u32, conv_dim: u32, eps: f32, scale: f32 }{u32(hkd), u32(key_dim), u32(conv_dim), 1e-6, scale}
+	enc->setBytes(bytes_of(&P, size_of(P)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(T * n_kh), 1, 1}, MTL.Size{32, 1, 1})
+}
+
+// Stage 2: batched gated-rmsnorm over [T x n_vh]
+@(private = "file")
+enc_rmsgated_batch :: proc(enc: ^MTL.ComputeCommandEncoder, outp, inp: ^MTL.Buffer, weight: rawptr, gate: ^MTL.Buffer, head_v_dim, n_vh, T: int, eps: f32) {
+	enc->setComputePipelineState(m_pso_rmsgated_batch)
+	enc->setBuffer(outp, 0, 0); enc->setBuffer(inp, 0, 1); enc->setBuffer(m_weights, woff(weight), 2); enc->setBuffer(gate, 0, 3)
+	P := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
+	enc->setBytes(bytes_of(&P, size_of(P)), 4)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(T * n_vh), 1, 1}, MTL.Size{32, 1, 1})
+}
+
+// Stage 2: chunked gated-delta for one chunk of C tokens (grid = n_vh value-heads)
+@(private = "file")
+enc_chunked_delta :: proc(enc: ^MTL.ComputeCommandEncoder,
+	qlin, klin, qkv2, bt, at: ^MTL.Buffer, a_decay, dt_bias: rawptr, rec_states, lout: ^MTL.Buffer,
+	hkd, hvd, C, key_dim, conv_dim, value_dim, n_vh, n_kh, chunk_start, slot: int) {
+	enc->setComputePipelineState(m_pso_chunked_delta)
+	enc->setBuffer(qlin, 0, 0); enc->setBuffer(klin, 0, 1); enc->setBuffer(qkv2, 0, 2)
+	enc->setBuffer(bt, 0, 3); enc->setBuffer(at, 0, 4)
+	enc->setBuffer(m_weights, woff(a_decay), 5); enc->setBuffer(m_weights, woff(dt_bias), 6)
+	enc->setBuffer(rec_states, 0, 7); enc->setBuffer(lout, 0, 8)
+	P := struct {
+		hkd: u32, hvd: u32, C: u32, key_dim: u32, conv_dim: u32, value_dim: u32, n_vh: u32, n_kh: u32, chunk_start: u32, slot: u32,
+	}{u32(hkd), u32(hvd), u32(C), u32(key_dim), u32(conv_dim), u32(value_dim), u32(n_vh), u32(n_kh), u32(chunk_start), u32(slot)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 9)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(hvd), 1, 1})
 }
 
 @(private = "file")
@@ -1214,11 +1363,14 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			conv_off := NS.UInteger(slot * conv_state_stride * 4)
 			rec_off := NS.UInteger(slot * rec_state_stride * 4)
 			enc_conv1d_batch(enc, m_b_qkv_t, m_b_qkv2_t, m_b_conv_states, conv_off, raw_data(la.conv.data), conv_dim, T, kernel)
+			// NOTE: a chunked_delta integration (Stage 2) was validated in isolation
+			// (delta_harness) but the v1 engine wiring neither sped up prefill nor stayed
+			// bit-identical, and C=16 had an unresolved failure. It is reverted to the
+			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
-			// per-token stateful: l2norm / delta / gated-rmsnorm (conv is batched above)
 			for t in 0 ..< T {
 				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
-				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim) // batched conv out[t] -> scratch
+				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim)
 				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
 				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
 				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
@@ -1246,9 +1398,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
-			// slide conv_state to this chunk's last km1 inputs (prefix-cache / next-chunk resume)
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, T, kernel)
-			// batched out -> residual
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 		}

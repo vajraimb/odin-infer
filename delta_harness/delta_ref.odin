@@ -386,6 +386,13 @@ main :: proc() {
 	// harder: slow decay, long
 	c_ok = run_chunked(16, 1024, 0x222, beta_real, proc(t: int) -> f64 { return 0.999 }) && c_ok
 	c_ok = run_chunked(16, 1024, 0x333, proc(t: int) -> f64 { return 1.0 }, g_real) && c_ok
+	// VARYING beta/g at C=16 — does chunked diverge from tokenwise? (engine uses varying)
+	c_ok = run_chunked(16, 256, 0x444,
+		proc(t: int) -> f64 { return 0.3 + 0.4 * math.sin(f64(t)) },
+		proc(t: int) -> f64 { return 0.4 + 0.4 * math.cos(f64(t) * 0.7) }) && c_ok
+	c_ok = run_chunked(16, 256, 0x555,
+		proc(t: int) -> f64 { x := f64(t) * 0.31; return 0.2 + 0.6 * (x - math.floor(x)) },
+		proc(t: int) -> f64 { x := f64(t) * 0.47; return 0.25 + 0.6 * (x - math.floor(x)) }) && c_ok
 	all_ok = all_ok && c_ok
 
 	fmt.printfln("\n=== RESULT: {} ===", all_ok ? "f64 reference is a faithful golden standard (aligned to f32)" : "ALIGNMENT FAILED — investigate")
