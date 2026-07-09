@@ -10,6 +10,11 @@ collection for GGUF parsing and quantized dot products.
 > precompute, V-head tiled reorder, Metal buffer zeroing, etc.) with symptoms,
 > root causes, and a checklist.
 
+> **Next milestone: batched prefill.** [`BATCHED_PREFILL.md`](./BATCHED_PREFILL.md)
+> tracks the simdgroup-GEMM work that fixes slow prompt/tool-result prefill
+> (the agent/tool bottleneck). Stage 1a performance is verified (~50× potential),
+> blocked on simdgroup matrix layout correctness.
+
 ## Status
 
 **Validated end-to-end against the real `deepreinforce-ai/Ornith-1.0-9B-GGUF`
