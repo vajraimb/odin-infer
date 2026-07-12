@@ -403,13 +403,14 @@ malloc_run_state :: proc(s: ^Run_State, p: Config) {
 }
 
 free_run_state :: proc(s: ^Run_State) {
-	delete(s.x); delete(s.xb); delete(s.xb2)
-	delete(s.hb); delete(s.hb2); delete(s.logits)
-	delete(s.qproj); delete(s.q); delete(s.xb3); delete(s.att)
-	delete(s.qkv_raw); delete(s.qkv_out)
-	delete(s.z_vec); delete(s.b_vec); delete(s.a_vec)
-	delete(s.q_lin); delete(s.k_lin)
-	delete(s.lin_out); delete(s.delta_scr)
+	// Guarded: when Metal is active, Run_State was never allocated (all nil).
+	if s.x != nil { delete(s.x) }; if s.xb != nil { delete(s.xb) }; if s.xb2 != nil { delete(s.xb2) }
+	if s.hb != nil { delete(s.hb) }; if s.hb2 != nil { delete(s.hb2) }; if s.logits != nil { delete(s.logits) }
+	if s.qproj != nil { delete(s.qproj) }; if s.q != nil { delete(s.q) }; if s.xb3 != nil { delete(s.xb3) }; if s.att != nil { delete(s.att) }
+	if s.qkv_raw != nil { delete(s.qkv_raw) }; if s.qkv_out != nil { delete(s.qkv_out) }
+	if s.z_vec != nil { delete(s.z_vec) }; if s.b_vec != nil { delete(s.b_vec) }; if s.a_vec != nil { delete(s.a_vec) }
+	if s.q_lin != nil { delete(s.q_lin) }; if s.k_lin != nil { delete(s.k_lin) }
+	if s.lin_out != nil { delete(s.lin_out) }; if s.delta_scr != nil { delete(s.delta_scr) }
 	if s.key_cache != nil {
 		delete(s.key_cache); delete(s.value_cache)
 	}
@@ -418,7 +419,7 @@ free_run_state :: proc(s: ^Run_State) {
 	}
 }
 
-build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int) {
+build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int, skip_cpu_state: bool = false) {
 	ggml.parse_gguf(checkpoint_path, &t.gguf)
 	load_config(t)
 
@@ -443,7 +444,12 @@ build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int
 	}
 
 	memory_map_weights(t)
-	malloc_run_state(&t.state, t.config)
+	// When Metal is active, forward_gpu uses Metal buffers exclusively — the CPU
+	// Run_State (KV cache, conv/recurrent states, activations) is never read.
+	// Skip its allocation to save up to GBs of dead memory at large -c.
+	if !skip_cpu_state {
+		malloc_run_state(&t.state, t.config)
+	}
 
 	t.inv_freq = make([]f32, t.config.rotary_dim / 2)
 	inv_freq_default(t.config.rope_theta, t.config.rotary_dim, t.inv_freq)

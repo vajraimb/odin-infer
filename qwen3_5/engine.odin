@@ -18,16 +18,22 @@ Engine :: struct {
 engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 	e: Engine
 	matmul_set_threads(max(opts.num_threads, 1))
-	build_transformer(&e.transformer, path, opts.max_ctx)
+	// Skip CPU Run_State allocation when Metal is requested — forward_gpu uses
+	// Metal buffers exclusively, so the CPU KV/conv/recurrent state would be
+	// dead memory (up to GBs at large -c).
+	build_transformer(&e.transformer, path, opts.max_ctx, skip_cpu_state = opts.use_metal)
 
 	if opts.use_metal {
 		when ODIN_OS == .Darwin {
 			e.metal_ready = metal_init(&e.transformer)
 			if !e.metal_ready {
 				fmt.eprintln("metal: init failed, falling back to CPU")
+				// Metal failed → allocate CPU Run_State for the CPU forward path
+				malloc_run_state(&e.transformer.state, e.transformer.config)
 			}
 		} else {
 			fmt.eprintln("metal: only supported on macOS; using CPU")
+			malloc_run_state(&e.transformer.state, e.transformer.config)
 		}
 	}
 	return e, true
