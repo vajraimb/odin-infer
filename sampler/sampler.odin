@@ -21,6 +21,11 @@ Sampler :: struct {
 	rng_state:   u64,
 	repeat_penalty: f32,      // 1.0 = off; >1 penalises tokens seen in last_tokens
 	last_tokens:    [dynamic]int, // recent token ids (prompt + generated) to penalise
+	// Grammar-constrained decoding (nil = unconstrained). When set, sample()
+	// masks out tokens whose text would violate the grammar before sampling.
+	grammar:      ^JSON_Grammar,
+	token_bytes:  [][]u8,        // cache: token id → decoded bytes
+	eos_token:    int,           // EOS id allowed when grammar.is_completable()
 }
 
 build_sampler :: proc(s: ^Sampler, vocab_size: int, temperature, topp: f32, rng_seed: u64) {
@@ -54,6 +59,9 @@ free_sampler :: proc(s: ^Sampler) {
 	delete(s.probindex)
 	if s.last_tokens != nil {
 		delete(s.last_tokens)
+	}
+	if s.token_bytes != nil {
+		free_token_cache(s.token_bytes, s.vocab_size)
 	}
 }
 
@@ -139,10 +147,7 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 			if tok < 0 || tok >= s.vocab_size do continue
 			dup := false
 			for st in seen {
-				if st == tok {
-					dup = true
-					break
-				}
+				if st == tok { dup = true; break }
 			}
 			if dup do continue
 			append(&seen, tok)
@@ -154,18 +159,41 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 		}
 	}
 
+	// Grammar-constrained: mask out tokens whose decoded bytes would violate
+	// the grammar. EOS is allowed when the grammar is in a completable state.
+	if s.grammar != nil && s.token_bytes != nil {
+		mask := make([]bool, s.vocab_size, allocator = context.temp_allocator)
+		defer delete(mask)
+		compute_token_mask(s.grammar, s.vocab_size, s.token_bytes, mask)
+		if s.eos_token >= 0 && s.eos_token < s.vocab_size && is_completable(s.grammar) {
+			mask[s.eos_token] = true
+		}
+		apply_mask(logits, mask)
+	}
+
+	// Choose token
+	chosen: int
 	if s.temperature == 0.0 {
-		return sample_argmax(logits)
+		chosen = sample_argmax(logits)
+	} else {
+		for i in 0 ..< s.vocab_size {
+			logits[i] /= s.temperature
+		}
+		infer.softmax(logits[:s.vocab_size])
+		coin := random_f32(&s.rng_state)
+		if s.topp <= 0 || s.topp >= 1 {
+			chosen = sample_mult(logits[:s.vocab_size], coin)
+		} else {
+			chosen = sample_topp(logits[:s.vocab_size], s.topp, s.probindex, coin)
+		}
 	}
 
-	for i in 0 ..< s.vocab_size {
-		logits[i] /= s.temperature
+	// Advance grammar state by the chosen token's bytes (if grammar active).
+	// EOS doesn't consume bytes, so skip it.
+	if s.grammar != nil && s.token_bytes != nil && chosen != s.eos_token {
+		if chosen >= 0 && chosen < s.vocab_size {
+			_ = advance_bytes(s.grammar, s.token_bytes[chosen])
+		}
 	}
-	infer.softmax(logits[:s.vocab_size])
-
-	coin := random_f32(&s.rng_state)
-	if s.topp <= 0 || s.topp >= 1 {
-		return sample_mult(logits[:s.vocab_size], coin)
-	}
-	return sample_topp(logits[:s.vocab_size], s.topp, s.probindex, coin)
+	return chosen
 }
