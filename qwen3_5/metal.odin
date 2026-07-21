@@ -769,6 +769,198 @@ metal_reset_state :: proc() {
 	}
 }
 
+// KV persist: Metal stores K/V as f16 head-major [n_full, n_kv_heads, seq_len,
+// head_dim]. The on-disk canonical format is f32 layer-major [n_full, seq_len,
+// kv_dim] (= [n_full, seq_len, n_kv_heads, head_dim] flattened). We do the
+// conversion in both directions here. conv_states and recurrent_states are
+// already f32 standard layout on both backends — straight copy.
+
+metal_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
+	if !metal_enabled { fmt.eprintln("kv: metal not enabled"); return false }
+	c := &t.config
+	if n_valid_pos > c.seq_len {
+		fmt.eprintf("kv: n_valid_pos %d > seq_len %d\n", n_valid_pos, c.seq_len)
+		return false
+	}
+	h := build_header(t, n_valid_pos)
+	f, err := os.open(path, os.O_CREATE | os.O_WRONLY | os.O_TRUNC)
+	if err != os.ERROR_NONE {
+		fmt.eprintf("kv: cannot open %s for write (%v)\n", path, err)
+		return false
+	}
+	defer os.close(f)
+
+	write_header(f, h)
+
+	kv_dim := c.n_kv_heads * c.head_dim
+	kc_bytes := m_b_kc->contentsAsSlice([]u8)
+	vc_bytes := m_b_vc->contentsAsSlice([]u8)
+
+	// Per-layer temp buffer of [n_valid_pos * kv_dim] f32
+	tmp_size := n_valid_pos * kv_dim
+	tmp: []f32 = make([]f32, tmp_size)
+	defer delete(tmp)
+
+	for l in 0 ..< c.n_full {
+		// Metal per-layer offset: l * (seq_len * kv_dim * 2) bytes
+		layer_byte_off := u64(l) * u64(c.seq_len) * u64(kv_dim) * 2
+		// Convert head-major f16 → layer-major f32
+		for h_idx in 0 ..< c.n_kv_heads {
+			for p in 0 ..< n_valid_pos {
+				for d in 0 ..< c.head_dim {
+					m_off := int(layer_byte_off) +
+						(h_idx * c.seq_len * c.head_dim +
+						 p * c.head_dim +
+						 d) * 2
+					f16_raw := u16(kc_bytes[m_off]) | (u16(kc_bytes[m_off + 1]) << 8)
+					cpu_off := p * kv_dim + h_idx * c.head_dim + d
+					tmp[cpu_off] = f32(transmute(f16)(f16_raw))
+				}
+			}
+		}
+		if !write_f32_slice(f, tmp) {
+			fmt.eprintf("kv: K write failed at layer %d\n", l); return false
+		}
+		// V: same layout
+		for h_idx in 0 ..< c.n_kv_heads {
+			for p in 0 ..< n_valid_pos {
+				for d in 0 ..< c.head_dim {
+					m_off := int(layer_byte_off) +
+						(h_idx * c.seq_len * c.head_dim +
+						 p * c.head_dim +
+						 d) * 2
+					f16_raw := u16(vc_bytes[m_off]) | (u16(vc_bytes[m_off + 1]) << 8)
+					cpu_off := p * kv_dim + h_idx * c.head_dim + d
+					tmp[cpu_off] = f32(transmute(f16)(f16_raw))
+				}
+			}
+		}
+		if !write_f32_slice(f, tmp) {
+			fmt.eprintf("kv: V write failed at layer %d\n", l); return false
+		}
+	}
+
+	// conv_states, recurrent_states: f32 standard layout, straight write
+	conv_slice := (cast([^]f32)raw_data(m_b_conv_states->contentsAsSlice([]u8)))[:h.n_linear_layers * h.conv_dim * (h.lin_conv_kernel - 1)]
+	if !write_f32_slice(f, conv_slice) {
+		fmt.eprintln("kv: conv_states write failed"); return false
+	}
+	rec_n := h.n_linear_layers * h.lin_n_v_heads * h.lin_head_k_dim * h.lin_head_v_dim
+	rec_slice := (cast([^]f32)raw_data(m_b_rec_states->contentsAsSlice([]u8)))[:rec_n]
+	if !write_f32_slice(f, rec_slice) {
+		fmt.eprintln("kv: recurrent_states write failed"); return false
+	}
+
+	if !append_crc32(path) {
+		fmt.eprintln("kv: crc append failed"); return false
+	}
+	fmt.printfln("kv: saved (Metal) %s (%d valid pos, %d full L, kv_dim=%d)",
+		path, n_valid_pos, c.n_full, kv_dim)
+	return true
+}
+
+metal_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
+	if !metal_enabled { fmt.eprintln("kv: metal not enabled"); return 0, false }
+	f, err := os.open(path, os.O_RDONLY)
+	if err != os.ERROR_NONE {
+		fmt.eprintf("kv: cannot open %s (%v)\n", path, err)
+		return 0, false
+	}
+	defer os.close(f)
+
+	h, ok := read_header(f)
+	if !ok { fmt.eprintln("kv: header truncated"); return 0, false }
+	if h.magic != KV_MAGIC {
+		fmt.eprintf("kv: bad magic 0x%08x\n", h.magic); return 0, false
+	}
+	if h.version != KV_VERSION {
+		fmt.eprintf("kv: version mismatch (file=%d, supported=%d)\n", h.version, KV_VERSION); return 0, false
+	}
+	if h.arch != KV_ARCH_QWEN3_5 {
+		fmt.eprintf("kv: arch mismatch (file=%d, expected qwen3_5)\n", h.arch); return 0, false
+	}
+	expected_fp := model_fingerprint(t)
+	if h.fingerprint != expected_fp {
+		fmt.eprintf("kv: fingerprint mismatch (file=0x%016x, model=0x%016x)\n",
+			h.fingerprint, expected_fp)
+		return 0, false
+	}
+	c := &t.config
+	if int(h.seq_len) != c.seq_len {
+		fmt.eprintf("kv: seq_len mismatch (file=%d, engine=%d) — use same -c\n",
+			h.seq_len, c.seq_len)
+		return 0, false
+	}
+	if !verify_crc32(path) {
+		fmt.eprintln("kv: CRC mismatch — file corrupted"); return 0, false
+	}
+
+	// Zero the K/V GPU buffers first (everything beyond n_valid_pos is stale).
+	kc_bytes := m_b_kc->contentsAsSlice([]u8)
+	vc_bytes := m_b_vc->contentsAsSlice([]u8)
+	for i in 0 ..< len(kc_bytes) { kc_bytes[i] = 0 }
+	for i in 0 ..< len(vc_bytes) { vc_bytes[i] = 0 }
+
+	kv_dim := c.n_kv_heads * c.head_dim
+	tmp_size := int(h.n_valid_pos) * kv_dim
+	tmp: []f32 = make([]f32, tmp_size)
+	defer delete(tmp)
+
+	for l in 0 ..< c.n_full {
+		layer_byte_off := u64(l) * u64(c.seq_len) * u64(kv_dim) * 2
+		// K
+		if !read_f32_into(f, tmp) {
+			fmt.eprintf("kv: K read failed at layer %d\n", l); return 0, false
+		}
+		for h_idx in 0 ..< c.n_kv_heads {
+			for p in 0 ..< int(h.n_valid_pos) {
+				for d in 0 ..< c.head_dim {
+					m_off := int(layer_byte_off) +
+						(h_idx * c.seq_len * c.head_dim +
+						 p * c.head_dim +
+						 d) * 2
+					cpu_off := p * kv_dim + h_idx * c.head_dim + d
+					f16_raw := transmute(u16)(f16(tmp[cpu_off]))
+					kc_bytes[m_off]     = u8(f16_raw & 0xff)
+					kc_bytes[m_off + 1] = u8((f16_raw >> 8) & 0xff)
+				}
+			}
+		}
+		// V
+		if !read_f32_into(f, tmp) {
+			fmt.eprintf("kv: V read failed at layer %d\n", l); return 0, false
+		}
+		for h_idx in 0 ..< c.n_kv_heads {
+			for p in 0 ..< int(h.n_valid_pos) {
+				for d in 0 ..< c.head_dim {
+					m_off := int(layer_byte_off) +
+						(h_idx * c.seq_len * c.head_dim +
+						 p * c.head_dim +
+						 d) * 2
+					cpu_off := p * kv_dim + h_idx * c.head_dim + d
+					f16_raw := transmute(u16)(f16(tmp[cpu_off]))
+					vc_bytes[m_off]     = u8(f16_raw & 0xff)
+					vc_bytes[m_off + 1] = u8((f16_raw >> 8) & 0xff)
+				}
+			}
+		}
+	}
+
+	// conv_states, recurrent_states: f32 standard layout, straight read into GPU buffer
+	conv_dst := (cast([^]f32)raw_data(m_b_conv_states->contentsAsSlice([]u8)))[:h.n_linear_layers * h.conv_dim * (h.lin_conv_kernel - 1)]
+	if !read_f32_into(f, conv_dst) {
+		fmt.eprintln("kv: conv_states read failed"); return 0, false
+	}
+	rec_n := h.n_linear_layers * h.lin_n_v_heads * h.lin_head_k_dim * h.lin_head_v_dim
+	rec_dst := (cast([^]f32)raw_data(m_b_rec_states->contentsAsSlice([]u8)))[:rec_n]
+	if !read_f32_into(f, rec_dst) {
+		fmt.eprintln("kv: recurrent_states read failed"); return 0, false
+	}
+
+	fmt.printfln("kv: loaded (Metal) %s (%d valid pos)", path, h.n_valid_pos)
+	return int(h.n_valid_pos), true
+}
+
 @(private = "file")
 make_pso :: proc(lib: ^MTL.Library, name: string) -> ^MTL.ComputePipelineState {
 	ns_name := NS.String.alloc()->initWithOdinString(name)
