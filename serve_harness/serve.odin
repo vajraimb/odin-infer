@@ -25,8 +25,8 @@ package serve
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:strconv"
 import "core:strings"
-import "core:sys/posix"
 import "core:time"
 import q35 "qwen3_5:qwen3_5"
 import tok35 "qwen3_5_tokenizer:qwen3_5_tokenizer"
@@ -83,17 +83,35 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 	buf: [65536]u8
 	total := 0
 	header_end := -1
+	body_len_needed := 0  // expected body size from Content-Length
 	for total < len(buf) {
+		// If we already have headers + full body, stop reading.
+		if header_end >= 0 && total >= header_end + body_len_needed { break }
 		n, rerr := net.recv_tcp(client, buf[total:])
-		if n <= 0 || rerr != nil { return }
+		if n <= 0 || rerr != nil { break }
 		total += n
-		for i in 0 ..< total - 3 {
-			if buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
-				header_end = i + 4
-				break
+		if header_end < 0 {
+			// Look for end of headers (\r\n\r\n)
+			for i in 0 ..< total - 3 {
+				if buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
+					header_end = i + 4
+					break
+				}
+			}
+			if header_end >= 0 {
+				// Parse Content-Length from headers so we know how much body to wait for.
+				hdr_str := string(buf[:header_end])
+				cl_idx := strings.index(hdr_str, "Content-Length:")
+				if cl_idx >= 0 {
+					v_start := cl_idx + len("Content-Length:")
+					v_end_rel := strings.index(hdr_str[v_start:], "\r\n")
+					if v_end_rel > 0 {
+						v_str := strings.trim_space(hdr_str[v_start:v_start + v_end_rel])
+						body_len_needed, _ = strconv_parse_int(v_str)
+					}
+				}
 			}
 		}
-		if header_end >= 0 { break }
 	}
 	if header_end < 0 {
 		write_simple(client, 400, "text/plain", "no header end")
@@ -121,11 +139,8 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 		val := strings.trim_space(lines[i][colon+1:])
 		req.headers[key] = val
 	}
-	cl, ok := req.headers["Content-Length"]
-	body_len := 0
-	if ok { body_len, _ = strconv_parse_int(cl) }
-	if body_len > 0 && header_end + body_len <= total {
-		req.body = string(buf[header_end:header_end + body_len])
+	if body_len_needed > 0 && header_end + body_len_needed <= total {
+		req.body = string(buf[header_end:header_end + body_len_needed])
 	}
 	defer free_request_safe(&req)
 
@@ -237,8 +252,16 @@ handle_request :: proc(req: ^Request, resp: ^Response) {
 		resp.headers["Content-Type"] = "application/json"
 		resp.body = handle_chat(req.body)
 
+	case req.method == "POST" && (req.path == "/v1/chat/completions" || req.path == "/chat/completions"):
+		resp.headers["Content-Type"] = "application/json"
+		resp.body = handle_openai_chat(req.body)
+
+	case req.method == "GET" && req.path == "/v1/models":
+		resp.headers["Content-Type"] = "application/json"
+		resp.body = openai_models_list()
+
 	case req.method == "OPTIONS":
-		resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+		resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 		resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
 		resp.status = 204
 
@@ -253,18 +276,22 @@ handle_request :: proc(req: ^Request, resp: ^Response) {
 
 json_escape :: proc(s: string, out: ^strings.Builder) {
 	strings.write_byte(out, byte('"'))
-	for c in s {
+	// Iterate BYTES not runes — Chinese/emoji chars are multi-byte UTF-8 and
+	// must be preserved verbatim. Only ASCII control chars and JSON specials
+	// need escaping.
+	for i in 0 ..< len(s) {
+		c := s[i]
 		switch c {
-		case '"':  strings.write_string(out, "\\\"")
-		case '\\': strings.write_string(out, "\\\\")
-		case '\n': strings.write_string(out, "\\n")
-		case '\r': strings.write_string(out, "\\r")
-		case '\t': strings.write_string(out, "\\t")
+		case byte('"'):  strings.write_string(out, "\\\"")
+		case byte('\\'): strings.write_string(out, "\\\\")
+		case byte('\n'): strings.write_string(out, "\\n")
+		case byte('\r'): strings.write_string(out, "\\r")
+		case byte('\t'): strings.write_string(out, "\\t")
 		case:
 			if c < 0x20 {
-				strings.write_string(out, fmt.tprintf( "\\u%04x", c))
+				strings.write_string(out, fmt.tprintf("\\u%04x", c))
 			} else {
-				strings.write_byte(out, u8(c))
+				strings.write_byte(out, c)
 			}
 		}
 	}
@@ -408,14 +435,13 @@ extract_json_field :: proc(json, field: string) -> string {
 		if c == '\\' && i + 1 < len(json) {
 			i += 1
 			switch json[i] {
-			case 'n':  strings.write_byte(&out, '\n')
-			case 't':  strings.write_byte(&out, '\t')
-			case 'r':  strings.write_byte(&out, '\r')
-			case '"':  strings.write_byte(&out, '"')
-			case '\\': strings.write_byte(&out, '\\')
-			case '/':  strings.write_byte(&out, '/')
-			case:
-				strings.write_byte(&out, json[i])
+			case 'n':  strings.write_byte(&out, byte('\n'))
+			case 't':  strings.write_byte(&out, byte('\t'))
+			case 'r':  strings.write_byte(&out, byte('\r'))
+			case '"':  strings.write_byte(&out, byte('"'))
+			case '\\': strings.write_byte(&out, byte('\\'))
+			case '/':  strings.write_byte(&out, byte('/'))
+			case:      strings.write_byte(&out, json[i])
 			}
 		} else if c == '"' {
 			break
@@ -424,7 +450,240 @@ extract_json_field :: proc(json, field: string) -> string {
 		}
 		i += 1
 	}
-	return strings.to_string(out)
+	return strings.clone(strings.to_string(out))
+}
+
+// ====================== OpenAI-compatible API ======================
+
+// strings.index starting from byte offset `from`.
+index_from :: proc(s, sub: string, from: int) -> int {
+	if from >= len(s) { return -1 }
+	rel := strings.index(s[from:], sub)
+	if rel < 0 { return -1 }
+	return from + rel
+}
+
+// Extract all "content":"..." strings that are inside "role":"..." objects.
+// Very lenient: scans the messages array, extracts (role, content) pairs in
+// order. Ignores everything else (tool_calls, function_call, name, etc).
+openai_extract_messages :: proc(json: string) -> []Message_Pair {
+	out: [dynamic]Message_Pair
+	out = make([dynamic]Message_Pair, 0, 8)
+	defer delete(out)
+	// We scan for `"role":"X"` then look for the next `"content":"..."`.
+	i := 0
+	for i < len(json) - 8 {
+		// find next "role"
+		role_idx := index_from(json, `"role":"`, i)
+		if role_idx < 0 { break }
+		r_start := role_idx + len(`"role":"`)
+		r_end := index_from(json, `"`, r_start)
+		if r_end < 0 { break }
+		role := json[r_start:r_end]
+		// find next "content"
+		c_idx := index_from(json, `"content":"`, r_end)
+		if c_idx < 0 { break }
+		c_start := c_idx + len(`"content":"`)
+		// walk to matching closing quote, honoring escapes
+		j := c_start
+		content_buf: strings.Builder
+		strings.builder_init(&content_buf, context.temp_allocator)
+		for j < len(json) {
+			ch := json[j]
+			if ch == '\\' && j + 1 < len(json) {
+				j += 1
+				switch json[j] {
+				case 'n':  strings.write_byte(&content_buf, byte('\n'))
+				case 't':  strings.write_byte(&content_buf, byte('\t'))
+				case 'r':  strings.write_byte(&content_buf, byte('\r'))
+				case '"':  strings.write_byte(&content_buf, byte('"'))
+				case '\\': strings.write_byte(&content_buf, byte('\\'))
+				case '/':  strings.write_byte(&content_buf, byte('/'))
+				case:      strings.write_byte(&content_buf, json[j])
+				}
+			} else if ch == '"' {
+				break
+			} else {
+				strings.write_byte(&content_buf, ch)
+			}
+			j += 1
+		}
+		append(&out, Message_Pair{
+			role = role,
+			content = strings.clone(strings.to_string(content_buf)),
+		})
+		strings.builder_destroy(&content_buf)
+		i = j + 1
+	}
+	// Copy dynamic to plain slice (caller owns; entries' strings are heap-allocated)
+	result := make([]Message_Pair, len(out))
+	for k in 0 ..< len(out) { result[k] = out[k] }
+	return result
+}
+
+Message_Pair :: struct {
+	role:    string,
+	content: string,
+}
+
+free_message_pairs :: proc(msgs: []Message_Pair) {
+	for m in msgs {
+		delete(m.content)
+	}
+	delete(msgs)
+}
+
+
+openai_models_list :: proc() -> string {
+	out: strings.Builder
+	strings.builder_init(&out, context.temp_allocator)
+	defer strings.builder_destroy(&out)
+	strings.write_string(&out, `{"object":"list","data":[{"id":"odin-infer","object":"model","created":0,"owned_by":"local"}]}`)
+	return strings.clone(strings.to_string(out))
+}
+
+handle_openai_chat :: proc(body: string) -> string {
+	// Extract messages array
+	msgs := openai_extract_messages(body)
+	defer free_message_pairs(msgs)
+	if len(msgs) == 0 {
+		return `{"error":{"message":"no messages found","type":"invalid_request_error"}}`
+	}
+
+	// Optional: parse max_tokens (default 256), temperature (default 0.6)
+	max_tokens := parse_int_field(body, "max_tokens", 256)
+	temperature := parse_f32_field(body, "temperature", 0.6)
+	_ = temperature  // currently unused; could set on sampler
+
+	// Render conversation as Qwen chat template (stateless per request)
+	prompt_buf: strings.Builder
+	strings.builder_init(&prompt_buf, context.allocator)
+	defer strings.builder_destroy(&prompt_buf)
+	for m in msgs {
+		// role normalization: tool/function -> user
+		role := m.role
+		if role != "system" && role != "user" && role != "assistant" {
+			role = "user"
+		}
+		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
+	}
+	strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
+
+	prompt := strings.clone(strings.to_string(prompt_buf))
+	defer delete(prompt)
+
+	// RESET engine state for stateless OpenAI semantics
+	q35.engine_reset_state(&g_state.engine)
+	g_state.pos = 0
+
+	encoded, err := tok35.encode(&g_state.tok, prompt)
+	if err != nil {
+		return `{"error":{"message":"encode failed","type":"internal_error"}}`
+	}
+
+	// Prefill all but last token
+	if len(encoded) > 1 {
+		_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
+		g_state.pos = len(encoded) - 1
+	}
+
+	// Generate
+	gen_buf: strings.Builder
+	strings.builder_init(&gen_buf, context.allocator)
+	defer strings.builder_destroy(&gen_buf)
+
+	t_start := time_to_ms()
+	t_first := t_start
+	gen := 0
+	next: int = 0
+
+	if g_state.pos > 0 && len(encoded) > 0 {
+		last := encoded[len(encoded) - 1]
+		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
+		next = sampler.sample(&g_state.samp, logits)
+	} else {
+		return `{"error":{"message":"empty prompt","type":"internal_error"}}`
+	}
+
+	for gen < max_tokens {
+		if next == EOS { break }
+		decoded := tok35.decode_token_id(&g_state.tok, next)
+		strings.write_string(&gen_buf, decoded)
+		delete(decoded)
+		if gen == 0 { t_first = time_to_ms() }
+		gen += 1
+		g_state.pos += 1
+		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
+		logits := q35.engine_forward(&g_state.engine, next, g_state.pos - 1)
+		next = sampler.sample(&g_state.samp, logits)
+	}
+
+	ttft := t_first - t_start
+	t_total := time_to_ms() - t_start
+	tps := gen > 0 && t_total > 0 ? f64(gen) * 1000.0 / f64(t_total) : 0.0
+	g_state.last_ttft = ttft
+	g_state.last_tps = tps
+	g_state.last_gen = gen
+
+	response_text := strings.to_string(gen_buf)
+
+	// Build OpenAI-format response
+	out: strings.Builder
+	strings.builder_init(&out, context.allocator)
+	defer strings.builder_destroy(&out)
+	strings.write_string(&out, "{")
+	strings.write_string(&out, fmt.tprintf(`"id":"chatcmpl-%d",`, t_start))
+	strings.write_string(&out, `"object":"chat.completion",`)
+	strings.write_string(&out, fmt.tprintf(`"created":%d,`, t_start / 1000))
+	strings.write_string(&out, `"model":"odin-infer",`)
+	strings.write_string(&out, `"choices":[{`)
+	strings.write_string(&out, `"index":0,`)
+	strings.write_string(&out, `"message":{"role":"assistant","content":`)
+	json_escape(response_text, &out)
+	strings.write_string(&out, "},")
+	strings.write_string(&out, fmt.tprintf(`"finish_reason":"%s"`, next == EOS ? "stop" : "length"))
+	strings.write_string(&out, "}],")
+	strings.write_string(&out, `"usage":{`)
+	strings.write_string(&out, fmt.tprintf(`"prompt_tokens":%d,`, len(encoded)))
+	strings.write_string(&out, fmt.tprintf(`"completion_tokens":%d,`, gen))
+	strings.write_string(&out, fmt.tprintf(`"total_tokens":%d`, len(encoded) + gen))
+	strings.write_string(&out, "}}")
+	final := strings.clone(strings.to_string(out))
+		len(encoded), gen, tps, ttft)
+	return final
+}
+
+parse_int_field :: proc(json, field: string, def: int) -> int {
+	key := fmt.tprintf("\"%s\":", field)
+	idx := strings.index(json, key)
+	if idx < 0 { return def }
+	i := idx + len(key)
+	for i < len(json) && (json[i] == ' ' || json[i] == '\t') { i += 1 }
+	v: int = 0
+	got := false
+	for i < len(json) && json[i] >= '0' && json[i] <= '9' {
+		v = v * 10 + int(json[i] - '0')
+		got = true
+		i += 1
+	}
+	return got ? v : def
+}
+
+parse_f32_field :: proc(json, field: string, def: f32) -> f32 {
+	key := fmt.tprintf("\"%s\":", field)
+	idx := strings.index(json, key)
+	if idx < 0 { return def }
+	i := idx + len(key)
+	for i < len(json) && (json[i] == ' ' || json[i] == '\t') { i += 1 }
+	// scan a float
+	start := i
+	for i < len(json) && ((json[i] >= '0' && json[i] <= '9') || json[i] == '.' || json[i] == '-' || json[i] == '+' || json[i] == 'e' || json[i] == 'E') {
+		i += 1
+	}
+	if start == i { return def }
+	v, ok := strconv.parse_f64(json[start:i])
+	if !ok { return def }
+	return f32(v)
 }
 
 // ====================== entry ======================

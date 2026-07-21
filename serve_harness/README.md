@@ -27,12 +27,67 @@ Then open `http://127.0.0.1:9748` in a browser.
 
 ## Endpoints
 
-| Method | Path          | Returns                                                |
-|--------|---------------|--------------------------------------------------------|
-| GET    | `/`           | HTML dashboard (chat UI + live metrics, polls /api/*) |
-| GET    | `/api/info`   | JSON: model dims, vocab, seq_len, metal                |
-| GET    | `/api/state`  | JSON: current pos, last tok/s, last TTFT               |
-| POST   | `/api/chat`   | JSON `{message}` → `{response, tok_per_s, ttft_ms, …}` |
+| Method | Path                       | Returns                                                |
+|--------|----------------------------|--------------------------------------------------------|
+| GET    | `/`                        | HTML dashboard (chat UI + live metrics, polls /api/*) |
+| GET    | `/api/info`                | JSON: model dims, vocab, seq_len, metal                |
+| GET    | `/api/state`               | JSON: current pos, last tok/s, last TTFT               |
+| POST   | `/api/chat`                | JSON `{message}` → `{response, tok_per_s, ttft_ms, …}` |
+| POST   | `/v1/chat/completions`     | **OpenAI-compatible** — for any agent client (pie, Cline, etc.) |
+| GET    | `/v1/models`               | OpenAI-compatible model list                           |
+
+## OpenAI-compatible API
+
+`/v1/chat/completions` accepts the standard OpenAI Chat Completions request
+format and returns the standard response shape. Use it with any OpenAI client:
+
+```sh
+curl http://127.0.0.1:9748/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "odin-infer",
+    "messages": [
+      {"role": "system", "content": "Be helpful."},
+      {"role": "user", "content": "What is 2+2?"}
+    ],
+    "max_tokens": 64
+  }'
+```
+
+Response:
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": ...,
+  "model": "odin-infer",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "4"},
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13}
+}
+```
+
+### Configuring pie / Cline / other OpenAI clients
+
+Point your client at the local server:
+
+- **Base URL**: `http://127.0.0.1:9748/v1`
+- **API Key**: any string (server doesn't validate)
+- **Model**: `odin-infer`
+
+### Stateless semantics
+
+Each `/v1/chat/completions` call **resets engine state** and re-prefills the
+full `messages` array. This matches OpenAI's stateless model — clients send
+the entire conversation history each turn. Internally, KV/SSM state is wiped
+via `engine_reset_state` before each request.
+
+By contrast, `POST /api/chat` (the dashboard's endpoint) is **stateful** —
+each call continues from the previous `pos`. Don't mix the two for the same
+conversation.
 
 ## Dashboard
 
