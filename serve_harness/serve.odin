@@ -350,6 +350,12 @@ handle_request :: proc(client: net.TCP_Socket, req: ^Request, resp: ^Response) -
 		resp.body = json_state()
 
 	case req.method == "POST" && req.path == "/api/chat":
+		// Auto-detect: Ollama-style (has "messages" array) vs dashboard (has "message" string)
+		if strings.contains(req.body, `"messages":`) {
+			write_ndjson_headers(client)
+			handle_ollama_chat_stream(client, req.body)
+			return true
+		}
 		resp.headers["Content-Type"] = "application/json"
 		resp.body = handle_chat(req.body)
 
@@ -362,6 +368,16 @@ handle_request :: proc(client: net.TCP_Socket, req: ^Request, resp: ^Response) -
 		write_sse_headers(client)
 		handle_openai_responses_stream(client, req.body)
 		return true
+
+	case req.method == "POST" && req.path == "/api/chat-ollama":
+		// deprecated — /api/chat auto-detects now. Kept for backward compat.
+		write_ndjson_headers(client)
+		handle_ollama_chat_stream(client, req.body)
+		return true
+
+	case req.method == "GET" && req.path == "/api/tags":
+		resp.headers["Content-Type"] = "application/json"
+		resp.body = `{"models":[{"name":"ornith","model":"ornith","size":0,"digest":"","modified":"","details":{"family":"qwen3_5","parameter_size":"9B","quantization_level":"Q4_K_M"}}]}`
 
 	case req.method == "GET" && req.path == "/v1/models":
 		resp.headers["Content-Type"] = "application/json"
@@ -561,12 +577,118 @@ extract_json_field :: proc(json, field: string) -> string {
 	return strings.clone(strings.to_string(out))
 }
 
+// ====================== Ollama-compatible API (pie-odin's odinfer provider) ======================
+
+// Pie-odin sends: POST /api/chat {"model":"ornith","messages":[...],"stream":true,"options":{...}}
+// Expects NDJSON response: one JSON object per line, each {"message":{"role":"assistant","content":"delta"},"done":false}
+// Final line: {"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",...}
+handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
+	// Extract messages from Ollama-format request
+	msgs := openai_extract_messages(body)  // works for {"role":"X","content":"Y"} too
+	defer free_message_pairs(msgs)
+	if len(msgs) == 0 {
+		ndjson_write(client, `{"error":"no messages"}`)
+		ndjson_end(client)
+		return
+	}
+
+	max_tokens := parse_int_field(body, "num_predict", 256)
+	if max_tokens == 0 { max_tokens = 256 }
+
+	// RESET engine state per request
+	q35.engine_reset_state(&g_state.engine)
+	g_state.pos = 0
+
+	// Render Qwen chat template
+	prompt_buf: strings.Builder
+	strings.builder_init(&prompt_buf, context.allocator)
+	defer strings.builder_destroy(&prompt_buf)
+	for m in msgs {
+		role := m.role
+		if role != "system" && role != "user" && role != "assistant" {
+			role = "user"
+		}
+		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
+	}
+	strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
+
+	prompt := strings.clone(strings.to_string(prompt_buf))
+	defer delete(prompt)
+
+	encoded, err := tok35.encode(&g_state.tok, prompt)
+	if err != nil {
+		ndjson_write(client, `{"error":"encode failed"}`)
+		ndjson_end(client)
+		return
+	}
+	if len(encoded) > 1 {
+		_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
+		g_state.pos = len(encoded) - 1
+	}
+
+	gen := 0
+	next: int = 0
+
+	if g_state.pos > 0 && len(encoded) > 0 {
+		last := encoded[len(encoded) - 1]
+		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
+		next = sampler.sample(&g_state.samp, logits)
+	}
+
+	finish_reason := "stop"
+	for gen < max_tokens {
+		if next == EOS { finish_reason = "stop"; break }
+		decoded := tok35.decode_token_id(&g_state.tok, next)
+		if len(decoded) > 0 {
+			// One NDJSON line per token delta
+			line := concat_json(
+				`{"message":{"role":"assistant","content":`, json_quote(decoded), `},"done":false}`)
+			ndjson_write(client, line)
+		}
+		delete(decoded)
+		gen += 1
+		g_state.pos += 1
+		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len {
+			finish_reason = "length"
+			break
+		}
+		logits := q35.engine_forward(&g_state.engine, next, g_state.pos - 1)
+		next = sampler.sample(&g_state.samp, logits)
+	}
+
+	// Final done line with usage stats
+	final_line := concat_json(
+		`{"message":{"role":"assistant","content":""},"done":true,"done_reason":"`, finish_reason, `","input_tokens":`, fmt.tprintf("%d", len(encoded)), `,"output_tokens":`, fmt.tprintf("%d", gen), `}`)
+	ndjson_write(client, final_line)
+	ndjson_end(client)
+	fmt.eprintfln("ollama: %d in / %d out", len(encoded), gen)
+}
+
 // ====================== OpenAI Responses API (streaming, for Codex) ======================
 
 // Write HTTP/1.1 headers for SSE streaming response (chunked encoding).
 write_sse_headers :: proc(client: net.TCP_Socket) {
 	hdr := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
 	_, _ = net.send_tcp(client, transmute([]byte)hdr)
+}
+
+// Write HTTP/1.1 headers for NDJSON streaming (Ollama-compatible).
+write_ndjson_headers :: proc(client: net.TCP_Socket) {
+	hdr := "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+	_, _ = net.send_tcp(client, transmute([]byte)hdr)
+}
+
+// Write one NDJSON line as a single HTTP chunk.
+ndjson_write :: proc(client: net.TCP_Socket, json_line: string) {
+	// Each NDJSON line: <json>\n  wrapped in chunked encoding
+	body := fmt.tprintf("%s\n", json_line)
+	chunk := fmt.tprintf("%x\r\n%s\r\n", len(body), body)
+	_, _ = net.send_tcp(client, transmute([]byte)chunk)
+}
+
+ndjson_end :: proc(client: net.TCP_Socket) {
+	end_marker := "0\r\n\r\n"
+	_, _ = net.send_tcp(client, transmute([]byte)end_marker)
 }
 
 // Write one SSE event as a single HTTP/1.1 chunk.
