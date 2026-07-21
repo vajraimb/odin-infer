@@ -1,0 +1,3 @@
+# Fixture binaries are large (~10-50 MB) and model-specific.
+# Regenerate locally with gen_fixture.py (or gen_self_fixture.odin).
+*.bin
