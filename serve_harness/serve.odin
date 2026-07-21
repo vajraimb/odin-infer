@@ -649,7 +649,6 @@ handle_openai_chat :: proc(body: string) -> string {
 	strings.write_string(&out, fmt.tprintf(`"total_tokens":%d`, len(encoded) + gen))
 	strings.write_string(&out, "}}")
 	final := strings.clone(strings.to_string(out))
-		len(encoded), gen, tps, ttft)
 	return final
 }
 
