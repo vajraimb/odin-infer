@@ -47,7 +47,9 @@ free_request :: proc(r: ^Request) {
 	delete(r.headers)
 }
 
-Server_Handler :: proc(req: ^Request, resp: ^Response)
+Server_Handler :: proc(client: net.TCP_Socket, req: ^Request, resp: ^Response) -> bool
+// Returns true if the handler already wrote the response to the socket
+// (e.g., streaming SSE) and the caller should NOT call write_full_response.
 
 Response :: struct {
 	status:  int,
@@ -80,13 +82,29 @@ start_server :: proc(port: u16, handler: Server_Handler) -> bool {
 }
 
 handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
-	buf: [65536]u8
+	// Heap-allocated buffer — Codex prompts can be 100KB+ (tools spec + history)
+	buf := make([]u8, 2_000_000, context.allocator)
+	defer delete(buf)
 	total := 0
 	header_end := -1
 	body_len_needed := 0  // expected body size from Content-Length
+	chunked_request := false
 	for total < len(buf) {
 		// If we already have headers + full body, stop reading.
-		if header_end >= 0 && total >= header_end + body_len_needed { break }
+		if header_end >= 0 {
+			if chunked_request {
+				// check for end-of-chunks marker (0\r\n\r\n)
+				if total >= header_end + 5 {
+					// look for "0\r\n\r\n" in the body part
+					body := buf[header_end:total]
+					if _last_5_eq(body, "\r\n0\r\n\r\n") || _has_terminator(body) {
+						break
+					}
+				}
+			} else if total >= header_end + body_len_needed {
+				break
+			}
+		}
 		n, rerr := net.recv_tcp(client, buf[total:])
 		if n <= 0 || rerr != nil { break }
 		total += n
@@ -99,15 +117,23 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 				}
 			}
 			if header_end >= 0 {
-				// Parse Content-Length from headers so we know how much body to wait for.
 				hdr_str := string(buf[:header_end])
-				cl_idx := strings.index(hdr_str, "Content-Length:")
-				if cl_idx >= 0 {
-					v_start := cl_idx + len("Content-Length:")
-					v_end_rel := strings.index(hdr_str[v_start:], "\r\n")
-					if v_end_rel > 0 {
-						v_str := strings.trim_space(hdr_str[v_start:v_start + v_end_rel])
-						body_len_needed, _ = strconv_parse_int(v_str)
+				// Detect chunked transfer encoding
+				if strings.contains(hdr_str, "Transfer-Encoding: chunked") ||
+				   strings.contains(hdr_str, "transfer-encoding: chunked") {
+					chunked_request = true
+				}
+				// Parse Content-Length if not chunked
+				if !chunked_request {
+					cl_idx := strings.index(hdr_str, "Content-Length:")
+					if cl_idx < 0 { cl_idx = strings.index(hdr_str, "content-length:") }
+					if cl_idx >= 0 {
+						v_start := cl_idx + len("Content-Length:")
+						v_end_rel := strings.index(hdr_str[v_start:], "\r\n")
+						if v_end_rel > 0 {
+							v_str := strings.trim_space(hdr_str[v_start:v_start + v_end_rel])
+							body_len_needed, _ = strconv_parse_int(v_str)
+						}
 					}
 				}
 			}
@@ -139,7 +165,14 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 		val := strings.trim_space(lines[i][colon+1:])
 		req.headers[key] = val
 	}
-	if body_len_needed > 0 && header_end + body_len_needed <= total {
+
+	// Extract body
+	if chunked_request {
+		// Decode chunked body from buf[header_end:total]
+		body := decode_chunked(buf[header_end:total])
+		req.body = body
+		defer delete(body)
+	} else if body_len_needed > 0 && header_end + body_len_needed <= total {
 		req.body = string(buf[header_end:header_end + body_len_needed])
 	}
 	defer free_request_safe(&req)
@@ -148,9 +181,77 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 	resp.status = 200
 	resp.headers = make(map[string]string)
 	defer delete_resp_headers(&resp)
-	handler(&req, &resp)
+	streamed := handler(client, &req, &resp)
+	if !streamed {
+		write_full_response(client, &resp)
+	}
+}
 
-	write_full_response(client, &resp)
+// Look for chunked-body terminator "0\r\n\r\n" anywhere in body
+_has_terminator :: proc(body: []u8) -> bool {
+	if len(body) < 5 { return false }
+	for i in 0 ..< len(body) - 4 {
+		if body[i] == '\r' && body[i+1] == '\n' && body[i+2] == '0' && body[i+3] == '\r' && body[i+4] == '\n' {
+			return true
+		}
+	}
+	return false
+}
+
+_last_5_eq :: proc(body: []u8, suffix: string) -> bool {
+	if len(body) < len(suffix) { return false }
+	for i in 0 ..< len(suffix) {
+		if body[len(body) - len(suffix) + i] != suffix[i] { return false }
+	}
+	return true
+}
+
+// Decode HTTP/1.1 chunked transfer encoding from raw bytes.
+decode_chunked :: proc(raw: []u8) -> string {
+	out: strings.Builder
+	strings.builder_init(&out, context.allocator)
+	i := 0
+	for i < len(raw) {
+		// read chunk size line (hex until \r\n)
+		line_end := i
+		for line_end + 1 < len(raw) && !(raw[line_end] == '\r' && raw[line_end+1] == '\n') {
+			line_end += 1
+		}
+		size_str := string(raw[i:line_end])
+		// strip any chunk extensions (;...)
+		semi := strings.index(size_str, ";")
+		if semi >= 0 { size_str = size_str[:semi] }
+		size_str = strings.trim_space(size_str)
+		chunk_size, ok := parse_hex(size_str)
+		if !ok { break }
+		i = line_end + 2  // skip \r\n
+		if chunk_size == 0 { break }
+		if i + chunk_size > len(raw) { break }
+		strings.write_bytes(&out, raw[i:i + chunk_size])
+		i += chunk_size + 2  // skip data + \r\n
+	}
+	return strings.to_string(out)
+}
+
+parse_hex :: proc(s: string) -> (int, bool) {
+	v: int = 0
+	got := false
+	for c in s {
+		switch {
+		case c >= '0' && c <= '9':
+			v = v * 16 + int(c - '0')
+			got = true
+		case c >= 'a' && c <= 'f':
+			v = v * 16 + int(c - 'a') + 10
+			got = true
+		case c >= 'A' && c <= 'F':
+			v = v * 16 + int(c - 'A') + 10
+			got = true
+		case:
+			return 0, false
+		}
+	}
+	return v, got
 }
 
 free_request_safe :: proc(r: ^Request) {
@@ -234,7 +335,7 @@ INDEX_HTML := #load ("./index.html")
 
 // ====================== request handlers ======================
 
-handle_request :: proc(req: ^Request, resp: ^Response) {
+handle_request :: proc(client: net.TCP_Socket, req: ^Request, resp: ^Response) -> bool {
 	switch {
 	case req.method == "GET" && req.path == "/":
 		resp.headers["Content-Type"] = "text/html; charset=utf-8"
@@ -256,6 +357,12 @@ handle_request :: proc(req: ^Request, resp: ^Response) {
 		resp.headers["Content-Type"] = "application/json"
 		resp.body = handle_openai_chat(req.body)
 
+	case req.method == "POST" && req.path == "/v1/responses":
+		// SSE streaming — write directly to socket, signal caller to skip
+		write_sse_headers(client)
+		handle_openai_responses_stream(client, req.body)
+		return true
+
 	case req.method == "GET" && req.path == "/v1/models":
 		resp.headers["Content-Type"] = "application/json"
 		resp.body = openai_models_list()
@@ -270,6 +377,7 @@ handle_request :: proc(req: ^Request, resp: ^Response) {
 		resp.headers["Content-Type"] = "application/json"
 		resp.body = `{"error": "not found"}`
 	}
+	return false
 }
 
 // ====================== JSON builders ======================
@@ -445,6 +553,213 @@ extract_json_field :: proc(json, field: string) -> string {
 			}
 		} else if c == '"' {
 			break
+		} else {
+			strings.write_byte(&out, c)
+		}
+		i += 1
+	}
+	return strings.clone(strings.to_string(out))
+}
+
+// ====================== OpenAI Responses API (streaming, for Codex) ======================
+
+// Write HTTP/1.1 headers for SSE streaming response (chunked encoding).
+write_sse_headers :: proc(client: net.TCP_Socket) {
+	hdr := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+	_, _ = net.send_tcp(client, transmute([]byte)hdr)
+}
+
+// Write one SSE event as a single HTTP/1.1 chunk.
+sse_write :: proc(client: net.TCP_Socket, event_name, data: string) {
+	// SSE event format uses CRLF line endings.
+	body := fmt.tprintf("event: %s\r\ndata: %s\r\n\r\n", event_name, data)
+	// Wrap in chunked encoding: <hex_size>\r\n<data>\r\n
+	chunk := fmt.tprintf("%x\r\n%s\r\n", len(body), body)
+	_, _ = net.send_tcp(client, transmute([]byte)chunk)
+}
+
+// End the chunked stream (write terminating 0-length chunk).
+sse_end :: proc(client: net.TCP_Socket) {
+	end_marker := "0\r\n\r\n"
+	_, _ = net.send_tcp(client, transmute([]byte)end_marker)
+}
+
+handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
+	input_str := extract_responses_input(body)
+	max_tokens := parse_int_field(body, "max_output_tokens", 256)
+
+	resp_id := fmt.tprintf("resp_%d", time_to_ms())
+
+	if len(input_str) == 0 {
+		sse_write(client, "error", `{"error":"no input"}`)
+		return
+	}
+
+	// RESET engine state per request
+	q35.engine_reset_state(&g_state.engine)
+	g_state.pos = 0
+
+	rendered := fmt.tprintf("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n", input_str)
+	encoded, err := tok35.encode(&g_state.tok, rendered)
+	if err != nil {
+		sse_write(client, "error", `{"error":"encode failed"}`)
+		return
+	}
+	if len(encoded) > 1 {
+		_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
+		g_state.pos = len(encoded) - 1
+	}
+
+	// Opening events — note: each data MUST include "type" matching event name
+	sse_write(client, "response.created",
+		concat_json(
+			`{"type":"response.created","response":{`,
+			`"id":"`, resp_id, `","object":"response","status":"in_progress","model":"odin-infer"}}`))
+	sse_write(client, "response.output_item.added",
+		concat_json(
+			`{"type":"response.output_item.added","output_index":0,"item":`,
+			`{"id":"msg_0","type":"message","role":"assistant","status":"in_progress","content":[]}}`))
+	sse_write(client, "response.content_part.added",
+		concat_json(
+			`{"type":"response.content_part.added","output_index":0,"content_index":0,"part":`,
+			`{"type":"output_text","text":"","annotations":[]}}`))
+
+	// Generate tokens, streaming deltas as they arrive
+	gen := 0
+	next: int = 0
+	full_text: strings.Builder
+	strings.builder_init(&full_text, context.allocator)
+	defer strings.builder_destroy(&full_text)
+
+	if g_state.pos > 0 && len(encoded) > 0 {
+		last := encoded[len(encoded) - 1]
+		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
+		next = sampler.sample(&g_state.samp, logits)
+	}
+
+	for gen < max_tokens {
+		if next == EOS { break }
+		decoded := tok35.decode_token_id(&g_state.tok, next)
+		if len(decoded) > 0 {
+			strings.write_string(&full_text, decoded)
+			// emit delta event with type field
+			delta_json := concat_json(
+				`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":`,
+				json_quote(decoded), `}`)
+			sse_write(client, "response.output_text.delta", delta_json)
+		}
+		delete(decoded)
+		gen += 1
+		g_state.pos += 1
+		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
+		logits := q35.engine_forward(&g_state.engine, next, g_state.pos - 1)
+		next = sampler.sample(&g_state.samp, logits)
+	}
+
+	final_text := strings.to_string(full_text)
+
+	// Closing events
+	sse_write(client, "response.output_text.done",
+		concat_json(`{"type":"response.output_text.done","output_index":0,"content_index":0,"text":`, json_quote(final_text), `}`))
+	sse_write(client, "response.content_part.done",
+		concat_json(`{"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":`, json_quote(final_text), `}}`))
+	sse_write(client, "response.output_item.done",
+		concat_json(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":`, json_quote(final_text), `,"annotations":[]}]}}`))
+	sse_write(client, "response.completed",
+		concat_json(
+			`{"type":"response.completed","response":{"id":"`, resp_id, `","object":"response","status":"completed","model":"odin-infer","output":[{"id":"msg_0","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":`, json_quote(final_text), `,"annotations":[]}]}],"usage":{"input_tokens":`, fmt.tprintf("%d", len(encoded)), `,"output_tokens":`, fmt.tprintf("%d", gen), `,"total_tokens":`, fmt.tprintf("%d", len(encoded) + gen), `}}}`))
+
+	sse_end(client)
+	fmt.eprintfln("responses: %d in / %d out", len(encoded), gen)
+}
+
+// Format a single SSE event.
+sse_event :: proc(event_name, data: string) -> string {
+	return fmt.tprintf("event: %s\ndata: %s\n\n", event_name, data)
+}
+
+// Quote a string as JSON (just surrounding quotes — assumes already escaped).
+json_quote :: proc(s: string) -> string {
+	out: strings.Builder
+	strings.builder_init(&out, context.temp_allocator)
+	defer strings.builder_destroy(&out)
+	json_escape(s, &out)
+	return strings.clone(strings.to_string(out))
+}
+
+// Concatenate strings into one heap-owned string.
+concat_json :: proc(parts: ..string) -> string {
+	out: strings.Builder
+	strings.builder_init(&out, context.temp_allocator)
+	defer strings.builder_destroy(&out)
+	for p in parts {
+		strings.write_string(&out, p)
+	}
+	return strings.clone(strings.to_string(out))
+}
+
+// Extract "input" from Responses API request. Input can be:
+//   "input": "string"
+//   "input": [{"role":"user","content":"string"}]
+//   "input": [{"role":"user","content":[{"type":"input_text","text":"string"}]}]
+extract_responses_input :: proc(body: string) -> string {
+	// Find "input":
+	idx := strings.index(body, `"input":`)
+	if idx < 0 { return "" }
+	i := idx + len(`"input":`)
+	// skip ws
+	for i < len(body) && (body[i] == ' ' || body[i] == '\t') { i += 1 }
+	if i >= len(body) { return "" }
+	if body[i] == '"' {
+		// string form
+		return extract_json_field(body, "input")
+	}
+	if body[i] == '[' {
+		// array form — extract last user message text
+		// Look for the last "text":"..." or "content":"..." near end
+		// Strategy: find all "text":"..." occurrences, take the last one
+		last_text := ""
+		scan_i := i
+		for scan_i < len(body) - 8 {
+			t_idx := strings.index(body[scan_i:], `"text":"`)
+			if t_idx < 0 { break }
+			real_idx := scan_i + t_idx + len(`"text":"`)
+			// walk to closing quote
+			end := real_idx
+			for end < len(body) {
+				if body[end] == '\\' { end += 2; continue }
+				if body[end] == '"' { break }
+				end += 1
+			}
+			if end > real_idx {
+				// decode escapes
+				last_text = decode_json_string(body[real_idx:end])
+			}
+			scan_i = end + 1
+		}
+		return last_text
+	}
+	return ""
+}
+
+decode_json_string :: proc(s: string) -> string {
+	out: strings.Builder
+	strings.builder_init(&out, context.temp_allocator)
+	defer strings.builder_destroy(&out)
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '\\' && i + 1 < len(s) {
+			i += 1
+			switch s[i] {
+			case 'n':  strings.write_byte(&out, byte('\n'))
+			case 't':  strings.write_byte(&out, byte('\t'))
+			case 'r':  strings.write_byte(&out, byte('\r'))
+			case '"':  strings.write_byte(&out, byte('"'))
+			case '\\': strings.write_byte(&out, byte('\\'))
+			case '/':  strings.write_byte(&out, byte('/'))
+			case:      strings.write_byte(&out, s[i])
+			}
 		} else {
 			strings.write_byte(&out, c)
 		}
