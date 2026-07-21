@@ -389,7 +389,7 @@ handle_chat :: proc(body: string) -> string {
 	}
 
 	ttft := t_first - t_start
-	t_total := time_to_ms() - t_start
+	t_total := time_to_ms() - t_first  // decode only (excludes prefill)
 	tps := gen > 0 && t_total > 0 ? f64(gen) * 1000.0 / f64(t_total) : 0.0
 	g_state.last_ttft = ttft
 	g_state.last_tps = tps
@@ -619,7 +619,7 @@ handle_openai_chat :: proc(body: string) -> string {
 	}
 
 	ttft := t_first - t_start
-	t_total := time_to_ms() - t_start
+	t_total := time_to_ms() - t_first  // decode only (excludes prefill)
 	tps := gen > 0 && t_total > 0 ? f64(gen) * 1000.0 / f64(t_total) : 0.0
 	g_state.last_ttft = ttft
 	g_state.last_tps = tps
