@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>odin-infer dashboard</title>
+<style>
+  body {
+    background: #0a0a10;
+    color: #e4e4ed;
+    font-family: -apple-system, system-ui, sans-serif;
+    margin: 0;
+    padding: 20px;
+    max-width: 1100px;
+  }
+  h1 { font-size: 1.4em; margin: 0 0 16px; color: #fff; }
+  h2 { font-size: 1.1em; margin: 24px 0 8px; color: #9da3b4; font-weight: 500; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: #15151c;
+    border: 1px solid #2a2a36;
+    border-radius: 6px;
+    padding: 14px;
+  }
+  .stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+  .stat-key { color: #9da3b4; }
+  .stat-val { color: #e4e4ed; font-family: ui-monospace, monospace; }
+  .chat-log {
+    background: #15151c;
+    border: 1px solid #2a2a36;
+    border-radius: 6px;
+    padding: 14px;
+    height: 360px;
+    overflow-y: auto;
+    font-size: 13px;
+  }
+  .msg { padding: 6px 0; border-bottom: 1px solid #2a2a36; }
+  .msg-user { color: #8ab4f8; }
+  .msg-bot { color: #e4e4ed; white-space: pre-wrap; }
+  .msg-meta { color: #6e7280; font-size: 11px; margin-top: 4px; }
+  .input-row { display: flex; gap: 8px; margin-top: 12px; }
+  input[type=text] {
+    flex: 1;
+    background: #15151c;
+    border: 1px solid #2a2a36;
+    color: #e4e4ed;
+    padding: 10px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 13px;
+  }
+  button {
+    background: #4a6cf7;
+    color: #fff;
+    border: 0;
+    padding: 10px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  button:disabled { background: #2a2a36; cursor: not-allowed; }
+  .live { font-size: 12px; color: #6e7280; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>odin-infer <span style="color:#6e7280;font-weight:400">/ dashboard</span></h1>
+
+<div class="grid">
+  <div>
+    <h2>model</h2>
+    <div class="card" id="info">loading…</div>
+
+    <h2>live stats</h2>
+    <div class="card" id="state">—</div>
+  </div>
+
+  <div>
+    <h2>chat</h2>
+    <div class="chat-log" id="log"></div>
+    <div class="input-row">
+      <input type="text" id="prompt" placeholder="Ask…" autofocus>
+      <button id="send" onclick="send()">send</button>
+    </div>
+    <div class="live" id="live"></div>
+  </div>
+</div>
+
+<script>
+let busy = false;
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts);
+  return r.json();
+}
+
+async function refresh() {
+  try {
+    const info = await fetchJSON('/api/info');
+    document.getElementById('info').innerHTML = `
+      <div class="stat"><span class="stat-key">model</span><span class="stat-val">${info.model || ''}</span></div>
+      <div class="stat"><span class="stat-key">vocab</span><span class="stat-val">${info.vocab}</span></div>
+      <div class="stat"><span class="stat-key">dim / hidden</span><span class="stat-val">${info.dim} / ${info.hidden_dim}</span></div>
+      <div class="stat"><span class="stat-key">layers (full/lin)</span><span class="stat-val">${info.n_layers} (${info.n_full}/${info.n_linear})</span></div>
+      <div class="stat"><span class="stat-key">heads (q/kv)</span><span class="stat-val">${info.n_heads}/${info.n_kv_heads} × ${info.head_dim}</span></div>
+      <div class="stat"><span class="stat-key">seq_len (eff/max)</span><span class="stat-val">${info.seq_len} / ${info.max_seq}</span></div>
+      <div class="stat"><span class="stat-key">metal</span><span class="stat-val">${info.metal ? '✓' : '✗'}</span></div>
+    `;
+
+    const st = await fetchJSON('/api/state');
+    document.getElementById('state').innerHTML = `
+      <div class="stat"><span class="stat-key">position</span><span class="stat-val">${st.pos}</span></div>
+      <div class="stat"><span class="stat-key">last tok/s</span><span class="stat-val">${st.last_tps.toFixed(2)}</span></div>
+      <div class="stat"><span class="stat-key">last TTFT (ms)</span><span class="stat-val">${st.last_ttft_ms}</span></div>
+      <div class="stat"><span class="stat-key">last generated</span><span class="stat-val">${st.last_generated} tokens</span></div>
+    `;
+  } catch (e) {
+    document.getElementById('live').textContent = 'refresh err: ' + e.message;
+  }
+}
+
+async function send() {
+  if (busy) return;
+  const input = document.getElementById('prompt');
+  const msg = input.value.trim();
+  if (!msg) return;
+  busy = true;
+  document.getElementById('send').disabled = true;
+  document.getElementById('live').textContent = 'generating…';
+  appendMsg('user', msg);
+  input.value = '';
+
+  const t0 = performance.now();
+  try {
+    const r = await fetchJSON('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: msg}),
+    });
+    const t1 = performance.now();
+    if (r.error) {
+      appendMsg('bot', '⚠ ' + r.error);
+    } else {
+      appendMsg('bot', r.response, `${r.generated} tok | ${r.tok_per_s.toFixed(2)} tok/s | TTFT ${r.ttft_ms}ms | wall ${(t1-t0).toFixed(0)}ms`);
+    }
+  } catch (e) {
+    appendMsg('bot', '⚠ fetch failed: ' + e.message);
+  }
+  document.getElementById('live').textContent = '';
+  busy = false;
+  document.getElementById('send').disabled = false;
+  refresh();
+}
+
+function appendMsg(who, text, meta) {
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = 'msg msg-' + who;
+  div.textContent = (who === 'user' ? 'Q: ' : 'A: ') + text;
+  if (meta) {
+    const m = document.createElement('div');
+    m.className = 'msg-meta';
+    m.textContent = meta;
+    div.appendChild(m);
+  }
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('prompt').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') send();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
