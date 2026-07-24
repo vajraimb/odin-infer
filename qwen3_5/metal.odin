@@ -676,6 +676,7 @@ m_pso_l2norm_batch, m_pso_rmsgated_batch, m_pso_chunked_delta: ^MTL.ComputePipel
 m_b_x, m_b_xb, m_b_xb2, m_b_qproj, m_b_q, m_b_xb3: ^MTL.Buffer
 @(private = "file")
 m_b_hb, m_b_hb2, m_b_ktmp, m_b_vtmp, m_b_logits: ^MTL.Buffer
+m_b_verify_logits: ^MTL.Buffer // [T × vocab] for batch verification (speculative decoding)
 @(private = "file")
 m_b_kc, m_b_vc: ^MTL.Buffer
 @(private = "file")
@@ -1650,4 +1651,98 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 		fmt.eprintfln("[timing] forward_gpu_batch T={} GPU={:.2f} ms ({:.2f} ms/tok){}", len(tokens), gpu_ms, gpu_ms / f64(len(tokens)), tag)
 	}
 	return m_b_logits->contentsAsSlice([]f32)[:p.vocab_size]
+}
+
+// Save full engine state (KV cache + recurrent + conv) to memory for prefix caching.
+// Returns heap-allocated byte slices that the caller owns.
+metal_save_full_state :: proc() -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
+	if !metal_enabled { return }
+	kc := m_b_kc->contentsAsSlice([]u8)
+	vc := m_b_vc->contentsAsSlice([]u8)
+	kv_k = make([]u8, len(kc))
+	kv_v = make([]u8, len(vc))
+	copy(kv_k, kc)
+	copy(kv_v, vc)
+	conv, rec = metal_save_spec_state()
+	return
+}
+
+// Restore full engine state from memory snapshot.
+metal_restore_full_state :: proc(kv_k, kv_v, conv, rec: []u8) {
+	if !metal_enabled { return }
+	kc := m_b_kc->contentsAsSlice([]u8)
+	vc := m_b_vc->contentsAsSlice([]u8)
+	copy(kc, kv_k)
+	copy(vc, kv_v)
+	metal_restore_spec_state(conv, rec)
+}
+
+// Save recurrent + conv states for speculative decoding rollback.
+// Returns heap-allocated byte slices that the caller owns.
+metal_save_spec_state :: proc() -> (conv: []u8, rec: []u8) {
+	if !metal_enabled { return }
+	conv_src := m_b_conv_states->contentsAsSlice([]u8)
+	rec_src := m_b_rec_states->contentsAsSlice([]u8)
+	conv = make([]u8, len(conv_src))
+	rec = make([]u8, len(rec_src))
+	copy(conv, conv_src)
+	copy(rec, rec_src)
+	return
+}
+
+// Restore recurrent + conv states from snapshot.
+metal_restore_spec_state :: proc(conv: []u8, rec: []u8) {
+	if !metal_enabled { return }
+	conv_dst := m_b_conv_states->contentsAsSlice([]u8)
+	rec_dst := m_b_rec_states->contentsAsSlice([]u8)
+	copy(conv_dst, conv)
+	copy(rec_dst, rec)
+}
+
+// Verify batch: extract logits for ALL positions in the last forward_gpu_batch.
+// m_b_bx holds [T × dim] hidden states after batch processing. For each
+// position, do RMSNorm + output GEMV to get that position's logits.
+// Returns a flat [T × vocab] f32 slice (caller slices into rows).
+// Cost: ~0.2ms × T on M3 (just GEMVs, layers already computed).
+metal_verify_batch_logits :: proc(t: ^Transformer, T: int) -> []f32 {
+	if !metal_enabled || T <= 0 { return {} }
+	p := t.config
+	w := t.weights
+	dim := p.dim
+	vocab := p.vocab_size
+	dim_bytes := NS.UInteger(dim * 4)
+
+	// Need a larger logits buffer: [T × vocab] instead of [1 × vocab]
+	bytes_needed := NS.UInteger(T * vocab * 4)
+	if m_b_verify_logits == nil {
+		m_b_verify_logits = new_shared_bytes(T * vocab * 4)
+	} else if m_b_verify_logits->length() < bytes_needed {
+		m_b_verify_logits->release()
+		m_b_verify_logits = new_shared_bytes(T * vocab * 4)
+	}
+
+	for i in 0 ..< T {
+		cmd := m_queue->commandBuffer()
+		enc := cmd->computeCommandEncoder()
+
+		// Copy hidden state i from batch buffer to m_b_x
+		off := NS.UInteger(i) * dim_bytes
+		enc_copy(enc, m_b_bx, off, m_b_x, 0, dim)
+		// RMSNorm
+		enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, p.rms_eps)
+		// GEMV → m_b_logits (reuse single-row buffer, then copy)
+		enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)),
+			m_b_x, 0, m_b_logits, 0, dim, vocab)
+
+		enc->endEncoding()
+		cmd->commit()
+		cmd->waitUntilCompleted()
+
+		// Copy from m_b_logits to position i in the verify buffer
+		verify_slice := m_b_verify_logits->contentsAsSlice([]f32)[i * vocab : (i + 1) * vocab]
+		logit_slice := m_b_logits->contentsAsSlice([]f32)[:vocab]
+		copy(verify_slice, logit_slice)
+	}
+
+	return m_b_verify_logits->contentsAsSlice([]f32)[:T * vocab]
 }

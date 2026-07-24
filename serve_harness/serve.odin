@@ -330,6 +330,15 @@ Engine_State :: struct {
 	// last fully-prefilled token sequence so multi-turn requests that extend
 	// the previous conversation can skip re-prefilling the shared prefix.
 	last_tokens: [dynamic]int,
+	// System prompt prefix cache: snapshot of full engine state after prefilling
+	// the system prompt + tools portion. Restored on subsequent requests to skip
+	// re-prefilling ~1000-1500 fixed tokens. O(1) restore (~6ms memcpy).
+	prefix_kv_k: []u8,
+	prefix_kv_v: []u8,
+	prefix_conv: []u8,
+	prefix_rec:  []u8,
+	prefix_tokens: [dynamic]int,  // token IDs that were prefilled before snapshot
+	prefix_pos:  int,             // position at snapshot time
 }
 
 g_state: Engine_State
@@ -580,6 +589,99 @@ extract_json_field :: proc(json, field: string) -> string {
 	return strings.clone(strings.to_string(out))
 }
 
+// ====================== N-gram speculative decoding ======================
+
+NGRAM_N :: 3    // context length for n-gram lookup
+SPEC_K :: 4    // max draft tokens per speculation step
+
+Spec_State :: struct {
+	ngram:    map[u64]u32,      // hash(N tokens) → predicted next token
+	history:  [dynamic]int,     // rolling token history for n-gram extraction
+	hits:     int,              // accepted speculations (for stats)
+	misses:   int,              // rejected speculations
+}
+
+spec_init :: proc() -> Spec_State {
+	s: Spec_State
+	s.ngram = make(map[u64]u32, 8192)
+	s.history = make([dynamic]int, 0, 4096)
+	return s
+}
+
+spec_free :: proc(s: ^Spec_State) {
+	delete(s.ngram)
+	delete(s.history)
+}
+
+// Hash the last N tokens from history starting at given index.
+ngram_hash_at :: proc(s: ^Spec_State, idx: int) -> u64 {
+	if idx + NGRAM_N > len(s.history) { return 0 }
+	h: u64 = 14695981039346656037
+	for i in 0 ..< NGRAM_N {
+		h ~= u64(s.history[idx + i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+// Record a token: append to history, update n-gram map.
+spec_record :: proc(s: ^Spec_State, token: int) {
+	if len(s.history) >= NGRAM_N {
+		h := ngram_hash_at(s, len(s.history) - NGRAM_N)
+		s.ngram[h] = u32(token)
+	}
+	append(&s.history, token)
+}
+
+// Seed from prompt tokens.
+spec_seed :: proc(s: ^Spec_State, tokens: []int) {
+	for t in tokens { spec_record(s, t) }
+}
+
+// Propose up to K draft tokens based on n-gram lookup.
+// Uses the last NGRAM_N tokens from history as context.
+spec_propose :: proc(s: ^Spec_State, k: int) -> []int {
+	out: [dynamic]int
+	out = make([dynamic]int, 0, k)
+	defer delete(out)
+	if len(s.history) < NGRAM_N { return out[:] }
+	// Build a temporary extended history for chained lookup
+	temp: [dynamic]int
+	temp = make([dynamic]int, 0, NGRAM_N + k)
+	defer delete(temp)
+	// Start with last NGRAM_N tokens
+	start := len(s.history) - NGRAM_N
+	for i in 0 ..< NGRAM_N { append(&temp, s.history[start + i]) }
+	// Chain lookup
+	for _ in 0 ..< k {
+		// Hash last NGRAM_N tokens of temp
+		h: u64 = 14695981039346656037
+		base := len(temp) - NGRAM_N
+		for i in 0 ..< NGRAM_N {
+			h ~= u64(temp[base + i])
+			h *= 1099511628211
+		}
+		if tok, ok := s.ngram[h]; ok {
+			append(&out, int(tok))
+			append(&temp, int(tok))
+		} else {
+			break
+		}
+	}
+	result := make([]int, len(out))
+	for i in 0 ..< len(out) { result[i] = out[i] }
+	return result
+}
+
+// Remove last n tokens from history (rollback on rejection).
+spec_rollback :: proc(s: ^Spec_State, n: int) {
+	for _ in 0 ..< n {
+		if len(s.history) > 0 { _ = pop(&s.history) }
+	}
+}
+
+// ====================== end N-gram speculation ======================
+
 // ====================== Ollama-compatible API (pie-odin's odinfer provider) ======================
 
 // Extract "tools" array from request body and format as Qwen3.5 tool calling prompt section.
@@ -726,29 +828,86 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 
 	t_prefill_start := time_to_ms()
 	t_reset_ms: i64 = 0
-	if common == len(g_state.last_tokens) && common > 0 && common < len(encoded) {
-		// Continuation — prefill encoded[common:len-1] at pos = common
-		new_tokens := encoded[common:len(encoded) - 1]
-		if len(new_tokens) > 0 {
-			_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
+
+	// System prompt prefix cache: if we have a snapshot AND the new prompt starts
+	// with the same system prefix tokens, restore snapshot and only prefill the suffix.
+	prefix_restored := false
+	if len(g_state.prefix_tokens) > 0 && len(encoded) > len(g_state.prefix_tokens) {
+		// Direct compare with cached prefix tokens (not common — that compares
+		// with last request's FULL token set which may have diverged).
+		match := true
+		for i in 0 ..< len(g_state.prefix_tokens) {
+			if encoded[i] != g_state.prefix_tokens[i] { match = false; break }
 		}
-		g_state.pos = len(encoded) - 1
-		fmt.eprintfln("ollama: prefix-cache hit (%d/%d tokens), prefilling only %d new",
-			common, len(encoded), len(new_tokens))
-	} else if common == len(encoded) && common > 0 && g_state.pos == len(encoded) - 1 {
-		// Full cache hit — same prompt as last request, skip prefill entirely.
-		fmt.eprintfln("ollama: prefix-cache FULL hit (%d tokens), skipping prefill", common)
-	} else {
-		// Reset and full prefill
-		t_r0 := time_to_ms()
-		q35.engine_reset_state(&g_state.engine)
-		t_reset_ms = time_to_ms() - t_r0
-		g_state.pos = 0
-		if len(encoded) > 1 {
-			_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
+		if match {
+			// Restore full state from snapshot — instantly positions us at prefix_pos
+			q35.engine_restore_full_state(&g_state.engine,
+				g_state.prefix_kv_k, g_state.prefix_kv_v,
+				g_state.prefix_conv, g_state.prefix_rec)
+			g_state.pos = g_state.prefix_pos
+			prefix_restored = true
+			// Now prefill only the tokens AFTER the cached prefix
+			suffix_start := g_state.prefix_pos
+			suffix_tokens := encoded[suffix_start:len(encoded) - 1]  // leave last for per-token fwd
+			if len(suffix_tokens) > 0 {
+				_ = q35.engine_forward_batch(&g_state.engine, suffix_tokens, suffix_start)
+			}
 			g_state.pos = len(encoded) - 1
+			fmt.eprintfln("ollama: PREFIX CACHE HIT (restored %d tokens, prefilling %d new)",
+				g_state.prefix_pos, len(suffix_tokens))
 		}
-		fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
+	}
+
+	if !prefix_restored {
+		if common == len(g_state.last_tokens) && common > 0 && common < len(encoded) {
+			// Continuation — prefill encoded[common:len-1] at pos = common
+			new_tokens := encoded[common:len(encoded) - 1]
+			if len(new_tokens) > 0 {
+				_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
+			}
+			g_state.pos = len(encoded) - 1
+			fmt.eprintfln("ollama: prefix-cache hit (%d/%d tokens), prefilling only %d new",
+				common, len(encoded), len(new_tokens))
+		} else if common == len(encoded) && common > 0 && g_state.pos == len(encoded) - 1 {
+			fmt.eprintfln("ollama: prefix-cache FULL hit (%d tokens), skipping prefill", common)
+		} else {
+			// Reset and full prefill
+			t_r0 := time_to_ms()
+			q35.engine_reset_state(&g_state.engine)
+			t_reset_ms = time_to_ms() - t_r0
+			g_state.pos = 0
+			if len(encoded) > 1 {
+				_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
+				g_state.pos = len(encoded) - 1
+			}
+			fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
+		}
+
+		// After full prefill, take a snapshot for future requests.
+		// Find the system prompt boundary: last <|im_end|>\n before first user turn.
+		if len(g_state.prefix_kv_k) == 0 && g_state.pos > 5 {
+			// Find system/user boundary: first <|im_end|> token marks end of system section.
+			snap_pos := 0
+			for i in 3 ..< len(encoded) - 1 {
+				if encoded[i] == EOS {  // EOS = <|im_end|>
+					snap_pos = i + 2  // skip <|im_end|> + \n token(s)
+					break
+				}
+			}
+			if snap_pos < 5 || snap_pos >= g_state.pos {
+				snap_pos = g_state.pos  // fallback: snapshot entire prompt
+			}
+			g_state.prefix_kv_k, g_state.prefix_kv_v,
+				g_state.prefix_conv, g_state.prefix_rec =
+				q35.engine_save_full_state(&g_state.engine)
+			g_state.prefix_pos = snap_pos
+			clear(&g_state.prefix_tokens)
+			for i in 0 ..< snap_pos {
+				append(&g_state.prefix_tokens, encoded[i])
+			}
+			fmt.eprintfln("ollama: prefix snapshot at system boundary pos=%d (%d tokens cached)",
+				snap_pos, snap_pos)
+		}
 	}
 	t_prefill_ms := time_to_ms() - t_prefill_start
 

@@ -130,3 +130,45 @@ engine_reset_state :: proc(e: ^Engine) {
 		s.value_cache[i] = 0
 	}
 }
+
+// Speculative decoding: verify K draft tokens via batched forward.
+// Returns per-position logits [K × vocab] and the number of tokens processed.
+// Caller compares draft tokens against argmax of each row to accept/reject.
+// Full-state snapshot for KV prefix caching (system prompt optimization).
+// Saves KV cache + recurrent + conv states to memory. Restore is O(1) memcpy.
+engine_save_full_state :: proc(e: ^Engine) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
+	when ODIN_OS == .Darwin {
+		if e.metal_ready { return metal_save_full_state() }
+	}
+	return
+}
+
+engine_restore_full_state :: proc(e: ^Engine, kv_k, kv_v, conv, rec: []u8) {
+	when ODIN_OS == .Darwin {
+		if e.metal_ready { metal_restore_full_state(kv_k, kv_v, conv, rec); return }
+	}
+}
+
+// Speculative decoding support
+engine_save_spec_state :: proc(e: ^Engine) -> (conv: []u8, rec: []u8) {
+	when ODIN_OS == .Darwin {
+		if e.metal_ready { return metal_save_spec_state() }
+	}
+	return
+}
+
+engine_restore_spec_state :: proc(e: ^Engine, conv: []u8, rec: []u8) {
+	when ODIN_OS == .Darwin {
+		if e.metal_ready { metal_restore_spec_state(conv, rec); return }
+	}
+}
+
+engine_verify_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
+	when ODIN_OS == .Darwin {
+		if e.metal_ready {
+			_ = forward_gpu_batch(&e.transformer, tokens, pos_start)
+			return metal_verify_batch_logits(&e.transformer, len(tokens))
+		}
+	}
+	return {}
+}
