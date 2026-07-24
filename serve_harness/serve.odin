@@ -977,15 +977,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	for gen < max_tokens {
 		if next == EOS { finish_reason = "stop"; break }
 		decoded := tok35.decode_token_id(&g_state.tok, next)
-		if len(decoded) > 0 {
-			strings.write_string(&gen_buf, decoded)
-			if !has_tools {
-				// Stream token immediately when no tools
-				line := concat_json(
-					`{"message":{"role":"assistant","content":`, json_quote(decoded), `},"done":false}`)
-				ndjson_write(client, line)
-			}
-		}
+		strings.write_string(&gen_buf, decoded)
 		delete(decoded)
 		gen += 1
 		g_state.pos += 1
@@ -997,11 +989,14 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
+	// Always buffer full output then emit. Per-token streaming causes issues
+	// with pie-odin's NDJSON parser (backslash eating in Chinese text).
+	// Buffering + decode_unicode_escapes at the end is the safe path.
+	full_text := strings.to_string(gen_buf)
+	full_text = decode_unicode_escapes(full_text)
+
 	// When tools are present, parse for <tool_call> blocks
 	if has_tools {
-		full_text := strings.to_string(gen_buf)
-		// Decode any \uXXXX escapes the model may have generated
-		full_text = decode_unicode_escapes(full_text)
 		tool_calls_json := parse_tool_calls(full_text)
 		if len(tool_calls_json) > 0 {
 			// Emit each tool_call as separate NDJSON line
@@ -1013,12 +1008,12 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			}
 			finish_reason = "tool_calls"
 			fmt.eprintfln("ollama: %d tool calls detected", len(tool_calls_json))
-		} else {
-			// No tool calls found — emit full text as one-shot
-			line := concat_json(
-				`{"message":{"role":"assistant","content":`, json_quote(full_text), `},"done":false}`)
-			ndjson_write(client, line)
 		}
+	} else {
+		// No tools — emit full text as one content chunk (already decoded above)
+		line := concat_json(
+			`{"message":{"role":"assistant","content":`, json_quote(full_text), `},"done":false}`)
+		ndjson_write(client, line)
 	}
 
 	// Final done line with usage stats
