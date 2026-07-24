@@ -12,6 +12,7 @@ import ggml "ggml:ggml"
 import NS "core:sys/darwin/Foundation"
 import "core:fmt"
 import "core:math"
+import "core:mem"
 import "core:os"
 import MTL "vendor:darwin/Metal"
 
@@ -761,11 +762,11 @@ print_quant_summary :: proc(t: ^Transformer) {
 // committed), so no race.
 metal_reset_state :: proc() {
 	if !metal_enabled do return
+	// Use mem.zero_slice (SIMD) instead of byte-by-byte loop — at max_ctx=20480
+	// the KV cache alone is 1.3 GB; the loop version was taking 4-5 seconds.
 	for b in ([]^MTL.Buffer{m_b_conv_states, m_b_rec_states, m_b_kc, m_b_vc}) {
 		s := b->contentsAsSlice([]u8)
-		for i in 0 ..< len(s) {
-			s[i] = 0
-		}
+		mem.zero_slice(s)
 	}
 }
 

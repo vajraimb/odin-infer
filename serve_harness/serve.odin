@@ -177,6 +177,7 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 	}
 	defer free_request_safe(&req)
 
+
 	resp: Response
 	resp.status = 200
 	resp.headers = make(map[string]string)
@@ -325,6 +326,10 @@ Engine_State :: struct {
 	last_ttft:  i64,
 	last_gen:   int,
 	model_path: string,
+	// Prefix-cache state for stateless protocols (Ollama/OpenAI). Stores the
+	// last fully-prefilled token sequence so multi-turn requests that extend
+	// the previous conversation can skip re-prefilling the shared prefix.
+	last_tokens: [dynamic]int,
 }
 
 g_state: Engine_State
@@ -495,8 +500,6 @@ handle_chat :: proc(body: string) -> string {
 		last := encoded[len(encoded) - 1]
 		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
 		next = sampler.sample(&g_state.samp, logits)
-	} else {
-		return `{"error": "empty prompt"}`
 	}
 
 	for gen < max_tokens {
@@ -579,6 +582,89 @@ extract_json_field :: proc(json, field: string) -> string {
 
 // ====================== Ollama-compatible API (pie-odin's odinfer provider) ======================
 
+// Extract "tools" array from request body and format as Qwen3.5 tool calling prompt section.
+// Returns the text to inject right after the system message.
+extract_tools_section :: proc(body: string) -> string {
+	// Find "tools" key, then scan to the [ that starts the array
+	tools_key_idx := strings.index(body, `"tools"`)
+	if tools_key_idx < 0 { return "" }
+	// Skip past key, whitespace, colon, whitespace to find [
+	i := tools_key_idx + len(`"tools"`)
+	for i < len(body) && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' || body[i] == ':') { i += 1 }
+	if i >= len(body) || body[i] != '[' { return "" }
+	tools_start := i
+	// Walk to matching ] (naive depth count)
+	depth := 1
+	i = tools_start + 1
+	for i < len(body) && depth > 0 {
+		if body[i] == '[' { depth += 1 }
+		else if body[i] == ']' { depth -= 1 }
+		i += 1
+	}
+	if depth != 0 { return "" }
+	tools_json := body[tools_start:i]
+
+	out: strings.Builder
+	strings.builder_init(&out, context.temp_allocator)
+	defer strings.builder_destroy(&out)
+	strings.write_string(&out, "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n")
+	// Extract each function definition from the tools array
+	// Format: each tool is {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+	scan_i := 0
+	for scan_i < len(tools_json) {
+		fn_idx := index_from(tools_json, `"function":`, scan_i)
+		if fn_idx < 0 { break }
+		// Find the { that starts the function object
+		obj_start := fn_idx + len(`"function":`)
+		for obj_start < len(tools_json) && tools_json[obj_start] == ' ' { obj_start += 1 }
+		if obj_start >= len(tools_json) || tools_json[obj_start] != '{' { scan_i = fn_idx + 1; continue }
+		// Walk to matching }
+		depth_fn := 1
+		obj_end := obj_start + 1
+		for obj_end < len(tools_json) && depth_fn > 0 {
+			if tools_json[obj_end] == '{' { depth_fn += 1 }
+			else if tools_json[obj_end] == '}' { depth_fn -= 1 }
+			obj_end += 1
+		}
+		fn_json := tools_json[obj_start:obj_end]  // {name, description, parameters}
+		strings.write_string(&out, fn_json)
+		strings.write_string(&out, "\n")
+		scan_i = obj_end
+	}
+	strings.write_string(&out, "</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"argument_name\": \"value\"}}\n</tool_call>\n")
+	return strings.clone(strings.to_string(out))
+}
+
+// Parse model output for <tool_call>...</tool_call> blocks.
+// Returns a slice of JSON strings, each being the function call object
+// like {"name":"...","arguments":{...}}
+parse_tool_calls :: proc(text: string) -> []string {
+	out: [dynamic]string
+	out = make([dynamic]string, 0, 4)
+	defer delete(out)
+	i := 0
+	for i < len(text) {
+		tc_start := index_from(text, "<tool_call>", i)
+		if tc_start < 0 { break }
+		tc_start += len("<tool_call>")
+		// Skip whitespace
+		for tc_start < len(text) && (text[tc_start] == '\n' || text[tc_start] == ' ' || text[tc_start] == '\r') { tc_start += 1 }
+		tc_end := index_from(text, "</tool_call>", tc_start)
+		if tc_end < 0 { break }
+		// Extract JSON between tags
+		json_str := strings.trim_space(text[tc_start:tc_end])
+		if len(json_str) > 0 {
+			append(&out, strings.clone(json_str))
+		}
+		i = tc_end + len("</tool_call>")
+	}
+	result := make([]string, len(out))
+	for k in 0 ..< len(out) { result[k] = out[k] }
+	return result
+}
+
+// ====================== end tool calling helpers ======================
+
 // Pie-odin sends: POST /api/chat {"model":"ornith","messages":[...],"stream":true,"options":{...}}
 // Expects NDJSON response: one JSON object per line, each {"message":{"role":"assistant","content":"delta"},"done":false}
 // Final line: {"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",...}
@@ -594,10 +680,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 
 	max_tokens := parse_int_field(body, "num_predict", 256)
 	if max_tokens == 0 { max_tokens = 256 }
-
-	// RESET engine state per request
-	q35.engine_reset_state(&g_state.engine)
-	g_state.pos = 0
+	has_tools := strings.contains(body, `"tools"`) && strings.contains(body, `"function"`)
 
 	// Render Qwen chat template
 	prompt_buf: strings.Builder
@@ -605,10 +688,21 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	defer strings.builder_destroy(&prompt_buf)
 	for m in msgs {
 		role := m.role
+		if role == "tool" {
+			// Tool result → Qwen <tool_response> block
+			strings.write_string(&prompt_buf, "<|im_start|>tool\n<tool_response>")
+			strings.write_string(&prompt_buf, m.content)
+			strings.write_string(&prompt_buf, "</tool_response>\n<|im_end|>\n")
+			continue
+		}
 		if role != "system" && role != "user" && role != "assistant" {
 			role = "user"
 		}
 		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
+		// Inject tools section right after system message
+		if role == "system" && has_tools {
+			strings.write_string(&prompt_buf, extract_tools_section(body))
+		}
 	}
 	strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
 
@@ -621,13 +715,56 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		ndjson_end(client)
 		return
 	}
-	if len(encoded) > 1 {
-		_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
-		g_state.pos = len(encoded) - 1
+
+	// Prefix-cache: if new tokens start with the previous tokens, only
+	// prefill the new tail. Else reset and prefill from scratch.
+	common := 0
+	max_common := min(len(encoded), len(g_state.last_tokens))
+	for common < max_common && encoded[common] == g_state.last_tokens[common] {
+		common += 1
 	}
+
+	t_prefill_start := time_to_ms()
+	t_reset_ms: i64 = 0
+	if common == len(g_state.last_tokens) && common > 0 && common < len(encoded) {
+		// Continuation — prefill encoded[common:len-1] at pos = common
+		new_tokens := encoded[common:len(encoded) - 1]
+		if len(new_tokens) > 0 {
+			_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
+		}
+		g_state.pos = len(encoded) - 1
+		fmt.eprintfln("ollama: prefix-cache hit (%d/%d tokens), prefilling only %d new",
+			common, len(encoded), len(new_tokens))
+	} else if common == len(encoded) && common > 0 && g_state.pos == len(encoded) - 1 {
+		// Full cache hit — same prompt as last request, skip prefill entirely.
+		fmt.eprintfln("ollama: prefix-cache FULL hit (%d tokens), skipping prefill", common)
+	} else {
+		// Reset and full prefill
+		t_r0 := time_to_ms()
+		q35.engine_reset_state(&g_state.engine)
+		t_reset_ms = time_to_ms() - t_r0
+		g_state.pos = 0
+		if len(encoded) > 1 {
+			_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
+			g_state.pos = len(encoded) - 1
+		}
+		fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
+	}
+	t_prefill_ms := time_to_ms() - t_prefill_start
+
+	// Cache this turn's tokens for next time
+	clear(&g_state.last_tokens)
+	append(&g_state.last_tokens, ..encoded)
 
 	gen := 0
 	next: int = 0
+	t_gen_start := time_to_ms()
+
+	// When tools are present, buffer full output for tool_call parsing (no streaming).
+	// Otherwise stream normally.
+	gen_buf: strings.Builder
+	strings.builder_init(&gen_buf, context.allocator)
+	defer strings.builder_destroy(&gen_buf)
 
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
@@ -640,10 +777,13 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		if next == EOS { finish_reason = "stop"; break }
 		decoded := tok35.decode_token_id(&g_state.tok, next)
 		if len(decoded) > 0 {
-			// One NDJSON line per token delta
-			line := concat_json(
-				`{"message":{"role":"assistant","content":`, json_quote(decoded), `},"done":false}`)
-			ndjson_write(client, line)
+			strings.write_string(&gen_buf, decoded)
+			if !has_tools {
+				// Stream token immediately when no tools
+				line := concat_json(
+					`{"message":{"role":"assistant","content":`, json_quote(decoded), `},"done":false}`)
+				ndjson_write(client, line)
+			}
 		}
 		delete(decoded)
 		gen += 1
@@ -656,12 +796,37 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
+	// When tools are present, parse for <tool_call> blocks
+	if has_tools {
+		full_text := strings.to_string(gen_buf)
+		tool_calls_json := parse_tool_calls(full_text)
+		if len(tool_calls_json) > 0 {
+			// Emit each tool_call as separate NDJSON line
+			for idx in 0 ..< len(tool_calls_json) {
+				tc := tool_calls_json[idx]
+				line := concat_json(
+					`{"message":{"role":"assistant","content":"","tool_calls":[{"index":`, fmt.tprintf("%d", idx), `,"id":"call_`, fmt.tprintf("%d", idx), `","function":`, tc, `}]},"done":false}`)
+				ndjson_write(client, line)
+			}
+			finish_reason = "tool_calls"
+			fmt.eprintfln("ollama: %d tool calls detected", len(tool_calls_json))
+		} else {
+			// No tool calls found — emit full text as one-shot
+			line := concat_json(
+				`{"message":{"role":"assistant","content":`, json_quote(full_text), `},"done":false}`)
+			ndjson_write(client, line)
+		}
+	}
+
 	// Final done line with usage stats
 	final_line := concat_json(
 		`{"message":{"role":"assistant","content":""},"done":true,"done_reason":"`, finish_reason, `","input_tokens":`, fmt.tprintf("%d", len(encoded)), `,"output_tokens":`, fmt.tprintf("%d", gen), `}`)
 	ndjson_write(client, final_line)
 	ndjson_end(client)
-	fmt.eprintfln("ollama: %d in / %d out", len(encoded), gen)
+	t_gen_ms := time_to_ms() - t_gen_start
+	tps := gen > 0 && t_gen_ms > 0 ? f64(gen) * 1000.0 / f64(t_gen_ms) : 0.0
+	fmt.eprintfln("ollama: %d in / %d out | reset=%dms prefill=%dms gen=%dms (%.1f tok/s)",
+		len(encoded), gen, t_reset_ms, t_prefill_ms, t_gen_ms, tps)
 }
 
 // ====================== OpenAI Responses API (streaming, for Codex) ======================
@@ -907,22 +1072,26 @@ openai_extract_messages :: proc(json: string) -> []Message_Pair {
 	out: [dynamic]Message_Pair
 	out = make([dynamic]Message_Pair, 0, 8)
 	defer delete(out)
-	// We scan for `"role":"X"` then look for the next `"content":"..."`.
+	// Scan for "role" then next "content" — handles whitespace after colons
+	// (standard JSON: "role": "user" vs compact: "role":"user")
 	i := 0
-	for i < len(json) - 8 {
-		// find next "role"
-		role_idx := index_from(json, `"role":"`, i)
+	for i < len(json) - 6 {
+		role_idx := index_from(json, `"role"`, i)
 		if role_idx < 0 { break }
-		r_start := role_idx + len(`"role":"`)
-		r_end := index_from(json, `"`, r_start)
+		r_val_start := role_idx + len(`"role"`)
+		for r_val_start < len(json) && (json[r_val_start] == ' ' || json[r_val_start] == '\t' || json[r_val_start] == ':') { r_val_start += 1 }
+		if r_val_start >= len(json) || json[r_val_start] != '"' { i = role_idx + 1; continue }
+		r_val_start += 1
+		r_end := index_from(json, `"`, r_val_start)
 		if r_end < 0 { break }
-		role := json[r_start:r_end]
-		// find next "content"
-		c_idx := index_from(json, `"content":"`, r_end)
+		role := json[r_val_start:r_end]
+		c_idx := index_from(json, `"content"`, r_end)
 		if c_idx < 0 { break }
-		c_start := c_idx + len(`"content":"`)
-		// walk to matching closing quote, honoring escapes
-		j := c_start
+		c_val_start := c_idx + len(`"content"`)
+		for c_val_start < len(json) && (json[c_val_start] == ' ' || json[c_val_start] == '\t' || json[c_val_start] == ':') { c_val_start += 1 }
+		if c_val_start >= len(json) || json[c_val_start] != '"' { i = c_idx + 1; continue }
+		c_val_start += 1
+		j := c_val_start
 		content_buf: strings.Builder
 		strings.builder_init(&content_buf, context.temp_allocator)
 		for j < len(json) {
@@ -952,7 +1121,6 @@ openai_extract_messages :: proc(json: string) -> []Message_Pair {
 		strings.builder_destroy(&content_buf)
 		i = j + 1
 	}
-	// Copy dynamic to plain slice (caller owns; entries' strings are heap-allocated)
 	result := make([]Message_Pair, len(out))
 	for k in 0 ..< len(out) { result[k] = out[k] }
 	return result
