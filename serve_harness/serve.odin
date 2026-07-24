@@ -883,28 +883,25 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
 		}
 
-		// After full prefill, take a snapshot for future requests.
-		// Find the system prompt boundary: last <|im_end|>\n before first user turn.
-		if len(g_state.prefix_kv_k) == 0 && g_state.pos > 5 {
-			// Find system/user boundary: first <|im_end|> token marks end of system section.
+		// After full prefill, take/update snapshot. Always update to handle
+		// system prompt changes between sessions.
+		if g_state.pos > 5 {
 			snap_pos := 0
 			for i in 3 ..< len(encoded) - 1 {
-				if encoded[i] == EOS {  // EOS = <|im_end|>
-					snap_pos = i + 2  // skip <|im_end|> + \n token(s)
-					break
-				}
+				if encoded[i] == EOS { snap_pos = i + 2; break }
 			}
-			if snap_pos < 5 || snap_pos >= g_state.pos {
-				snap_pos = g_state.pos  // fallback: snapshot entire prompt
+			if snap_pos < 5 || snap_pos >= g_state.pos { snap_pos = g_state.pos }
+			// Free old snapshot
+			if len(g_state.prefix_kv_k) > 0 {
+				delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
+				delete(g_state.prefix_conv); delete(g_state.prefix_rec)
 			}
 			g_state.prefix_kv_k, g_state.prefix_kv_v,
 				g_state.prefix_conv, g_state.prefix_rec =
 				q35.engine_save_full_state(&g_state.engine)
 			g_state.prefix_pos = snap_pos
 			clear(&g_state.prefix_tokens)
-			for i in 0 ..< snap_pos {
-				append(&g_state.prefix_tokens, encoded[i])
-			}
+			for i in 0 ..< snap_pos { append(&g_state.prefix_tokens, encoded[i]) }
 			fmt.eprintfln("ollama: prefix snapshot at system boundary pos=%d (%d tokens cached)",
 				snap_pos, snap_pos)
 		}
