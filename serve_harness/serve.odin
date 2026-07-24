@@ -589,6 +589,51 @@ extract_json_field :: proc(json, field: string) -> string {
 	return strings.clone(strings.to_string(out))
 }
 
+// Decode common JSON Unicode escape sequences (\uXXXX) back to UTF-8.
+// Some models (esp. small quantized ones primed with JSON-heavy tool prompts)
+// generate literal \uXXXX text instead of actual Unicode characters.
+decode_unicode_escapes :: proc(s: string) -> string {
+	if !strings.contains(s, "\\u") { return s }
+	out: strings.Builder
+	strings.builder_init(&out, context.temp_allocator)
+	defer strings.builder_destroy(&out)
+	i := 0
+	for i < len(s) {
+		if i + 5 < len(s) && s[i] == '\\' && s[i+1] == 'u' {
+			// Parse 4 hex digits
+			cp: u32 = 0
+			valid := true
+			for j in 0 ..< 4 {
+				c := s[i + 2 + j]
+				switch {
+				case c >= '0' && c <= '9': cp = cp * 16 + u32(c - '0')
+				case c >= 'a' && c <= 'f': cp = cp * 16 + u32(c - 'a') + 10
+				case c >= 'A' && c <= 'F': cp = cp * 16 + u32(c - 'A') + 10
+				case: valid = false
+				}
+			}
+			if valid && cp > 0 {
+				// Encode codepoint as UTF-8
+				if cp < 0x80 {
+					strings.write_byte(&out, byte(cp))
+				} else if cp < 0x800 {
+					strings.write_byte(&out, byte(0xC0 | (cp >> 6)))
+					strings.write_byte(&out, byte(0x80 | (cp & 0x3F)))
+				} else {
+					strings.write_byte(&out, byte(0xE0 | (cp >> 12)))
+					strings.write_byte(&out, byte(0x80 | ((cp >> 6) & 0x3F)))
+					strings.write_byte(&out, byte(0x80 | (cp & 0x3F)))
+				}
+				i += 6
+				continue
+			}
+		}
+		strings.write_byte(&out, s[i])
+		i += 1
+	}
+	return strings.clone(strings.to_string(out))
+}
+
 // ====================== N-gram speculative decoding ======================
 
 NGRAM_N :: 3    // context length for n-gram lookup
@@ -955,6 +1000,8 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	// When tools are present, parse for <tool_call> blocks
 	if has_tools {
 		full_text := strings.to_string(gen_buf)
+		// Decode any \uXXXX escapes the model may have generated
+		full_text = decode_unicode_escapes(full_text)
 		tool_calls_json := parse_tool_calls(full_text)
 		if len(tool_calls_json) > 0 {
 			// Emit each tool_call as separate NDJSON line
