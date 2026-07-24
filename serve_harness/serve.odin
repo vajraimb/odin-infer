@@ -977,7 +977,13 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	for gen < max_tokens {
 		if next == EOS { finish_reason = "stop"; break }
 		decoded := tok35.decode_token_id(&g_state.tok, next)
-		strings.write_string(&gen_buf, decoded)
+		if len(decoded) > 0 {
+			strings.write_string(&gen_buf, decoded)
+			// Stream token immediately (per-token NDJSON)
+			line := concat_json(
+				`{"message":{"role":"assistant","content":`, json_quote(decoded), `},"done":false}`)
+			ndjson_write(client, line)
+		}
 		delete(decoded)
 		gen += 1
 		g_state.pos += 1
@@ -989,11 +995,9 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
-	// Always buffer full output then emit. Per-token streaming causes issues
-	// with pie-odin's NDJSON parser (backslash eating in Chinese text).
-	// Buffering + decode_unicode_escapes at the end is the safe path.
-	full_text := strings.to_string(gen_buf)
-	full_text = decode_unicode_escapes(full_text)
+	// Decode the full accumulated text for tool-call parsing (not for streaming —
+	// streamed tokens were already emitted raw above).
+	full_text := decode_unicode_escapes(strings.to_string(gen_buf))
 
 	// When tools are present, parse for <tool_call> blocks
 	if has_tools {
@@ -1010,10 +1014,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			fmt.eprintfln("ollama: %d tool calls detected", len(tool_calls_json))
 		}
 	} else {
-		// No tools — emit full text as one content chunk (already decoded above)
-		line := concat_json(
-			`{"message":{"role":"assistant","content":`, json_quote(full_text), `},"done":false}`)
-		ndjson_write(client, line)
+		// No tools — text was already streamed per-token above. Nothing to emit here.
 	}
 
 	// Final done line with usage stats
