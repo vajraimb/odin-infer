@@ -489,9 +489,11 @@ handle_chat :: proc(body: string) -> string {
 			g_state.pos = len(encoded) - 1
 		}
 	} else {
-		if len(encoded) > 0 {
-			_ = q35.engine_forward_batch(&g_state.engine, encoded, g_state.pos)
-			g_state.pos += len(encoded)
+		// Leave the last token for the per-token kickoff forward below;
+		// forwarding it here too would feed it to the recurrent state twice.
+		if len(encoded) > 1 {
+			_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], g_state.pos)
+			g_state.pos += len(encoded) - 1
 		}
 	}
 
@@ -507,7 +509,7 @@ handle_chat :: proc(body: string) -> string {
 
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
-		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, last, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -520,7 +522,7 @@ handle_chat :: proc(body: string) -> string {
 		gen += 1
 		g_state.pos += 1
 		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
-		logits := q35.engine_forward(&g_state.engine, next, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, next, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -555,6 +557,48 @@ handle_chat :: proc(body: string) -> string {
 	return final
 }
 
+// Parse 4 hex digits at s[i:i+4]; returns -1 when out of range or non-hex.
+parse_hex4 :: proc(s: string, i: int) -> int {
+	if i + 4 > len(s) { return -1 }
+	v := 0
+	for k in 0 ..< 4 {
+		c := s[i + k]
+		d := -1
+		switch {
+		case c >= '0' && c <= '9': d = int(c - '0')
+		case c >= 'a' && c <= 'f': d = int(c - 'a') + 10
+		case c >= 'A' && c <= 'F': d = int(c - 'A') + 10
+		}
+		if d < 0 { return -1 }
+		v = v * 16 + d
+	}
+	return v
+}
+
+// Decode a JSON \uXXXX escape (s[i] == 'u') as UTF-8 into `out`, handling
+// surrogate pairs. Standard JSON clients escape non-ASCII (Python json.dumps
+// does it by default), so without this the model is fed literal "u4f60" text
+// and starts mirroring escape-speak. Returns how many extra input bytes were
+// consumed beyond the 'u' itself (4 for BMP, 10 for a surrogate pair, 0 when
+// invalid — a literal 'u' is emitted then).
+write_json_unicode_escape :: proc(out: ^strings.Builder, s: string, i: int) -> int {
+	cp := parse_hex4(s, i + 1)
+	if cp < 0 {
+		strings.write_byte(out, 'u')
+		return 0
+	}
+	consumed := 4
+	if cp >= 0xD800 && cp <= 0xDBFF &&
+	   i + 6 < len(s) && s[i + 5] == '\\' && s[i + 6] == 'u' {
+		if lo := parse_hex4(s, i + 7); lo >= 0xDC00 && lo <= 0xDFFF {
+			cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+			consumed = 10
+		}
+	}
+	strings.write_rune(out, rune(cp))
+	return consumed
+}
+
 extract_json_field :: proc(json, field: string) -> string {
 	key := fmt.tprintf("\"%s\":", field)
 	idx := strings.index(json, key)
@@ -577,6 +621,7 @@ extract_json_field :: proc(json, field: string) -> string {
 			case '"':  strings.write_byte(&out, byte('"'))
 			case '\\': strings.write_byte(&out, byte('\\'))
 			case '/':  strings.write_byte(&out, byte('/'))
+			case 'u':  i += write_json_unicode_escape(&out, json, i)
 			case:      strings.write_byte(&out, json[i])
 			}
 		} else if c == '"' {
@@ -754,7 +799,7 @@ extract_tools_section :: proc(body: string) -> string {
 	out: strings.Builder
 	strings.builder_init(&out, context.temp_allocator)
 	defer strings.builder_destroy(&out)
-	strings.write_string(&out, "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n")
+	strings.write_string(&out, "\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n")
 	// Extract each function definition from the tools array
 	// Format: each tool is {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
 	scan_i := 0
@@ -778,11 +823,45 @@ extract_tools_section :: proc(body: string) -> string {
 		strings.write_string(&out, "\n")
 		scan_i = obj_end
 	}
-	strings.write_string(&out, "</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"argument_name\": \"value\"}}\n</tool_call>\n")
+	// Match the model's native chat template (tokenizer.chat_template in the
+	// GGUF): <function=name><parameter=key>value</parameter></function> nested
+	// in <tool_call>. Instructing a different format makes the model improvise
+	// (`memory(script: ...)`), which then can't be parsed back.
+	strings.write_string(&out, `
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the user's question normally.
+</IMPORTANT>
+`)
 	return strings.clone(strings.to_string(out))
 }
 
-// Parse model output for <tool_call>...</tool_call> blocks.
+// Parse model output for <tool_call>...</tool_call> blocks. Two payload forms
+// are accepted:
+//   1. JSON object {"name":"...","arguments":{...}} (returned as-is)
+//   2. The model's native trained form:
+//      <function=name>\n<parameter=key>\nvalue\n</parameter>\n</function>
+//      which is converted to the same JSON shape.
 // Returns a slice of JSON strings, each being the function call object
 // like {"name":"...","arguments":{...}}
 parse_tool_calls :: proc(text: string) -> []string {
@@ -791,23 +870,258 @@ parse_tool_calls :: proc(text: string) -> []string {
 	defer delete(out)
 	i := 0
 	for i < len(text) {
+		out_len_before := len(out)
 		tc_start := index_from(text, "<tool_call>", i)
 		if tc_start < 0 { break }
 		tc_start += len("<tool_call>")
 		// Skip whitespace
 		for tc_start < len(text) && (text[tc_start] == '\n' || text[tc_start] == ' ' || text[tc_start] == '\r') { tc_start += 1 }
 		tc_end := index_from(text, "</tool_call>", tc_start)
-		if tc_end < 0 { break }
-		// Extract JSON between tags
-		json_str := strings.trim_space(text[tc_start:tc_end])
-		if len(json_str) > 0 {
-			append(&out, strings.clone(json_str))
+		// Truncation salvage: <tool_call> opened but never closed (the model
+		// hit max_tokens / context mid-call). Take the payload up to the end
+		// of text instead of dropping the whole call — a native call is often
+		// still parseable from its prefix.
+		truncated := false
+		if tc_end < 0 {
+			tc_end = len(text)
+			truncated = true
+		}
+		payload := strings.trim_space(text[tc_start:tc_end])
+		if len(payload) > 0 {
+			if payload[0] == '{' {
+				// JSON form. Repair common 9B malformations (trailing comma,
+				// missing close brace) before forwarding; if it's too broken
+				// to salvage, drop it with a log instead of forwarding garbage
+				// that the client's JSON parser will choke on.
+				if repaired, ok := repair_tool_call_json(payload); ok {
+					append(&out, repaired)
+				} else {
+					fmt.eprintfln("tool_call: dropped malformed JSON payload (len %d): %s", len(payload), payload[:min(len(payload), 120)])
+				}
+			} else if strings.contains(payload, "<function=") {
+				if json_str, ok := native_tool_call_to_json(payload); ok {
+					append(&out, json_str)
+				} else {
+					fmt.eprintfln("tool_call: native payload failed to convert (len %d): %s", len(payload), payload[:min(len(payload), 120)])
+				}
+			} else if truncated {
+				fmt.eprintfln("tool_call: truncated <tool_call> with no <function=> (len %d): %s", len(payload), payload[:min(len(payload), 120)])
+			}
+		}
+		if truncated {
+			// A call was salvaged from a generation that never closed
+			// </tool_call> — flag it so a truncated/partial argument is
+			// traceable in the logs rather than looking like a clean call.
+			if len(out) > out_len_before {
+				fmt.eprintfln("tool_call: salvaged from truncated generation (no </tool_call>) — last call's args may be incomplete")
+			}
+			break  // consumed to end of text
 		}
 		i = tc_end + len("</tool_call>")
 	}
 	result := make([]string, len(out))
 	for k in 0 ..< len(out) { result[k] = out[k] }
 	return result
+}
+
+// Convert a native <function=name><parameter=key>value</parameter>...</function>
+// payload into {"name":"name","arguments":{"key":"value",...}}. All values stay
+// strings; the tool's own params parser interprets them.
+native_tool_call_to_json :: proc(payload: string) -> (string, bool) {
+	fs := strings.index(payload, "<function=")
+	if fs < 0 { return "", false }
+	name_start := fs + len("<function=")
+	name_end := index_from(payload, ">", name_start)
+	if name_end < 0 { return "", false }
+	name := strings.trim_space(payload[name_start:name_end])
+	if len(name) == 0 { return "", false }
+
+	out: strings.Builder
+	strings.builder_init(&out, context.temp_allocator)
+	defer strings.builder_destroy(&out)
+	strings.write_string(&out, `{"name":`)
+	strings.write_string(&out, json_quote(name))
+	strings.write_string(&out, `,"arguments":{`)
+
+	n_params := 0
+	pos := name_end
+	for {
+		ps := index_from(payload, "<parameter=", pos)
+		if ps < 0 { break }
+		key_start := ps + len("<parameter=")
+		key_end := index_from(payload, ">", key_start)
+		if key_end < 0 { break }
+		key := strings.trim_space(payload[key_start:key_end])
+		val_start := key_end + 1
+		val_end := index_from(payload, "</parameter>", val_start)
+		// Truncation salvage: if the model hit max_tokens before closing
+		// </parameter>, take the value up to the end of the payload instead
+		// of dropping the whole call. A trailing newline strip still applies.
+		truncated_param := false
+		if val_end < 0 {
+			val_end = len(payload)
+			truncated_param = true
+		}
+		value := payload[val_start:val_end]
+		// Template puts the value on its own line — strip one leading and one
+		// trailing newline, keep interior formatting intact.
+		if len(value) > 0 && value[0] == '\n' { value = value[1:] }
+		if len(value) > 0 && value[len(value) - 1] == '\n' { value = value[:len(value) - 1] }
+		if n_params > 0 { strings.write_string(&out, ",") }
+		strings.write_string(&out, json_quote(key))
+		strings.write_string(&out, ":")
+		strings.write_string(&out, json_quote(value))
+		n_params += 1
+		if truncated_param { break }
+		pos = val_end + len("</parameter>")
+	}
+	strings.write_string(&out, "}}")
+	// Zero-param salvage: the model named a function but emitted no parseable
+	// parameters (forgot them, or truncated before the first value). Return
+	// empty arguments so the tool gets CALLED and can report a missing-arg
+	// error, instead of the call vanishing silently and stalling the agent.
+	if n_params == 0 {
+		fmt.eprintfln("tool_call: \"%s\" emitted with no parseable parameters — salvaging with empty args", name)
+	}
+	return strings.clone(strings.to_string(out)), true
+}
+
+// Repair common 9B-model JSON malformations in a {...} tool-call payload:
+//   - trailing comma before a closing brace (the most frequent error)
+//   - missing close braces from truncation (braces unbalanced, depth > 0)
+// Drops (returns false) on structurally fatal cases: negative brace depth
+// (more closes than opens) or an unterminated string (can't be salvaged
+// safely — forwarding it would only move the parse failure to the client).
+// serve.odin has no JSON parser available, so this is a single-pass
+// structural heuristic, not a full validate.
+repair_tool_call_json :: proc(payload: string) -> (string, bool) {
+	if len(payload) == 0 || payload[0] != '{' { return "", false }
+	out: [dynamic]u8
+	out = make([dynamic]u8, 0, len(payload) + 4)
+	defer delete(out)
+	depth := 0
+	in_str := false
+	esc := false
+	for i in 0 ..< len(payload) {
+		c := payload[i]
+		if in_str {
+			append(&out, c)
+			if esc { esc = false }
+			else if c == '\\' { esc = true }
+			else if c == '"' { in_str = false }
+			continue
+		}
+		switch c {
+		case '"': in_str = true
+		case '{': depth += 1
+		case '}':
+			// Strip a trailing comma (with any whitespace) before this brace.
+			for len(out) > 0 {
+				last := out[len(out) - 1]
+				if last == ' ' || last == '\t' || last == '\n' || last == '\r' { pop(&out) }
+				else if last == ',' { pop(&out); break }
+				else { break }
+			}
+			depth -= 1
+		case:
+		}
+		append(&out, c)
+	}
+	if in_str { return "", false }  // unterminated string — unsafe to salvage
+	// Strip a trailing comma left dangling at end of input, then re-balance.
+	for len(out) > 0 {
+		last := out[len(out) - 1]
+		if last == ' ' || last == '\t' || last == '\n' || last == '\r' || last == ',' { pop(&out) }
+		else { break }
+	}
+	if depth < 0 { return "", false }
+	for _ in 0 ..< depth { append(&out, '}') }
+	return strings.clone(string(out[:])), true
+}
+
+// Deterministic, model-free regression for parse_tool_calls + its helpers.
+// Run with: ./serve.bin --self-test  (or `odin run serve_harness/serve.odin
+// -file -- --self-test ...`). Locks in the hardening: truncation salvage
+// (no </tool_call>), truncated-parameter salvage, zero-param salvage,
+// malformed-JSON repair, multi-call, prose-before-call. Inner helper procs
+// take all data as params and do NOT capture outer locals (Odin has no
+// closures) — they only log + return pass/fail, aggregated by the caller.
+run_parse_self_test :: proc() -> bool {
+	eq_str :: proc(label, got, want: string) -> bool {
+		if got == want do return true
+		fmt.eprintfln("self-test FAIL: %s\n  want: %s\n  got:  %s", label, want, got)
+		return false
+	}
+	has_sub :: proc(label: string, parsed: []string, needle: string) -> bool {
+		for s in parsed {
+			if strings.contains(s, needle) do return true
+		}
+		fmt.eprintfln("self-test FAIL: %s — parsed %d call(s), none contained \"%s\"", label, len(parsed), needle)
+		return false
+	}
+	is_count :: proc(label: string, got, want: int) -> bool {
+		if got == want do return true
+		fmt.eprintfln("self-test FAIL: %s — want count %d, got %d", label, want, got)
+		return false
+	}
+
+	pass, total := 0, 0
+
+	// 1. Happy native form (the format ornith is trained on).
+	r := parse_tool_calls("<tool_call>\n<function=weather>\n<parameter=city>\nsf\n</parameter>\n</function>\n</tool_call>")
+	total += 1; if is_count("happy-native count", len(r), 1) do pass += 1
+	total += 1; if has_sub("happy-native name", r, `"name":"weather"`) do pass += 1
+	total += 1; if has_sub("happy-native arg value", r, `"city":"sf"`) do pass += 1
+
+	// 2. Happy JSON form (inside a <tool_call> wrapper, like the native form).
+	r = parse_tool_calls(`<tool_call>{"name":"weather","arguments":{"city":"sf"}}</tool_call>`)
+	total += 1; if is_count("happy-json count", len(r), 1) do pass += 1
+	total += 1; if has_sub("happy-json name", r, `"name":"weather"`) do pass += 1
+
+	// 3. Truncation: <tool_call> with NO closing tag — must salvage, not drop.
+	r = parse_tool_calls("<tool_call>\n<function=weather>\n<parameter=city>\nsf\n</parameter>\n</function>")
+	total += 1; if is_count("truncated-no-close count", len(r), 1) do pass += 1
+	total += 1; if has_sub("truncated-no-close name", r, `"name":"weather"`) do pass += 1
+
+	// 4. Truncated parameter: <parameter> opened, never closed.
+	r = parse_tool_calls("<tool_call><function=weather><parameter=city>san fran</tool_call>")
+	total += 1; if is_count("truncated-param count", len(r), 1) do pass += 1
+	total += 1; if has_sub("truncated-param salvaged value", r, `"city":"san fran"`) do pass += 1
+
+	// 5. Zero parameters: function named, no params — salvage as empty args.
+	r = parse_tool_calls("<tool_call><function=list_files></function></tool_call>")
+	total += 1; if is_count("zero-param count", len(r), 1) do pass += 1
+	total += 1; if eq_str("zero-param empty args", r[0], `{"name":"list_files","arguments":{}}`) do pass += 1
+
+	// 6. Prose/reasoning before the call — still parsed.
+	r = parse_tool_calls("Let me check that.\n<tool_call><function=weather><parameter=city>sf</parameter></function></tool_call>")
+	total += 1; if is_count("prose-before count", len(r), 1) do pass += 1
+	total += 1; if has_sub("prose-before name", r, `"name":"weather"`) do pass += 1
+
+	// 7. Multiple tool calls in one generation.
+	r = parse_tool_calls("<tool_call><function=a><parameter=x>1</parameter></function></tool_call>\n<tool_call><function=b><parameter=y>2</parameter></function></tool_call>")
+	total += 1; if is_count("multi count", len(r), 2) do pass += 1
+
+	// 8. Trailing-comma JSON — repair and keep.
+	r = parse_tool_calls(`<tool_call>{"name":"weather","arguments":{"city":"sf",}}</tool_call>`)
+	total += 1; if is_count("trailing-comma count", len(r), 1) do pass += 1
+	total += 1; if has_sub("trailing-comma value", r, `"city":"sf"`) do pass += 1
+
+	// 9. Truncated JSON object (closed strings, missing braces) — re-balance.
+	r = parse_tool_calls(`<tool_call>{"name":"read","arguments":{"path":"/tmp",</tool_call>`)
+	total += 1; if is_count("truncated-json salvage count", len(r), 1) do pass += 1
+	total += 1; if has_sub("truncated-json name", r, `"name":"read"`) do pass += 1
+
+	// 10. Truncated mid-string-value — can't be salvaged safely; drop it.
+	r = parse_tool_calls(`<tool_call>{"name":"read","arguments":{"path":"/tmp</tool_call>`)
+	total += 1; if is_count("mid-string-trunc dropped", len(r), 0) do pass += 1
+
+	// 11. No tool call at all — empty result.
+	r = parse_tool_calls("just a normal answer, no tools here")
+	total += 1; if is_count("no-call count", len(r), 0) do pass += 1
+
+	fmt.printfln("self-test: %d/%d cases passed", pass, total)
+	return pass == total
 }
 
 // ====================== end tool calling helpers ======================
@@ -845,11 +1159,14 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		if role != "system" && role != "user" && role != "assistant" {
 			role = "user"
 		}
-		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
-		// Inject tools section right after system message
 		if role == "system" && has_tools {
-			strings.write_string(&prompt_buf, extract_tools_section(body))
+			// Tools section goes INSIDE the system block, matching the model's
+			// native chat template (and letting the prefix snapshot cache it).
+			strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>system\n%s%s<|im_end|>\n",
+				m.content, extract_tools_section(body)))
+			continue
 		}
+		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
 	}
 	strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
 
@@ -870,6 +1187,18 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	for common < max_common && encoded[common] == g_state.last_tokens[common] {
 		common += 1
 	}
+
+	// Locate the system-prompt boundary (first <|im_end|> + following "\n") so a
+	// state snapshot can be taken exactly there. The linear-attention conv and
+	// recurrent states evolve with position and are NOT rewindable, so a snapshot
+	// is only sound when the engine has forwarded exactly prefix_pos tokens at
+	// save time — saving later and resuming earlier replays the suffix tokens on
+	// top of an already-advanced recurrent state and corrupts generation.
+	snap_pos := 0
+	for i in 3 ..< len(encoded) - 1 {
+		if encoded[i] == EOS { snap_pos = i + 2; break }
+	}
+	snap_ok := snap_pos >= 5 && snap_pos < len(encoded)
 
 	t_prefill_start := time_to_ms()
 	t_reset_ms: i64 = 0
@@ -892,10 +1221,9 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			g_state.pos = g_state.prefix_pos
 			prefix_restored = true
 			// Now prefill only the tokens AFTER the cached prefix
-			suffix_start := g_state.prefix_pos
-			suffix_tokens := encoded[suffix_start:len(encoded) - 1]  // leave last for per-token fwd
+			suffix_tokens := encoded[g_state.prefix_pos:len(encoded) - 1]  // leave last for per-token fwd
 			if len(suffix_tokens) > 0 {
-				_ = q35.engine_forward_batch(&g_state.engine, suffix_tokens, suffix_start)
+				_ = q35.engine_forward_batch(&g_state.engine, suffix_tokens, g_state.prefix_pos)
 			}
 			g_state.pos = len(encoded) - 1
 			fmt.eprintfln("ollama: PREFIX CACHE HIT (restored %d tokens, prefilling %d new)",
@@ -904,8 +1232,12 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	}
 
 	if !prefix_restored {
-		if common == len(g_state.last_tokens) && common > 0 && common < len(encoded) {
-			// Continuation — prefill encoded[common:len-1] at pos = common
+		// Continuation — sound only when the engine state sits exactly at the
+		// divergence point (g_state.pos == number of tokens forwarded so far).
+		// Otherwise the non-rewindable recurrent state would absorb the tail
+		// tokens a second time.
+		if common == len(g_state.last_tokens) && common > 0 && common < len(encoded) &&
+		   g_state.pos == common {
 			new_tokens := encoded[common:len(encoded) - 1]
 			if len(new_tokens) > 0 {
 				_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
@@ -913,42 +1245,41 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			g_state.pos = len(encoded) - 1
 			fmt.eprintfln("ollama: prefix-cache hit (%d/%d tokens), prefilling only %d new",
 				common, len(encoded), len(new_tokens))
-		} else if common == len(encoded) && common > 0 && g_state.pos == len(encoded) - 1 {
-			fmt.eprintfln("ollama: prefix-cache FULL hit (%d tokens), skipping prefill", common)
 		} else {
-			// Reset and full prefill
+			// Reset and full prefill. When the system boundary is known, prefill
+			// up to it FIRST and snapshot the state at exactly that position,
+			// then prefill the rest.
 			t_r0 := time_to_ms()
 			q35.engine_reset_state(&g_state.engine)
 			t_reset_ms = time_to_ms() - t_r0
 			g_state.pos = 0
-			if len(encoded) > 1 {
-				_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
-				g_state.pos = len(encoded) - 1
-			}
-			fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
-		}
 
-		// After full prefill, take/update snapshot. Always update to handle
-		// system prompt changes between sessions.
-		if g_state.pos > 5 {
-			snap_pos := 0
-			for i in 3 ..< len(encoded) - 1 {
-				if encoded[i] == EOS { snap_pos = i + 2; break }
+			prefill_from := 0
+			if snap_ok {
+				_ = q35.engine_forward_batch(&g_state.engine, encoded[:snap_pos], 0)
+				g_state.pos = snap_pos
+				prefill_from = snap_pos
+
+				// Free old snapshot, take the new one at the boundary
+				if len(g_state.prefix_kv_k) > 0 {
+					delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
+					delete(g_state.prefix_conv); delete(g_state.prefix_rec)
+				}
+				g_state.prefix_kv_k, g_state.prefix_kv_v,
+					g_state.prefix_conv, g_state.prefix_rec =
+					q35.engine_save_full_state(&g_state.engine)
+				g_state.prefix_pos = snap_pos
+				clear(&g_state.prefix_tokens)
+				for i in 0 ..< snap_pos { append(&g_state.prefix_tokens, encoded[i]) }
+				fmt.eprintfln("ollama: prefix snapshot at system boundary pos=%d (%d tokens cached)",
+					snap_pos, snap_pos)
 			}
-			if snap_pos < 5 || snap_pos >= g_state.pos { snap_pos = g_state.pos }
-			// Free old snapshot
-			if len(g_state.prefix_kv_k) > 0 {
-				delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
-				delete(g_state.prefix_conv); delete(g_state.prefix_rec)
+
+			if len(encoded) - 1 > prefill_from {
+				_ = q35.engine_forward_batch(&g_state.engine, encoded[prefill_from:len(encoded) - 1], prefill_from)
 			}
-			g_state.prefix_kv_k, g_state.prefix_kv_v,
-				g_state.prefix_conv, g_state.prefix_rec =
-				q35.engine_save_full_state(&g_state.engine)
-			g_state.prefix_pos = snap_pos
-			clear(&g_state.prefix_tokens)
-			for i in 0 ..< snap_pos { append(&g_state.prefix_tokens, encoded[i]) }
-			fmt.eprintfln("ollama: prefix snapshot at system boundary pos=%d (%d tokens cached)",
-				snap_pos, snap_pos)
+			g_state.pos = len(encoded) - 1
+			fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
 		}
 	}
 	t_prefill_ms := time_to_ms() - t_prefill_start
@@ -969,7 +1300,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
-		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, last, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -991,7 +1322,9 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			finish_reason = "length"
 			break
 		}
-		logits := q35.engine_forward(&g_state.engine, next, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, next, g_state.pos)
+		// Track forwarded tokens so the next request can use the continuation path.
+		append(&g_state.last_tokens, next)
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -1012,6 +1345,21 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			}
 			finish_reason = "tool_calls"
 			fmt.eprintfln("ollama: %d tool calls detected", len(tool_calls_json))
+		} else {
+			// Tools were offered but nothing parseable came back. Distinguish a
+			// real parse failure (model emitted <tool_call>/<function=> but it
+			// was malformed/truncated) from the model simply choosing to answer
+			// in prose. Either way, log a trimmed snippet so the failure isn't
+			// a black box — this is the signal that the tool-prompt format
+			// drifted or that max_tokens truncated a call.
+			snippet_end := min(len(full_text), 160)
+			if strings.contains(full_text, "<tool_call>") || strings.contains(full_text, "<function=") {
+				fmt.eprintfln("ollama: PARSE FAILURE — model emitted a tool-call tag but none parsed (gen=%d, finish=%s): %s",
+					gen, finish_reason, full_text[:snippet_end])
+			} else {
+				fmt.eprintfln("ollama: tools offered, model answered in prose (gen=%d, finish=%s): %s",
+					gen, finish_reason, full_text[:snippet_end])
+			}
 		}
 	} else {
 		// No tools — text was already streamed per-token above. Nothing to emit here.
@@ -1119,7 +1467,7 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
-		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, last, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -1138,7 +1486,7 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 		gen += 1
 		g_state.pos += 1
 		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
-		logits := q35.engine_forward(&g_state.engine, next, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, next, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -1244,6 +1592,7 @@ decode_json_string :: proc(s: string) -> string {
 			case '"':  strings.write_byte(&out, byte('"'))
 			case '\\': strings.write_byte(&out, byte('\\'))
 			case '/':  strings.write_byte(&out, byte('/'))
+			case 'u':  i += write_json_unicode_escape(&out, s, i)
 			case:      strings.write_byte(&out, s[i])
 			}
 		} else {
@@ -1304,6 +1653,7 @@ openai_extract_messages :: proc(json: string) -> []Message_Pair {
 				case '"':  strings.write_byte(&content_buf, byte('"'))
 				case '\\': strings.write_byte(&content_buf, byte('\\'))
 				case '/':  strings.write_byte(&content_buf, byte('/'))
+				case 'u':  j += write_json_unicode_escape(&content_buf, json, j)
 				case:      strings.write_byte(&content_buf, json[j])
 				}
 			} else if ch == '"' {
@@ -1403,7 +1753,7 @@ handle_openai_chat :: proc(body: string) -> string {
 
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
-		logits := q35.engine_forward(&g_state.engine, last, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, last, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
 	} else {
 		return `{"error":{"message":"empty prompt","type":"internal_error"}}`
@@ -1418,7 +1768,7 @@ handle_openai_chat :: proc(body: string) -> string {
 		gen += 1
 		g_state.pos += 1
 		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
-		logits := q35.engine_forward(&g_state.engine, next, g_state.pos - 1)
+		logits := q35.engine_forward(&g_state.engine, next, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -1493,8 +1843,20 @@ parse_f32_field :: proc(json, field: string, def: f32) -> f32 {
 
 main :: proc() {
 	args := os.args
+	// --self-test: exercise parse_tool_calls + repair_tool_call_json over a
+	// fixture table WITHOUT loading the model. Exits 0 on all-pass, 1 on any
+	// failure. Fast (no model load), model-free, deterministic.
+	for a in args {
+		if a == "--self-test" {
+			if run_parse_self_test() {
+				os.exit(0)
+			}
+			os.exit(1)
+		}
+	}
 	if len(args) < 2 {
 		fmt.eprintln("usage: serve <model.gguf> [--port N] [--metal] [--max-ctx N]")
+		fmt.eprintln("       serve --self-test  (parse regression, no model needed)")
 		os.exit(1)
 	}
 	model_path := args[1]

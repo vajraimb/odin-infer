@@ -2,3 +2,6 @@
 *.dSYM/
 *.log
 .DS_Store
+serve.bin
+oracle.bin
+serve_harness/.test-serve.bin

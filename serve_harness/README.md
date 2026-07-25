@@ -89,6 +89,24 @@ By contrast, `POST /api/chat` (the dashboard's endpoint) is **stateful** —
 each call continues from the previous `pos`. Don't mix the two for the same
 conversation.
 
+## Regression test
+
+Multi-turn Chinese conversation through the Ollama endpoint with prefix-cache
+hits (guards against snapshot mispositioning corrupting the linear-attention
+recurrent state, and against JSON `\uXXXX` escapes reaching the model as
+literal text):
+
+```sh
+python3 serve_harness/test_prefix_cache.py   # MODEL=... PORT=... to override
+```
+
+Builds a cached test binary (`serve_harness/.test-serve.bin`), starts a
+throwaway server, runs 3 Chinese turns via `/api/chat` plus a 4th turn with a
+`tools` payload (asserts the model's native
+`<tool_call><function=...><parameter=...>` form is parsed back into structured
+`tool_calls`), and checks clean CJK output + `PREFIX CACHE HIT` on turns 2+.
+Exit code 0 on PASS.
+
 ## Dashboard
 
 The HTML page (inlined via `#load`) provides:
