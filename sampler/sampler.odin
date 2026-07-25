@@ -24,6 +24,9 @@ Sampler :: struct {
 	// Grammar-constrained decoding (nil = unconstrained). When set, sample()
 	// masks out tokens whose text would violate the grammar before sampling.
 	grammar:      ^JSON_Grammar,
+	// Native <tool_call> constraint (nil = off). Mutually exclusive with the
+	// JSON grammar in practice; masked the same way before sampling.
+	tool_grammar: ^Tool_Call_Grammar,
 	token_bytes:  [][]u8,        // cache: token id → decoded bytes
 	eos_token:    int,           // EOS id allowed when grammar.is_completable()
 }
@@ -171,6 +174,18 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 		apply_mask(logits, mask)
 	}
 
+	// Tool-call grammar: same masking scheme for native <tool_call> output.
+	// EOS is legal only in completable states (free prose outside a call).
+	if s.tool_grammar != nil && s.tool_grammar.enabled && s.token_bytes != nil {
+		mask := make([]bool, s.vocab_size, allocator = context.temp_allocator)
+		defer delete(mask)
+		tcg_compute_token_mask(s.tool_grammar, s.vocab_size, s.token_bytes, mask)
+		if s.eos_token >= 0 && s.eos_token < s.vocab_size {
+			mask[s.eos_token] = tcg_is_completable(s.tool_grammar)
+		}
+		apply_mask(logits, mask)
+	}
+
 	// Choose token
 	chosen: int
 	if s.temperature == 0.0 {
@@ -193,6 +208,11 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 	if s.grammar != nil && s.token_bytes != nil && chosen != s.eos_token {
 		if chosen >= 0 && chosen < s.vocab_size {
 			_ = advance_bytes(s.grammar, s.token_bytes[chosen])
+		}
+	}
+	if s.tool_grammar != nil && s.tool_grammar.enabled && s.token_bytes != nil && chosen != s.eos_token {
+		if chosen >= 0 && chosen < s.vocab_size {
+			_ = tcg_advance_token(s.tool_grammar, s.token_bytes[chosen])
 		}
 	}
 	return chosen

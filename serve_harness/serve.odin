@@ -22,6 +22,7 @@
 
 package serve
 
+import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -1120,11 +1121,203 @@ run_parse_self_test :: proc() -> bool {
 	r = parse_tool_calls("just a normal answer, no tools here")
 	total += 1; if is_count("no-call count", len(r), 0) do pass += 1
 
+	// ---- tool-call grammar fixtures (model-free state machine checks) ----
+	feed_bytes :: proc(g: ^sampler.Tool_Call_Grammar, s: string) -> bool {
+		for i in 0 ..< len(s) {
+			if !sampler.tcg_advance_byte(g, s[i]) { return false }
+		}
+		return true
+	}
+	expect_true :: proc(label: string, v: bool) -> bool {
+		if v do return true
+		fmt.eprintfln("self-test FAIL: %s", label)
+		return false
+	}
+
+	table: sampler.TCG_Table
+	mem := sampler.tcg_table_add_tool(&table, "memory")
+	sampler.tcg_tool_add_param(mem, "script")
+	sampler.tcg_table_add_tool(&table, "list_directory") // no params → any key allowed
+	sampler.tcg_table_add_tool(&table, "search")
+	sampler.tcg_table_add_tool(&table, "search_web")
+
+	// G1. Fresh grammar: EOS allowed in prose state.
+	g: sampler.Tool_Call_Grammar
+	sampler.tcg_init(&g, &table)
+	total += 1; if expect_true("grammar: fresh is completable", sampler.tcg_is_completable(&g)) do pass += 1
+
+	// G2. Prose + well-formed call accepted end-to-end; EOS allowed again after.
+	sampler.tcg_init(&g, &table)
+	ok := feed_bytes(&g, "好的，先记下来。\n<tool_call>\n<function=memory>\n<parameter=script>\nset m [recall user]\n</parameter>\n</function>\n</tool_call>")
+	total += 1; if expect_true("grammar: accepts well-formed call", ok) do pass += 1
+	total += 1; if expect_true("grammar: completable again after call", sampler.tcg_is_completable(&g)) do pass += 1
+
+	// G3. Wrong function name rejected.
+	sampler.tcg_init(&g, &table)
+	ok = feed_bytes(&g, "<tool_call>\n<function=memX")
+	total += 1; if expect_true("grammar: rejects bad func name", !ok) do pass += 1
+
+	// G4. Wrong parameter key rejected (schema known).
+	sampler.tcg_init(&g, &table)
+	ok = feed_bytes(&g, "<tool_call>\n<function=memory>\n<parameter=wrong>")
+	total += 1; if expect_true("grammar: rejects bad param key", !ok) do pass += 1
+
+	// G5. Unknown-schema tool: any key allowed.
+	sampler.tcg_init(&g, &table)
+	ok = feed_bytes(&g, "<tool_call>\n<function=list_directory>\n<parameter=path>\n/tmp\n</parameter>\n</function>\n</tool_call>")
+	total += 1; if expect_true("grammar: any key allowed when schema unknown", ok) do pass += 1
+
+	// G6. Mid-call: EOS not allowed.
+	sampler.tcg_init(&g, &table)
+	_ = feed_bytes(&g, "<tool_call>\n<function=mem")
+	total += 1; if expect_true("grammar: mid-call not completable", !sampler.tcg_is_completable(&g)) do pass += 1
+
+	// G7. Prefix-name tools: both "search" and "search_web" committable.
+	sampler.tcg_init(&g, &table)
+	ok_a := feed_bytes(&g, "<tool_call>\n<function=search>\n</function>\n</tool_call>")
+	sampler.tcg_init(&g, &table)
+	ok_b := feed_bytes(&g, "<tool_call>\n<function=search_web>\n</function>\n</tool_call>")
+	total += 1; if expect_true("grammar: prefix-name commit", ok_a && ok_b) do pass += 1
+
+	// G8. Value length cap forces termination.
+	sampler.tcg_init(&g, &table)
+	_ = feed_bytes(&g, "<tool_call>\n<function=memory>\n<parameter=script>\n")
+	capped := true
+	for _ in 0 ..< sampler.TCG_MAX_VALUE {
+		if !sampler.tcg_advance_byte(&g, 'a') { capped = false; break }
+	}
+	over := sampler.tcg_advance_byte(&g, 'b') // must be rejected past the cap
+	fin := feed_bytes(&g, "\n</parameter>\n</function>\n</tool_call>")
+	total += 1; if expect_true("grammar: value cap forces terminator", capped && !over && fin) do pass += 1
+
+	// G9. Multiple calls in one generation.
+	sampler.tcg_init(&g, &table)
+	ok = feed_bytes(&g, "<tool_call>\n<function=search>\n</function>\n</tool_call>\n\n<tool_call>\n<function=memory>\n<parameter=script>\nx\n</parameter>\n</function>\n</tool_call>")
+	total += 1; if expect_true("grammar: multiple calls in one generation", ok) do pass += 1
+
 	fmt.printfln("self-test: %d/%d cases passed", pass, total)
 	return pass == total
 }
 
 // ====================== end tool calling helpers ======================
+
+// ====================== tool-call grammar constraint (VISION.md P0) ======================
+
+g_tool_token_cache_ready: bool
+
+decode_token_for_cache :: proc(id: int, allocator: runtime.Allocator) -> string {
+	return tok35.decode_token_id(&g_state.tok, id, allocator)
+}
+
+// Build the token-id → bytes cache once (one-time cost over the full vocab);
+// shared by the tool-call grammar mask on every structured token.
+ensure_tool_token_cache :: proc() {
+	if g_tool_token_cache_ready do return
+	if g_state.samp.token_bytes == nil {
+		t0 := time_to_ms()
+		g_state.samp.token_bytes = sampler.build_token_cache(g_state.samp.vocab_size, decode_token_for_cache)
+		fmt.eprintfln("ollama: tool-grammar token cache built (%d tokens, %dms)",
+			g_state.samp.vocab_size, time_to_ms() - t0)
+	}
+	g_tool_token_cache_ready = true
+}
+
+// Scan a JSON string starting at or after `start` (skips to the opening quote).
+// Returns the inner text (escapes kept raw — tool names/keys are identifiers),
+// the index past the closing quote, and success.
+tcg_scan_json_string :: proc(text: string, start: int) -> (string, int, bool) {
+	i := start
+	for i < len(text) && text[i] != '"' { i += 1 }
+	if i >= len(text) { return "", i, false }
+	j := i + 1
+	for j < len(text) {
+		if text[j] == '\\' { j += 2; continue }
+		if text[j] == '"' { return text[i+1:j], j+1, true }
+		j += 1
+	}
+	return "", j, false
+}
+
+// Extract tool names + parameter keys from the request's "tools" array into a
+// grammar table. Heuristic depth-1 scan of parameters.properties; when no
+// properties are found the tool degrades to "any parameter key allowed".
+// Returned strings alias `body`, which outlives the request handler.
+extract_tool_specs :: proc(body: string, table: ^sampler.TCG_Table) {
+	table.n_tools = 0
+	search := 0
+	for table.n_tools < sampler.TCG_MAX_TOOLS {
+		rel := strings.index(body[search:], `"function"`)
+		if rel < 0 { break }
+		fi := search + rel
+		// Find the { that opens the function object
+		obj_start := -1
+		for j := fi + len(`"function"`); j < len(body); j += 1 {
+			c := body[j]
+			if c == '{' { obj_start = j; break }
+			if c == '}' || c == ']' { break }
+		}
+		if obj_start < 0 { break }
+		// Walk to the matching close brace (string-aware)
+		depth := 1
+		j := obj_start + 1
+		in_str := false
+		for j < len(body) && depth > 0 {
+			c := body[j]
+			if in_str {
+				if c == '\\' { j += 1 }
+				else if c == '"' { in_str = false }
+			} else {
+				if c == '"' { in_str = true }
+				else if c == '{' { depth += 1 }
+				else if c == '}' { depth -= 1 }
+			}
+			j += 1
+		}
+		region := body[obj_start:j]
+		search = j
+		// name
+		name := ""
+		if ni := strings.index(region, `"name"`); ni >= 0 {
+			s, _, ok := tcg_scan_json_string(region, ni + len(`"name"`))
+			if ok { name = s }
+		}
+		if name == "" { continue }
+		spec := sampler.tcg_table_add_tool(table, name)
+		if spec == nil { break }
+		// parameters.properties: depth-1 keys followed by ':'
+		pi := strings.index(region, `"properties"`)
+		if pi < 0 { continue }
+		ps := -1
+		for k := pi + len(`"properties"`); k < len(region); k += 1 {
+			if region[k] == '{' { ps = k; break }
+			if region[k] == '}' { break }
+		}
+		if ps < 0 { continue }
+		d := 1
+		k := ps + 1
+		for k < len(region) && d > 0 {
+			c := region[k]
+			if c == '"' {
+				s, e, ok := tcg_scan_json_string(region, k)
+				if !ok { break }
+				if d == 1 {
+					m := e
+					for m < len(region) && (region[m] == ' ' || region[m] == '\t' || region[m] == '\n' || region[m] == '\r') { m += 1 }
+					if m < len(region) && region[m] == ':' {
+						sampler.tcg_tool_add_param(spec, s)
+					}
+				}
+				k = e
+				continue
+			}
+			if c == '{' || c == '[' { d += 1 }
+			else if c == '}' || c == ']' { d -= 1 }
+			k += 1
+		}
+	}
+}
+
+// ====================== end tool-call grammar constraint ======================
 
 // Pie-odin sends: POST /api/chat {"model":"ornith","messages":[...],"stream":true,"options":{...}}
 // Expects NDJSON response: one JSON object per line, each {"message":{"role":"assistant","content":"delta"},"done":false}
@@ -1142,6 +1335,22 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	max_tokens := parse_int_field(body, "num_predict", 256)
 	if max_tokens == 0 { max_tokens = 256 }
 	has_tools := strings.contains(body, `"tools"`) && strings.contains(body, `"function"`)
+
+	// Syntax-constrained tool-call generation (P0): when the request carries
+	// tools, mask sampling so the model cannot break the native <tool_call>
+	// format. The serve-side parser stays as a fallback. TOOLCALL_GRAMMAR=0 disables.
+	tcg_table: sampler.TCG_Table
+	tcg: sampler.Tool_Call_Grammar
+	if has_tools && os.get_env("TOOLCALL_GRAMMAR", context.temp_allocator) != "0" {
+		extract_tool_specs(body, &tcg_table)
+		if tcg_table.n_tools > 0 {
+			ensure_tool_token_cache()
+			sampler.tcg_init(&tcg, &tcg_table)
+			g_state.samp.tool_grammar = &tcg
+			defer g_state.samp.tool_grammar = nil
+			fmt.eprintfln("ollama: tool-grammar ON (%d tools)", tcg_table.n_tools)
+		}
+	}
 
 	// Render Qwen chat template
 	prompt_buf: strings.Builder
@@ -1904,6 +2113,7 @@ main :: proc() {
 
 	cfg := q35.engine_config(&g_state.engine)
 	sampler.build_sampler(&g_state.samp, int(cfg.vocab_size), 0.6, 0.95, 0)
+	g_state.samp.eos_token = EOS
 	defer sampler.free_sampler(&g_state.samp)
 
 	fmt.printfln("serve: ready (vocab=%d, seq_len=%d, metal=%v)",
