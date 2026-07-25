@@ -437,6 +437,64 @@ json_escape :: proc(s: string, out: ^strings.Builder) {
 	strings.write_byte(out, byte('"'))
 }
 
+// ====================== UTF-8 stream reassembly ======================
+//
+// Byte-level BPE tokens can split a multi-byte UTF-8 character across tokens
+// (e.g. ☀ = U+2600 is E2 98 80, and the tokenizer may emit it as two tokens
+// [E2 98] + [80]). decode_token_id returns RAW BYTES, so streaming one token
+// per NDJSON/SSE line can put a truncated UTF-8 sequence on the wire — that
+// line is then invalid UTF-8 AND invalid JSON (JSON text must be Unicode).
+// Strict clients reject the whole line and fall back to printing raw bytes,
+// which is what showed up as garbled characters in pie-odin.
+//
+// Fix: hold any incomplete trailing sequence in a small per-request buffer and
+// prepend it to the next token's bytes, so every line on the wire is complete,
+// valid UTF-8.
+
+// Length of the longest prefix of s consisting of complete UTF-8 sequences.
+// Bytes past the cut are a truncated multi-byte character to be held back.
+utf8_complete_prefix_len :: proc(s: string) -> int {
+	i := 0
+	good := 0
+	for i < len(s) {
+		c := s[i]
+		n := 1
+		if c >= 0xF0 { n = 4 } else if c >= 0xE0 { n = 3 } else if c >= 0xC2 { n = 2 }
+		// 0x80-0xC1 = stray continuation/overlong lead: treat as a single
+		// pass-through byte so a malformed sequence can't stall the stream.
+		if i + n > len(s) { break }
+		ok := true
+		for k in 1 ..< n {
+			if s[i + k] & 0xC0 != 0x80 { ok = false; break }
+		}
+		if !ok {
+			// Malformed lead — emit it alone rather than wedging the stream.
+			i += 1
+			good = i
+			continue
+		}
+		i += n
+		good = i
+	}
+	return good
+}
+
+// Append newly decoded token bytes to `pending` and return the longest prefix
+// safe to emit now (complete UTF-8 only), heap-owned on the context allocator.
+// The incomplete tail (0-3 bytes) stays in `pending` for the next call.
+utf8_stream_take :: proc(pending: ^[dynamic]u8, s: string) -> string {
+	append(pending, s)
+	n := utf8_complete_prefix_len(string(pending[:]))
+	if n == 0 { return "" }
+	out := strings.clone(string(pending[:n]))
+	remaining := len(pending) - n
+	if remaining > 0 {
+		copy(pending[:remaining], pending[n:])
+	}
+	resize(pending, remaining)
+	return out
+}
+
 json_info :: proc() -> string {
 	cfg := q35.engine_config(&g_state.engine)
 	out: strings.Builder
@@ -1659,6 +1717,12 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	strings.builder_init(&gen_buf, context.allocator)
 	defer strings.builder_destroy(&gen_buf)
 
+	// BPE tokens can split a multi-byte UTF-8 character (e.g. ☀ as [E2 98]+[80]).
+	// Hold an incomplete trailing sequence here and prepend it to the next
+	// token's bytes so every streamed NDJSON line is valid UTF-8 / valid JSON.
+	utf8_pending: [dynamic]u8
+	defer delete(utf8_pending)
+
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
 		logits := q35.engine_forward(&g_state.engine, last, g_state.pos)
@@ -1671,10 +1735,15 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		decoded := tok35.decode_token_id(&g_state.tok, next)
 		if len(decoded) > 0 {
 			strings.write_string(&gen_buf, decoded)
-			// Stream token immediately (per-token NDJSON)
-			line := concat_json(
-				`{"message":{"role":"assistant","content":`, json_quote(decoded), `},"done":false}`)
-			ndjson_write(client, line)
+			// Stream immediately (per-token NDJSON), emitting only complete
+			// UTF-8 sequences — see utf8_stream_take.
+			emit := utf8_stream_take(&utf8_pending, decoded)
+			if len(emit) > 0 {
+				line := concat_json(
+					`{"message":{"role":"assistant","content":`, json_quote(emit), `},"done":false}`)
+				ndjson_write(client, line)
+				delete(emit)
+			}
 		}
 		delete(decoded)
 		gen += 1
@@ -1687,6 +1756,14 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		// Track forwarded tokens so the next request can use the continuation path.
 		append(&g_state.last_tokens, next)
 		next = sampler.sample(&g_state.samp, logits)
+	}
+
+	// Flush any dangling partial sequence. Shouldn't happen (generated text
+	// ends at a character boundary), but never strand bytes.
+	if len(utf8_pending) > 0 {
+		line := concat_json(
+			`{"message":{"role":"assistant","content":`, json_quote(string(utf8_pending[:])), `},"done":false}`)
+		ndjson_write(client, line)
 	}
 
 	// Decode the full accumulated text for tool-call parsing (not for streaming —
@@ -1827,6 +1904,12 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 	strings.builder_init(&full_text, context.allocator)
 	defer strings.builder_destroy(&full_text)
 
+	// Hold incomplete trailing UTF-8 across tokens so every SSE delta is
+	// valid UTF-8 / valid JSON (BPE can split a multi-byte char — see
+	// utf8_stream_take).
+	utf8_pending: [dynamic]u8
+	defer delete(utf8_pending)
+
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
 		logits := q35.engine_forward(&g_state.engine, last, g_state.pos)
@@ -1838,11 +1921,15 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 		decoded := tok35.decode_token_id(&g_state.tok, next)
 		if len(decoded) > 0 {
 			strings.write_string(&full_text, decoded)
-			// emit delta event with type field
-			delta_json := concat_json(
-				`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":`,
-				json_quote(decoded), `}`)
-			sse_write(client, "response.output_text.delta", delta_json)
+			// emit delta event with type field (complete UTF-8 only)
+			emit := utf8_stream_take(&utf8_pending, decoded)
+			if len(emit) > 0 {
+				delta_json := concat_json(
+					`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":`,
+					json_quote(emit), `}`)
+				sse_write(client, "response.output_text.delta", delta_json)
+				delete(emit)
+			}
 		}
 		delete(decoded)
 		gen += 1
@@ -1850,6 +1937,14 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
 		logits := q35.engine_forward(&g_state.engine, next, g_state.pos)
 		next = sampler.sample(&g_state.samp, logits)
+	}
+
+	// Flush any dangling partial sequence before the closing events.
+	if len(utf8_pending) > 0 {
+		delta_json := concat_json(
+			`{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":`,
+			json_quote(string(utf8_pending[:])), `}`)
+		sse_write(client, "response.output_text.delta", delta_json)
 	}
 
 	final_text := strings.to_string(full_text)
