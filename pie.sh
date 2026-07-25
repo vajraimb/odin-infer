@@ -18,6 +18,10 @@ unset OPENAI_API_KEY ANTHROPIC_API_KEY OPENROUTER_API_KEY GROQ_API_KEY \
 
 export ODINFERSERVER_BASE_URL="http://127.0.0.1:${PORT}"
 
+# Load local secrets (MEMECSY_API_KEY, MEMECSY_DAEMON_URL) — kept in
+# ~/.pie/env, NOT in this repo. The memecsy MCP thin client inherits these.
+[[ -f "$HOME/.pie/env" ]] && source "$HOME/.pie/env"
+
 if [[ $# -ge 1 ]]; then
   # One-shot: feed prompt via stdin, then close
   echo "$1" | exec "$PIE_BIN" --model odinfer 2>/dev/null
