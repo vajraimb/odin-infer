@@ -1319,6 +1319,157 @@ extract_tool_specs :: proc(body: string, table: ^sampler.TCG_Table) {
 
 // ====================== end tool-call grammar constraint ======================
 
+// ====================== KV persistence across restarts (VISION.md P0) ======================
+//
+// Two rolling artifacts under g_kv_dir (default .kv-cache/, KV_PERSIST_DIR
+// overrides, KV_PERSIST=0 disables):
+//   prefix.oikv/.tokens  — full engine state at the system-prompt boundary,
+//                          saved when the in-memory prefix snapshot is taken
+//   session.oikv/.tokens — full engine state after each completed request,
+//                          with the exact forwarded token list
+// On startup both are restored: the prefix snapshot goes back into the
+// in-memory cache (first request after a restart is a PREFIX CACHE HIT
+// instead of a ~30s prefill) and the session state restores continuation
+// bookkeeping. Corruption is refused via the kv file's CRC + fingerprint.
+
+TOKENS_FILE_MAGIC :: u32(0x4F49544B) // 'OITK'
+
+g_kv_dir: string // empty = persistence disabled
+
+kv_persist_path :: proc(name: string) -> string {
+	return fmt.tprintf("%s/%s", g_kv_dir, name)
+}
+
+write_tokens_file :: proc(path: string, tokens: []int) -> bool {
+	put32 :: proc(buf: []u8, off: int, v: u32) {
+		buf[off+0] = u8(v & 0xff);       buf[off+1] = u8((v >> 8) & 0xff)
+		buf[off+2] = u8((v >> 16) & 0xff); buf[off+3] = u8((v >> 24) & 0xff)
+	}
+	buf := make([]u8, 8 + 4*len(tokens)) // heap: delete() pairs with context.allocator
+	defer delete(buf)
+	put32(buf, 0, TOKENS_FILE_MAGIC)
+	put32(buf, 4, u32(len(tokens)))
+	for t, i in tokens { put32(buf, 8 + 4*i, u32(t)) }
+	f, err := os.open(path, os.O_CREATE | os.O_WRONLY | os.O_TRUNC)
+	if err != os.ERROR_NONE { return false }
+	defer os.close(f)
+	n, werr := os.write(f, buf)
+	return werr == os.ERROR_NONE && n == len(buf)
+}
+
+read_tokens_file :: proc(path: string) -> ([]int, bool) {
+	get32 :: proc(buf: []u8, off: int) -> u32 {
+		return u32(buf[off]) | u32(buf[off+1]) << 8 | u32(buf[off+2]) << 16 | u32(buf[off+3]) << 24
+	}
+	data, err := os.read_entire_file_from_path(path, context.allocator) // heap, freed below
+	if err != os.ERROR_NONE || len(data) < 8 { return nil, false }
+	defer delete(data)
+	if get32(data, 0) != TOKENS_FILE_MAGIC { return nil, false }
+	count := int(get32(data, 4))
+	if len(data) != 8 + 4*count { return nil, false }
+	out := make([]int, count) // long-lived (process lifetime), intentionally not freed
+	for i in 0 ..< count { out[i] = int(get32(data, 8 + 4*i)) }
+	return out, true
+}
+
+tokens_equal :: proc(a: []int, b: [dynamic]int) -> bool {
+	if len(a) != len(b) { return false }
+	for t, i in a { if t != b[i] { return false } }
+	return true
+}
+
+// Called right after the in-memory prefix snapshot is taken (engine state sits
+// exactly at prefix_pos there). Skips the ~140MB write when the cached system
+// prefix is unchanged.
+save_prefix_snapshot :: proc() {
+	if len(g_kv_dir) == 0 || len(g_state.prefix_tokens) == 0 { return }
+	tokens_path := kv_persist_path("prefix.tokens")
+	if old, ok := read_tokens_file(tokens_path); ok && tokens_equal(old, g_state.prefix_tokens) {
+		return
+	}
+	tmp := kv_persist_path("prefix.oikv.tmp")
+	if !q35.engine_save_kv(&g_state.engine, tmp, g_state.prefix_pos) {
+		fmt.eprintln("kv-persist: prefix save failed")
+		return
+	}
+	_ = os.rename(tmp, kv_persist_path("prefix.oikv"))
+	if !write_tokens_file(tokens_path, g_state.prefix_tokens[:]) {
+		fmt.eprintln("kv-persist: prefix tokens write failed")
+		return
+	}
+	fmt.eprintfln("kv-persist: saved prefix snapshot (%d tokens)", g_state.prefix_pos)
+}
+
+// Called after a request completes (response already streamed). The engine
+// coverage invariant is len(last_tokens) forwarded tokens.
+save_session_state :: proc() {
+	if len(g_kv_dir) == 0 || len(g_state.last_tokens) == 0 { return }
+	n_valid := len(g_state.last_tokens)
+	tmp := kv_persist_path("session.oikv.tmp")
+	if !q35.engine_save_kv(&g_state.engine, tmp, n_valid) {
+		fmt.eprintln("kv-persist: session save failed")
+		return
+	}
+	_ = os.rename(tmp, kv_persist_path("session.oikv"))
+	if !write_tokens_file(kv_persist_path("session.tokens"), g_state.last_tokens[:]) {
+		fmt.eprintln("kv-persist: session tokens write failed")
+		return
+	}
+	fmt.eprintfln("kv-persist: saved session state (%d tokens)", n_valid)
+}
+
+// Called once at startup, after engine + tokenizer are ready. Failures degrade
+// to a normal cold start (CRC/fingerprint/seq_len mismatches refuse the load).
+restore_persisted_state :: proc() {
+	if len(g_kv_dir) == 0 { return }
+
+	// 1) System-prefix snapshot → back into the in-memory prefix cache.
+	prefix_loaded := 0
+	if pt, ok := read_tokens_file(kv_persist_path("prefix.tokens")); ok {
+		n, lok := q35.engine_load_kv(&g_state.engine, kv_persist_path("prefix.oikv"))
+		if lok && n == len(pt) {
+			g_state.prefix_kv_k, g_state.prefix_kv_v,
+				g_state.prefix_conv, g_state.prefix_rec =
+				q35.engine_save_full_state(&g_state.engine)
+			g_state.prefix_pos = n
+			clear(&g_state.prefix_tokens)
+			append(&g_state.prefix_tokens, ..pt)
+			prefix_loaded = n
+			fmt.eprintfln("kv-persist: restored prefix snapshot (%d tokens)", n)
+		} else if lok {
+			fmt.eprintfln("kv-persist: prefix tokens/state mismatch (%d vs %d) — ignoring", n, len(pt))
+		}
+	}
+
+	// 2) Session continuation state → engine + bookkeeping.
+	if st, ok := read_tokens_file(kv_persist_path("session.tokens")); ok {
+		n, lok := q35.engine_load_kv(&g_state.engine, kv_persist_path("session.oikv"))
+		if lok && n == len(st) {
+			clear(&g_state.last_tokens)
+			append(&g_state.last_tokens, ..st)
+			g_state.pos = n - 1 // engine coverage n, pos = last forwarded position
+			fmt.eprintfln("kv-persist: restored session state (%d tokens)", n)
+			return
+		}
+		if lok {
+			fmt.eprintfln("kv-persist: session tokens/state mismatch (%d vs %d) — ignoring", n, len(st))
+		}
+	}
+
+	// No usable session — but if the prefix load above left the engine sitting
+	// at the system boundary, keep that as the starting point.
+	if prefix_loaded > 0 {
+		clear(&g_state.last_tokens)
+		append(&g_state.last_tokens, ..g_state.prefix_tokens[:])
+		g_state.pos = prefix_loaded - 1
+	} else if len(g_state.last_tokens) > 0 || g_state.pos != 0 {
+		q35.engine_reset_state(&g_state.engine)
+		g_state.pos = 0
+	}
+}
+
+// ====================== end KV persistence ======================
+
 // Pie-odin sends: POST /api/chat {"model":"ornith","messages":[...],"stream":true,"options":{...}}
 // Expects NDJSON response: one JSON object per line, each {"message":{"role":"assistant","content":"delta"},"done":false}
 // Final line: {"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",...}
@@ -1482,6 +1633,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 				for i in 0 ..< snap_pos { append(&g_state.prefix_tokens, encoded[i]) }
 				fmt.eprintfln("ollama: prefix snapshot at system boundary pos=%d (%d tokens cached)",
 					snap_pos, snap_pos)
+				save_prefix_snapshot()
 			}
 
 			if len(encoded) - 1 > prefill_from {
@@ -1583,6 +1735,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	tps := gen > 0 && t_gen_ms > 0 ? f64(gen) * 1000.0 / f64(t_gen_ms) : 0.0
 	fmt.eprintfln("ollama: %d in / %d out | reset=%dms prefill=%dms gen=%dms (%.1f tok/s)",
 		len(encoded), gen, t_reset_ms, t_prefill_ms, t_gen_ms, tps)
+	save_session_state()
 }
 
 // ====================== OpenAI Responses API (streaming, for Codex) ======================
@@ -2115,6 +2268,18 @@ main :: proc() {
 	sampler.build_sampler(&g_state.samp, int(cfg.vocab_size), 0.6, 0.95, 0)
 	g_state.samp.eos_token = EOS
 	defer sampler.free_sampler(&g_state.samp)
+
+	// KV persistence across restarts: resume the last session + system-prefix
+	// snapshot. KV_PERSIST=0 disables; KV_PERSIST_DIR overrides .kv-cache/.
+	if os.get_env("KV_PERSIST", context.temp_allocator) == "0" {
+		g_kv_dir = ""
+	} else {
+		dir := os.get_env("KV_PERSIST_DIR", context.temp_allocator)
+		if dir == "" { dir = ".kv-cache" }
+		g_kv_dir = strings.clone(dir)
+		_ = os.make_directory(g_kv_dir)
+	}
+	restore_persisted_state()
 
 	fmt.printfln("serve: ready (vocab=%d, seq_len=%d, metal=%v)",
 		cfg.vocab_size, cfg.seq_len, g_state.engine.metal_ready)

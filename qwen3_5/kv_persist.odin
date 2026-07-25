@@ -338,8 +338,11 @@ cpu_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 // ---------- CRC32 over file contents (excluding the trailing 4 CRC bytes) ----------
 
 append_crc32 :: proc(path: string) -> bool {
-	data, err := os.read_entire_file_from_path(path, context.temp_allocator)
+	// Heap (not temp): the buffer is file-sized (50-200MB) and the server's
+	// temp arena is never reset — temp would leak the file size per save.
+	data, err := os.read_entire_file_from_path(path, context.allocator)
 	if err != os.ERROR_NONE { return false }
+	defer delete(data)
 	c := hash.crc32(data)
 	f, oerr := os.open(path, os.O_APPEND | os.O_WRONLY)
 	if oerr != os.ERROR_NONE { return false }
@@ -349,8 +352,9 @@ append_crc32 :: proc(path: string) -> bool {
 }
 
 verify_crc32 :: proc(path: string) -> bool {
-	data, err := os.read_entire_file_from_path(path, context.temp_allocator)
+	data, err := os.read_entire_file_from_path(path, context.allocator)
 	if err != os.ERROR_NONE { return false }
+	defer delete(data)
 	if len(data) < 4 { return false }
 	body := data[:len(data) - 4]
 	stored_crc := u32(data[len(data) - 4]) |

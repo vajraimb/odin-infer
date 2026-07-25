@@ -144,7 +144,7 @@ sample_topp :: proc(probabilities: []f32, topp: f32, probindex: []Prob_Index, co
 sample :: proc(s: ^Sampler, logits: []f32) -> int {
 	// CTRL repetition penalty: penalise each unique token in the recent window.
 	if s.repeat_penalty != 1.0 && len(s.last_tokens) > 0 {
-		seen := make([dynamic]int, 0, 64, allocator = context.temp_allocator)
+		seen := make([dynamic]int, 0, 64) // heap: delete() pairs with context.allocator
 		defer delete(seen)
 		for tok in s.last_tokens {
 			if tok < 0 || tok >= s.vocab_size do continue
@@ -165,7 +165,7 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 	// Grammar-constrained: mask out tokens whose decoded bytes would violate
 	// the grammar. EOS is allowed when the grammar is in a completable state.
 	if s.grammar != nil && s.token_bytes != nil {
-		mask := make([]bool, s.vocab_size, allocator = context.temp_allocator)
+		mask := make([]bool, s.vocab_size) // heap: delete() pairs with context.allocator
 		defer delete(mask)
 		compute_token_mask(s.grammar, s.vocab_size, s.token_bytes, mask)
 		if s.eos_token >= 0 && s.eos_token < s.vocab_size && is_completable(s.grammar) {
@@ -177,7 +177,7 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 	// Tool-call grammar: same masking scheme for native <tool_call> output.
 	// EOS is legal only in completable states (free prose outside a call).
 	if s.tool_grammar != nil && s.tool_grammar.enabled && s.token_bytes != nil {
-		mask := make([]bool, s.vocab_size, allocator = context.temp_allocator)
+		mask := make([]bool, s.vocab_size) // heap: delete() pairs with context.allocator
 		defer delete(mask)
 		tcg_compute_token_mask(s.tool_grammar, s.vocab_size, s.token_bytes, mask)
 		if s.eos_token >= 0 && s.eos_token < s.vocab_size {
