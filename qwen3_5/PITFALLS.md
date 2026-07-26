@@ -156,6 +156,39 @@
 
 ---
 
+## 七、内存生命周期（serve 层）
+
+### 16. 逐个 `make`/`delete` 配对管请求内存 → 泄漏、双重释放、悬空 view 三连
+- **症状**（历史事故汇总）：`delete` 嵌套 map 行为不可靠（#6）、并发 make/delete 全局 map
+  use-after-free（#7）、`free_transformer` 误 delete mmap 切片成双重释放隐患（#9）、
+  "resp_text 是 builder 的 view 不能 delete" 类防御注释越来越多。另有静默泄漏：
+  `tok35.encode` 的返回值从不释放、`read_tokens_file` 的比较副本每次 prefix 保存泄一份、
+  **`context.temp_allocator` 全进程从不 reset**，每个请求的 `fmt.tprintf`/临时 builder 永远累积。
+- **根因**：serve 层的内存生命周期只有两种——**请求内**（HTTP 解析、JSON 构建、逐 token
+  解码字符串）和**跨请求**（prefix cache 快照、token 历史、tool-token cache、KV 落盘暂存），
+  但代码用同一种逐对 make/delete 管理两者。配对一多，忘删、删错、删早了都不可避免。
+- **修复**：`serve_harness/serve.odin` 改为 **per-request arena**。`handle_client` 入口把
+  `context.allocator` 换成全局 `virtual.Arena`（growing，页面跨请求保留），请求结束
+  `defer` 里 `virtual.arena_free_all` + `free_all(context.temp_allocator)` 一次清干净。
+  请求内分配的 delete 全部变成无害 no-op。跨请求存活的 5 处显式走 `g_heap`
+  （启动时捕获的进程堆）：
+  1. `g_state.last_tokens` / `g_state.prefix_tokens`——启动时用 g_heap `make`；
+     `[dynamic]` 记住首次 make 的 allocator，`clear()` 不丢，之后 append 不碰 arena。
+  2. `g_state.prefix_kv_*` 快照（~140MB）——`engine_save_full_state` 内部用
+     `context.allocator`，调用点临时切 g_heap；对应 delete 同域。
+  3. `sampler.build_token_cache`——请求中懒加载但存活全进程，切 g_heap。
+  4. `save_prefix_snapshot` / `save_session_state`——CRC 校验会把 50–200MB KV 文件
+     整个读进 allocator，切 g_heap 防止 arena 高水位永久膨胀。
+  5. （规则而非点位）**任何新写的跨请求状态，先想清楚 allocator 是谁。**
+- **教训**：**判断标准就一条——这份数据活不活得过这次请求？** 活不过 → 不用管，arena 收尾；
+  活得过 → 必须 g_heap，否则 arena reset 后就是悬空指针。反过来 g_heap 的 delete 若发生在
+  arena 语境下会变成 no-op 泄漏（140MB 快照换届时就是）。server 是单线程串行 accept，
+  arena 无线程安全问题；matmul 线程池的 task 分配/释放也都在主线程。验证：
+  三个集成测试（prefix cache / kv persist / toolcall grammar）恰好把五条逃逸路径全覆盖，
+  改后全 PASS，tok/s 无变化（9.7 vs 9.3 噪声范围）。
+
+---
+
 ## 快速自检清单（下次移植新架构）
 
 - [ ] 写 GGUF 头部 dump 工具，拿真实张量名 + metadata，**别猜**
@@ -164,3 +197,5 @@
 - [ ] **接参考实现做行为对照**（llama-cli / transformers），用事实性问答验证
 - [ ] CPU 跑通后，Metal 单独验证：buffer 清零、权重在 mmap、kernel 激活函数逐个对拍
 - [ ] 关注实际 tok/s 和 "Metal: enabled"，别被静默回退 CPU 骗了
+- [ ] serve 层新分配先问"活不活得过这次请求"：活不过 → 留给 per-request arena 收尾；
+  活得过 → 显式 `g_heap`（见 #16），并确认对应 delete 也在 g_heap 语境下

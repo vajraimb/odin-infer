@@ -24,6 +24,7 @@ package serve
 
 import "base:runtime"
 import "core:fmt"
+import "core:mem/virtual"
 import "core:net"
 import "core:os"
 import "core:strconv"
@@ -83,7 +84,27 @@ start_server :: proc(port: u16, handler: Server_Handler) -> bool {
 }
 
 handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
-	// Heap-allocated buffer — Codex prompts can be 100KB+ (tools spec + history)
+	// Per-request arena: swap context.allocator for the request's duration and
+	// release everything in one shot on exit — no per-allocation delete pairs,
+	// and no dangling-pointer risk for request-scoped data. Requests run
+	// serially on this thread (single accept loop) and the matmul pool's task
+	// alloc/free both happen on this thread, so the unsynchronized bump
+	// allocator is safe. Existing delete() calls on arena memory are harmless
+	// no-ops and are kept for clarity.
+	prev_alloc := context.allocator
+	context.allocator = virtual.arena_allocator(&g_req_arena)
+	defer {
+		context.allocator = prev_alloc
+		virtual.arena_free_all(&g_req_arena)
+		// The default temp arena is never reset anywhere else in this process —
+		// without this, every fmt.tprintf / temp-builder allocation in a request
+		// accumulates forever (the "temp arena is never reset" note in
+		// qwen3_5/kv_persist.odin documents one symptom of exactly that).
+		free_all(context.temp_allocator)
+	}
+
+	// Arena-backed read buffer — Codex prompts can be 100KB+ (tools spec +
+	// history). Pages stay reserved across requests after the first request.
 	buf := make([]u8, 2_000_000, context.allocator)
 	defer delete(buf)
 	total := 0
@@ -343,6 +364,16 @@ Engine_State :: struct {
 }
 
 g_state: Engine_State
+
+// Per-request arena (see handle_client): every allocation scoped to one HTTP
+// request — the 2MB read buffer, header parsing, JSON building, per-token
+// decode strings — bumps this pointer and is released in a single free_all
+// when the request ends. The arena keeps its reserved pages across requests,
+// so the read buffer stops paying mmap+page-fault cost per request. Anything
+// that must OUTLIVE the request (prefix-cache snapshots, token histories, the
+// tool-token cache, KV-persist staging) allocates on g_heap explicitly.
+g_heap:      runtime.Allocator
+g_req_arena: virtual.Arena
 
 // ====================== HTML (single-page dashboard) ======================
 
@@ -1273,7 +1304,12 @@ ensure_tool_token_cache :: proc() {
 	if g_tool_token_cache_ready do return
 	if g_state.samp.token_bytes == nil {
 		t0 := time_to_ms()
+		// The cache is built lazily inside a request but lives for the whole
+		// process — allocate it on g_heap, not the per-request arena.
+		prev := context.allocator
+		context.allocator = g_heap
 		g_state.samp.token_bytes = sampler.build_token_cache(g_state.samp.vocab_size, decode_token_for_cache)
+		context.allocator = prev
 		fmt.eprintfln("ollama: tool-grammar token cache built (%d tokens, %dms)",
 			g_state.samp.vocab_size, time_to_ms() - t0)
 	}
@@ -1441,6 +1477,12 @@ tokens_equal :: proc(a: []int, b: [dynamic]int) -> bool {
 // prefix is unchanged.
 save_prefix_snapshot :: proc() {
 	if len(g_kv_dir) == 0 || len(g_state.prefix_tokens) == 0 { return }
+	// Called mid-request; the CRC re-read pulls the whole KV file (50-200MB)
+	// through context.allocator — keep that on g_heap so the per-request
+	// arena's reserved high-water mark isn't inflated by file-sized buffers.
+	prev := context.allocator
+	context.allocator = g_heap
+	defer context.allocator = prev
 	tokens_path := kv_persist_path("prefix.tokens")
 	if old, ok := read_tokens_file(tokens_path); ok && tokens_equal(old, g_state.prefix_tokens) {
 		return
@@ -1462,6 +1504,10 @@ save_prefix_snapshot :: proc() {
 // coverage invariant is len(last_tokens) forwarded tokens.
 save_session_state :: proc() {
 	if len(g_kv_dir) == 0 || len(g_state.last_tokens) == 0 { return }
+	// See save_prefix_snapshot: file-sized staging stays on g_heap.
+	prev := context.allocator
+	context.allocator = g_heap
+	defer context.allocator = prev
 	n_valid := len(g_state.last_tokens)
 	tmp := kv_persist_path("session.oikv.tmp")
 	if !q35.engine_save_kv(&g_state.engine, tmp, n_valid) {
@@ -1678,14 +1724,21 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 				g_state.pos = snap_pos
 				prefill_from = snap_pos
 
-				// Free old snapshot, take the new one at the boundary
-				if len(g_state.prefix_kv_k) > 0 {
-					delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
-					delete(g_state.prefix_conv); delete(g_state.prefix_rec)
+				// Free old snapshot, take the new one at the boundary. The
+				// snapshot buffers (~140MB) must outlive this request — allocate
+				// and free them on g_heap, never the per-request arena.
+				{
+					prev := context.allocator
+					context.allocator = g_heap
+					if len(g_state.prefix_kv_k) > 0 {
+						delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
+						delete(g_state.prefix_conv); delete(g_state.prefix_rec)
+					}
+					g_state.prefix_kv_k, g_state.prefix_kv_v,
+						g_state.prefix_conv, g_state.prefix_rec =
+						q35.engine_save_full_state(&g_state.engine)
+					context.allocator = prev
 				}
-				g_state.prefix_kv_k, g_state.prefix_kv_v,
-					g_state.prefix_conv, g_state.prefix_rec =
-					q35.engine_save_full_state(&g_state.engine)
 				g_state.prefix_pos = snap_pos
 				clear(&g_state.prefix_tokens)
 				for i in 0 ..< snap_pos { append(&g_state.prefix_tokens, encoded[i]) }
@@ -2299,6 +2352,14 @@ parse_f32_field :: proc(json, field: string, def: f32) -> f32 {
 // ====================== entry ======================
 
 main :: proc() {
+	// Capture the process heap before handle_client ever swaps
+	// context.allocator to the per-request arena; g_heap is the escape hatch
+	// for allocations that outlive a request.
+	g_heap = context.allocator
+	if virtual.arena_init_growing(&g_req_arena) != nil {
+		fmt.eprintln("serve: request arena init failed")
+		os.exit(1)
+	}
 	args := os.args
 	// --self-test: exercise parse_tool_calls + repair_tool_call_json over a
 	// fixture table WITHOUT loading the model. Exits 0 on all-pass, 1 on any
@@ -2340,6 +2401,12 @@ main :: proc() {
 	}
 
 	g_state.model_path = model_path
+	// Cross-request token histories: bind to the process heap now so appends
+	// made while a request's arena is installed as context.allocator never
+	// allocate from the arena (a [dynamic] array keeps the allocator captured
+	// by its initial make, and clear() preserves it).
+	g_state.last_tokens = make([dynamic]int, 0, 4096, g_heap)
+	g_state.prefix_tokens = make([dynamic]int, 0, 4096, g_heap)
 	fmt.println("serve: loading engine…")
 	e, ok := q35.engine_load(model_path, q35.Engine_Opts{
 		max_ctx = max_ctx,
