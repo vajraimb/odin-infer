@@ -56,7 +56,17 @@ GPU f32 ~2.15 TFLOPS / fp16 ~4.3 TFLOPS。
 - 端到端体感:1500-tok prefill + 500-tok 生成 ≈ 78s(原 ~6 分钟)。继续死磕 MMQ 极限
   仅换 ~15% 端到端(78→67s),且 decode 已在带宽墙 → **杠杆率极低,决定收工**。
 - profiling 工具(`QFASTMATH`/`QTIMING`/`QPROF_*`)保留,**默认关闭**(env 门控)。
-- **C=16 chunked-delta 悬案**(挂起):engine 在 C=16 出 `!!!!!`,C≤8 正常;math 在 harness
-  C=16(含变 beta/g)全过。**重启条件**:若未来做 fused sequence-wise kernel,第一件事是用
-  `QFASTMATH=0` 跑 engine C=16,排查是否 fast-math;若否,转 host-side dispatch/buffer layout。
+- **C=16 chunked-delta 悬案(已结案,2026-10-31)**:engine 在 C=16 出 `!!!!!`,C≤8 正常。
+  用 `delta_harness/engine_chunked_gpu.odin`(engine 内核逐字 + engine 维度/布局 + CPU 逐行双胞)
+  做了判决性实验:
+  - **fast-math 排除**:良性输入下 C∈{8,16} × fast-math{on,off} 四组合全过
+    (GPU vs CPU 双胞 max|dOut| ~5e-9),engine 内核本身无辜。
+  - **真凶定位(机制级)**:对抗用例(cp 累积衰减下溢:单个 head 内两个 token 的
+    g=exp(a_dec·softplus)≈1e-14 → cp[t] 下溢为字面 0 → `cp[t]/cp[i]` = 0/0 → NaN),
+    CPU 双胞与 GPU 产生**完全一致的 NaN 模式**(各 19968 个)。这不是 fast-math,也不是
+    dispatch,而是 chunked 公式本身的脆弱点——tokenwise 路径从不构造 cp 比率所以免疫;
+    C 越大,一个 chunk 内含多个极小-g token 的概率越高,与"C≤8 正常、C=16 炸"的症状吻合。
+  - **对 fused kernel 的硬性设计要求**:必须稳定化 cp 比率——clamp 累积衰减下界
+    (cp ≥ 1e-20 量级)或改 log-space 比率(exp(cumsum 差)并 clamp),否则 fused 版会
+    在真实激活上随机炸 NaN。
   chunked delta 整体只值 ~2ms/tok,非优先。

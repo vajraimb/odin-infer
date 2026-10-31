@@ -48,7 +48,7 @@
 - **数学已验证**:affine 分解 `S_t = A_t S_{t-1} + B_t`(左乘),A_t=g_t(I−β_t k_t k_tᵀ),B_t=β_t k_t v_tᵀ。chunk 推导 = 下三角 δ 系统,**前向替换、不求逆、不形成 hkd×hkd**。
 - **CPU 原型** extra_error_ratio ~3e-6(chunked vs tokenwise-f32);**GPU kernel** 对齐 CPU ~1e-7(C=16 含变 beta/g 全过)。harness 在 `delta_harness/`(delta_ref.odin + chunked_gpu.odin)。
 - **engine 集成失败已回滚**:v1(S 留 global、per-v-col、per-chunk dispatch)FLOPs 比 per-token 还多、并行度差 → 不提速;且不 bit-identical。
-- **C=16 悬案**:engine C=16 出 `!!!!!`,C≤8 正常;math 在 harness C=16 全过(含变 g)。`maxTotalThreadsPerThreadgroup=1024` 排除资源上限。**重启条件**:做 fused sequence-wise kernel 时第一件事用 `QFASTMATH=0` 跑 engine C=16 排查 fast-math;若否则查 host-side dispatch/buffer layout。
+- **C=16 悬案(已结案,2026-10-31)**:engine C=16 出 `!!!!!`,C≤8 正常。经 `delta_harness/engine_chunked_gpu.odin`(engine 内核逐字双胞 + fast-math on/off 对照 + 对抗输入)判决:**fast-math 排除**(良性输入四组合全过,误差 ~5e-9);真凶是 chunked 公式的 **cp 累积衰减下溢**——g 极小时 cp[t]→0,`cp[t]/cp[i]`=0/0→NaN,C 越大越易触发(CPU 双胞与 GPU NaN 模式逐位一致)。**fused kernel 启动条件更新**:第一设计约束是稳定化 cp 比率(clamp 下界或 log-space),不用再查 fast-math/dispatch。
 - **fused 版**(未来):sequence-wise,一个 threadgroup 走完一个 head 全部 chunk,S 驻留 threadgroup(V_TILE tiling 过 32KB),三角替换限 1 个 simdgroup 内串行。地基已就绪,设计空间被 v1 失败完全约束。
 
 ## subject: tooling(profiling,env 门控,默认关)
