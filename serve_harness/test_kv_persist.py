@@ -22,7 +22,10 @@ What it does
   4. asserts both states were restored at startup, the first post-restart
      turn is a PREFIX CACHE HIT with a small prefill, and the reply is
      clean CJK (a corrupted f16<->f32 state round-trip would produce
-     garbage, same symptom class as the old prefix-cache mispositioning bug).
+     garbage, same symptom class as the old prefix-cache mispositioning bug),
+  5. bit-identical check: both servers get the SAME first-turn prompt with
+     temperature=0 (greedy argmax); the cold and warm replies must match
+     byte-for-byte, proving the disk round-trip is numerically lossless.
 
 Usage
 -----
@@ -134,7 +137,7 @@ def chat(messages):
         "model": "ornith",
         "messages": messages,
         "stream": True,
-        "options": {"num_predict": NUM_PREDICT},
+        "options": {"num_predict": NUM_PREDICT, "temperature": 0},
     }
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
@@ -175,7 +178,8 @@ def main():
     try:
         msgs = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": "你是哪个模型"}]
-        check_clean_reply("cold turn 1", chat(msgs))
+        cold_reply1 = chat(msgs)
+        check_clean_reply("cold turn 1", cold_reply1)
         msgs.append({"role": "assistant", "content": "我是 pie。"})
         msgs.append({"role": "user", "content": "你擅长做什么"})
         check_clean_reply("cold turn 2", chat(msgs))
@@ -205,8 +209,14 @@ def main():
         print("warm start: prefix + session restored from disk")
 
         msgs = [{"role": "system", "content": SYSTEM},
-                {"role": "user", "content": "用中文写一句关于春天的话"}]
-        check_clean_reply("warm turn 1", chat(msgs))
+                {"role": "user", "content": "你是哪个模型"}]
+        warm_reply1 = chat(msgs)
+        check_clean_reply("warm turn 1", warm_reply1)
+        if warm_reply1 != cold_reply1:
+            fail("warm turn 1: reply differs from cold turn 1 — "
+                 "disk round-trip is not bit-identical")
+        print("warm turn 1: reply byte-identical to cold turn 1 "
+              "(disk round-trip lossless)")
         with open(log2) as f:
             log2_text = f.read()
         if "PREFIX CACHE HIT" not in log2_text:
@@ -220,7 +230,8 @@ def main():
         stop_server(proc)
 
     shutil.rmtree(KV_DIR, ignore_errors=True)
-    print("PASS: KV state survives a server restart (prefix hit + clean generation)")
+    print("PASS: KV state survives a server restart "
+          "(prefix hit + bit-identical generation)")
 
 
 if __name__ == "__main__":

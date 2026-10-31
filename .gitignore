@@ -7,3 +7,4 @@ oracle.bin
 serve_harness/.test-serve.bin
 .kv-cache/
 serve_harness/.test-kv-cache/
+serve_harness/.test-serve-old.bin

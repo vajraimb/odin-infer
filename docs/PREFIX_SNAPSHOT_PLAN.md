@@ -29,10 +29,16 @@ fallback 路径 = 现状，无回归风险。
 
 **闸门**：命中 vs 非命中输出 bit-identical；连续 100 请求无状态污染。
 
-## Step 2 — 快照落盘（1 天，可选）
+## Step 2 — 快照落盘（1 天，可选）✅ 已交付（随 Step 1 一同 ship），验收已加固（2026-10-31）
 
 - 照 `kv_persist.odin` 模式写盘，server 重启预热即恢复。磁盘读 48 MB < 0.1 s。
 - 不做多版本管理：前缀变了整体失效重存。
+- ✅ 落盘实现早已就位：`prefix.oikv` + `prefix.tokens` + `session.oikv` + `session.tokens`，
+  重启恢复（CRC + model fingerprint + seq_len 校验），首个请求即 PREFIX CACHE HIT。
+- ✅ 验收加固（2026-10-31）：`serve_harness/test_kv_persist.py` 从"回复是干净中文"
+  升级为 **bit-identical 判据**——冷、暖两轮发同一首轮 prompt（temperature=0 贪心），
+  断言两次回复逐字节相同（f16↔f32 落盘往返无损的强判据）。实测 PASS，
+  暖启动 prefill=1295ms。
 
 ## Step 3 — Autotune 基建（2 天，可与 1/2 并行）✅ 已交付（2026-10-31）
 
@@ -74,6 +80,7 @@ Step 0–2 约一周拿走几乎全部收益；Step 3–4 是长尾。Step 0 不
 - `qwen3_5/kv_persist.odin`：`engine_save_kv` / `engine_load_kv` 落盘，conv_states + recurrent_states 已在格式内（Metal 路径含 f16↔f32 布局转换）。
 - `serve_harness/serve.odin`：系统提示词边界（首个 `<|im_end|>` + "\n"）快照 → 命中时 restore + 只 prefill 后缀；`prefix.oikv` + `prefix.tokens` 落盘，重启后首个请求即 HIT。
 - `serve_harness/test_prefix_cache.py`：快照错位 bug（suffix 在已推进的 recurrent state 上重放 → 24/32 层污染）的回归测试。
+- `serve_harness/test_kv_persist.py`：重启恢复回归，已升级为 bit-identical 判据（冷/暖两轮贪心输出逐字节比对，2026-10-31）。
 
 **剩余空白（本次开工范围）**：
 
