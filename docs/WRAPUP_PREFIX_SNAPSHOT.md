@@ -88,3 +88,29 @@ M3 Air 上 wall-clock 噪声 ±20%，只用 `[timing] forward_gpu_batch` 行下�
 差一永假 + 快照检查顺序截胡。全部修复后：多轮请求整段会话复用（demo 中 64/81 tokens，
 只 prefill 16 个新 token），且与冷全量 prefill **逐字节相同**（`test_prefix_bitidentical.py`
 新增多轮阶段固化）。这正是 Step 0a 埋点的设计目的：没有计数器，这条死路径会永远躺着。
+
+## 结案后追加：连环 tool-call 修复（2026-10-31 深夜）
+
+**症状**：pie 里问天气类问题，模型答完一轮工具调用后无限重调同一个工具，永不给正文。
+
+**根因**：`openai_extract_messages` 只抓 role+content，把 assistant 历史消息里的
+`tool_calls` 字段整个丢掉。渲染出来的历史里 assistant 从没调用过工具，但下一条却是
+tool 结果——模型看到的因果链断裂，只能"再调一次试试"，死循环。
+
+**修复**（serve.odin）：
+- `Message_Pair` 增加 `tool_calls_raw`（raw JSON 数组，用 `json_balanced_end` 平衡括号
+  扫描逐字节捕获，不重序列化）；
+- assistant 历史渲染改用 JSON 形式 `<tool_call>\n{...}\n</tool_call>`（function 对象
+  逐字节嵌入）；tool 角色结果渲染为 `<|im_start|>user\n工具执行结果: ...<|im_end|>\n`。
+
+**为什么是 JSON 形式而不是原生 `<function=` 形式**：探针 4 变体贪心实测——历史里放
+原生 `<function=` 形式 = 连环重调；`<tool_response>` 包装（无论 tool/user 角色）= 连环；
+只有 **JSON 形式 + 纯 user 角色结果** = 正常收尾。模型对训练分布外的历史形态会退化为
+"继续生成 tool_call"，这是行为事实，不是猜测。
+
+**已知取舍**：跨工具轮次 continuation 不命中（历史里的 JSON 形式 ≠ 模型生成的原生
+形式，token 流不同），走 snapshot 路径，可接受。
+
+**回归**：`serve_harness/test_toolloop.py`——turn2 必须无 tool call、缓存命中、有正文。
+`test_prefix_cache.py` 断言放宽为认 snapshot 或 continuation 两种命中（88b2c42 之后
+turn 2 走 continuation 是正确行为，原断言过期）。

@@ -203,10 +203,16 @@ def main():
             reply, _ = chat(messages)
             check_reply(i, reply)
             messages.append({"role": "assistant", "content": reply})
-            if i >= 2 and "PREFIX CACHE HIT" not in server_log():
-                fail(f"turn {i}: expected PREFIX CACHE HIT in server log")
             if i >= 2:
-                print(f"turn {i}: prefix cache hit confirmed")
+                # Either cache path is legitimate: a snapshot hit
+                # ("PREFIX CACHE HIT") or a continuation hit (turn 2+ history
+                # continues the previous request's tail). Since commit 88b2c42
+                # fixed the continuation fast-path, turn 2 typically takes the
+                # continuation route; both prove we skipped re-prefill.
+                log = server_log()
+                if "PREFIX CACHE HIT" not in log and "continuation hit" not in log:
+                    fail(f"turn {i}: expected PREFIX CACHE HIT or continuation hit in server log")
+                print(f"turn {i}: cache hit confirmed (snapshot or continuation)")
 
         # Turn 4 (with tools): the model must emit its NATIVE
         # <tool_call><function=memory><parameter=script>... form, and serve

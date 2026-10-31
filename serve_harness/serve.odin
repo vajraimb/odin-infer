@@ -1645,10 +1645,13 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	for m in msgs {
 		role := m.role
 		if role == "tool" {
-			// Tool result → Qwen <tool_response> block
-			strings.write_string(&prompt_buf, "<|im_start|>tool\n<tool_response>")
+			// Tool result → plain user turn. Probe verdict: this model does NOT
+			// know the <tool_response> wrapper (loops with it, in either a tool
+			// or user role); a plain "工具执行结果: ..." user message is the
+			// only rendering that makes it consume the result and answer.
+			strings.write_string(&prompt_buf, "<|im_start|>user\n工具执行结果: ")
 			strings.write_string(&prompt_buf, m.content)
-			strings.write_string(&prompt_buf, "</tool_response>\n<|im_end|>\n")
+			strings.write_string(&prompt_buf, "<|im_end|>\n")
 			continue
 		}
 		if role != "system" && role != "user" && role != "assistant" {
@@ -1672,8 +1675,16 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			// stub in history makes the token stream structurally identical
 			// between full prefill and continuation, preserving the
 			// bit-identical invariant.
-			strings.write_string(&prompt_buf, fmt.tprintf(
-				"<|im_start|>assistant\n<think>\n\n</think>\n%s<|im_end|>\n", m.content))
+			strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
+			strings.write_string(&prompt_buf, m.content)
+			// Re-render tool calls in JSON form inside <tool_call>. Dropping
+			// them (the old behavior) hid the model's own calls from history
+			// — it re-called the same tool forever; and the NATIVE form
+			// (byte-identical to generation) still loops, per template probe.
+			if len(m.tool_calls_raw) > 0 {
+				render_json_tool_calls(&prompt_buf, m.tool_calls_raw)
+			}
+			strings.write_string(&prompt_buf, "<|im_end|>\n")
 			continue
 		}
 		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
@@ -1732,6 +1743,18 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	// tokens a second time.
 	can_continue := common == len(g_state.last_tokens) && common > 0 &&
 		common < len(encoded) && g_state.pos == common - 1
+
+	// Diagnostics: dump the divergence window whenever continuation was
+	// plausible (shared prefix with last_tokens) but failed — regardless of
+	// which fallback path (snapshot / full prefill) ends up serving.
+	if g_dump_diverge && !can_continue && common > 0 && common < len(g_state.last_tokens) {
+		lo := max(0, common - 6)
+		hi_new := min(len(encoded), common + 10)
+		hi_old := min(len(g_state.last_tokens), common + 10)
+		fmt.eprintfln("DIVERGE vs last_tokens @%d/%d (pos=%d):", common, len(g_state.last_tokens), g_state.pos)
+		fmt.eprintfln("  new: %q", detok_window(encoded[lo:hi_new]))
+		fmt.eprintfln("  old: %q", detok_window(g_state.last_tokens[lo:hi_old]))
+	}
 
 	// Prefer continuation over the system-boundary snapshot whenever it reuses
 	// at least as many tokens — extending the live state skips re-prefilling
@@ -2251,9 +2274,28 @@ openai_extract_messages :: proc(json: string) -> []Message_Pair {
 			}
 			j += 1
 		}
+		// Capture a "tool_calls" array belonging to THIS message (between the
+		// end of its content and the next message's "role" key).
+		tc_raw := ""
+		{
+			scan_end := index_from(json, `"role"`, j)
+			if scan_end < 0 { scan_end = len(json) }
+			tc_idx := index_from(json, `"tool_calls"`, j)
+			if tc_idx >= 0 && tc_idx < scan_end {
+				arr_start := tc_idx + len(`"tool_calls"`)
+				for arr_start < scan_end && (json[arr_start] == ' ' || json[arr_start] == '\t' ||
+					json[arr_start] == ':' || json[arr_start] == '\n') { arr_start += 1 }
+				if arr_start < scan_end && json[arr_start] == '[' {
+					if arr_end, ok := json_balanced_end(json, arr_start); ok {
+						tc_raw = strings.clone(json[arr_start:arr_end])
+					}
+				}
+			}
+		}
 		append(&out, Message_Pair{
 			role = role,
 			content = strings.clone(strings.to_string(content_buf)),
+			tool_calls_raw = tc_raw,
 		})
 		strings.builder_destroy(&content_buf)
 		i = j + 1
@@ -2266,13 +2308,137 @@ openai_extract_messages :: proc(json: string) -> []Message_Pair {
 Message_Pair :: struct {
 	role:    string,
 	content: string,
+	// Raw JSON text of the message's "tool_calls" array (verbatim substring of
+	// the request body), empty when absent. Used to re-render assistant tool
+	// calls into history in the native <tool_call> format.
+	tool_calls_raw: string,
 }
 
 free_message_pairs :: proc(msgs: []Message_Pair) {
 	for m in msgs {
 		delete(m.content)
+		delete(m.tool_calls_raw)
 	}
 	delete(msgs)
+}
+
+// Return the index just past the closing bracket/brace matching s[start]
+// (which must be '[' or '{'), honoring strings and escapes. ok=false on
+// unbalanced input.
+json_balanced_end :: proc(s: string, start: int) -> (int, bool) {
+	depth := 0
+	in_str := false
+	esc := false
+	for i in start ..< len(s) {
+		ch := s[i]
+		if in_str {
+			if esc { esc = false; continue }
+			if ch == '\\' { esc = true; continue }
+			if ch == '"' { in_str = false }
+			continue
+		}
+		switch ch {
+		case '"': in_str = true
+		case '[', '{': depth += 1
+		case ']', '}':
+			depth -= 1
+			if depth == 0 { return i + 1, true }
+		}
+	}
+	return 0, false
+}
+
+// Extract the raw (balanced) value text for "key" in a flat JSON object.
+// Works for object/array/scalar values. Returns "" when absent.
+json_raw_value :: proc(obj: string, key: string) -> (string, bool) {
+	needle := fmt.tprintf("\"%s\"", key)
+	defer delete(needle)
+	i := 0
+	for {
+		k := index_from(obj, needle, i)
+		if k < 0 { return "", false }
+		// Ensure this is a key position (followed by ':').
+		j := k + len(needle)
+		for j < len(obj) && (obj[j] == ' ' || obj[j] == '\t' || obj[j] == '\n') { j += 1 }
+		if j < len(obj) && obj[j] == ':' {
+			j += 1
+			for j < len(obj) && (obj[j] == ' ' || obj[j] == '\t' || obj[j] == '\n') { j += 1 }
+			if j >= len(obj) { return "", false }
+			if obj[j] == '"' {
+				// String value: find closing quote honoring escapes.
+				p := j + 1
+				for p < len(obj) {
+					if obj[p] == '\\' { p += 2; continue }
+					if obj[p] == '"' { return obj[j:p+1], true }
+					p += 1
+				}
+				return "", false
+			}
+			if obj[j] == '{' || obj[j] == '[' {
+				end, ok := json_balanced_end(obj, j)
+				if !ok { return "", false }
+				return obj[j:end], true
+			}
+			// Scalar: read until , } ] or whitespace.
+			p := j
+			for p < len(obj) && obj[p] != ',' && obj[p] != '}' && obj[p] != ']' &&
+				obj[p] != ' ' && obj[p] != '\n' && obj[p] != '\t' { p += 1 }
+			return obj[j:p], true
+		}
+		i = k + len(needle)
+	}
+}
+
+// Unescape a JSON string literal (with surrounding quotes) into b.
+json_unescape_into :: proc(b: ^strings.Builder, lit: string) {
+	if len(lit) < 2 { return }
+	j := 1
+	for j < len(lit) - 1 {
+		ch := lit[j]
+		if ch == '\\' && j + 1 < len(lit) - 1 {
+			j += 1
+			switch lit[j] {
+			case 'n':  strings.write_byte(b, byte('\n'))
+			case 't':  strings.write_byte(b, byte('\t'))
+			case 'r':  strings.write_byte(b, byte('\r'))
+			case '"':  strings.write_byte(b, byte('"'))
+			case '\\': strings.write_byte(b, byte('\\'))
+			case '/':  strings.write_byte(b, byte('/'))
+			case 'u':  j += write_json_unicode_escape(b, lit, j)
+			case:      strings.write_byte(b, lit[j])
+			}
+		} else {
+			strings.write_byte(b, ch)
+		}
+		j += 1
+	}
+}
+
+// Re-render one request-side tool_call element ({"id":..,"function":{...}})
+// for history. Empirically (probe: 4 template variants x greedy decode) this
+// model only recognizes a COMPLETED tool call when history shows the JSON
+// form — the native <function=...> form (what the model actually generates
+// under the tool-call grammar) pattern-matches as "about to call" and the
+// model re-calls the same tool forever. JSON form + a plain user-role result
+// breaks the loop. The function object is emitted verbatim (byte-stable).
+render_json_tool_calls :: proc(b: ^strings.Builder, raw_array: string) {
+	i := strings.index(raw_array, "[")
+	if i < 0 { return }
+	i += 1
+	for i < len(raw_array) {
+		for i < len(raw_array) && raw_array[i] != '{' && raw_array[i] != ']' { i += 1 }
+		if i >= len(raw_array) || raw_array[i] == ']' { break }
+		elem_end, ok := json_balanced_end(raw_array, i)
+		if !ok { break }
+		elem := raw_array[i:elem_end]
+		i = elem_end
+
+		fn_raw, fok := json_raw_value(elem, "function")
+		if !fok { continue }
+		strings.write_string(b, "<tool_call>\n")
+		strings.write_string(b, fn_raw)
+		strings.write_string(b, "\n</tool_call>")
+	}
 }
 
 
