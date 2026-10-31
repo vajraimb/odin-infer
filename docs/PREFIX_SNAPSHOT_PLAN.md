@@ -48,7 +48,10 @@ fallback 路径 = 现状，无回归风险。
 - 附带战果：正确性门第一跑抓到泛化 bug（BK≠32 时 qs 索引应用组内列 `e_base&31` 而非 `col_base`；
   BK=32 时两者恰相等，v3 从未暴露）。
 - ✅ C=16 悬案已先于本步结案（`delta_harness/engine_chunked_gpu.odin`，cp 比率下溢，见 ROOFLINE.md）。
-- 后续：把 bm=64 bk=64 采纳进 engine MMQ（预期端到端 prefill ~10%）。
+- ✅ 已采纳进 engine（2026-10-31）：`metal.odin` 新增 `gemm_q4k_f32_b64`，M%64==0 走 bm=64 bk=64
+  （in_a/in_b 的 M=n_vh=32 回退 v3）；**Q6K 不走 b64**（w2 实测 0.66× 回归，v3 保持）。
+  验证：`test_prefix_bitidentical.py` PASS + `serve_harness/ab_b64_check.py`（新旧二进制 A/B，
+  贪心回复逐字节相同，QTIMING 位置对齐 4 chunk median 39.2→32.4 ms/tok，**prefill ~1.2×**）。
 
 **期望复盘**：预估 0–10%，实测 Q4K +13–18%，超预期；Q6K 验证了"已在上限"。
 

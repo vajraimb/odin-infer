@@ -30,7 +30,7 @@ GPU f32 ~2.15 TFLOPS / fp16 ~4.3 TFLOPS。
 | Stage 1b 批量投影 + tuned MMQ | prefill 122→23 ms/tok(**4.9×**) | ✅ 已交付 |
 | Stage 2 chunked delta(线性层递推) | ~2 ms/tok | ❌ 数据否决(低 ROI),kernel 验证过但未接 |
 | MMQ dequant/staging 往 1.5 TFLOPS 推 | prefill 15→~9-12 ms/tok(~1.5×) | 硬工程,唯一真杠杆,收益封顶 ~2× |
-| tile sweep(真实 shape) | ~10-20%(900→1100) | ✅ 已交付(`gemm_harness/gemm_autotune.odin`):Q4K bm=64 bk=64 → w1 874→**1028**(+18%)、hidden_x_T 933→**1052**(+13%);Q6K 持平 ~400(bk=32 必需);fm on/off 无差。engine 采纳待做 |
+| tile sweep(真实 shape) | ~10-20%(900→1100) | ✅ 已交付并采纳进 engine:`gemm_harness/gemm_autotune.odin` + `metal.odin` 的 `gemm_q4k_f32_b64`(M%64 走 bm=64 bk=64,其余回退 v3)。Q4K isolated w1 874→1028(+18%);**engine 实测 prefill ~1.2×**(QTIMING 位置对齐 median 39.2→32.4 ms/tok)。Q6K b64 是 0.66× 回归已排除(w2 保持 v3 ~400 GFLOPS 上限);fm on/off 无差 |
 | fp16 累加路径 | 死路 | ❌ half 操作数已用;全 half 累加 K=4096 精度崩;dequant 是瓶颈非 MAC |
 | 全注意力批量(Stage 1c) | ~1-4 ms/tok | 低 ROI(全注意力只 8 层) |
 | Flash attention | ~5% 以下 | 跳过(Rigel:分解式优于融合) |

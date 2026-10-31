@@ -608,6 +608,59 @@ kernel void gemm_q6k_f32(
     simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
+// bm=64 bk=64 variants (autotune winner, gemm_harness/gemm_autotune.odin):
+// 8 simdgroups (256 threads), sa[64x64], sb[64x8], k-step 64. Requires M%64==0.
+// NB: qs index uses the within-32-group column l32 = e_base&31 (== col_base only
+// when k%32==0; v3's BK=32 made them coincide, BK=64 must not assume it).
+kernel void gemm_q4k_f32_b64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 64, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[64 * 64];
+    threadgroup half sb[64 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 64; row += 32) {       // TPR=8, RSTEP=256/8=32
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
+            int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
+            float d = (float)(*(device const half *)(blk));
+            float dmin = (float)(*(device const half *)(blk + 2));
+            device const uchar * scales = blk + 4;
+            device const uchar * qs = blk + 16;
+            uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+            float dl = d * (float)sc, ml = dmin * (float)m;
+            int qoff = sup * 32, shift = 4 * hf;
+            int l32 = ew & 31;
+            for (uint j = 0; j < 8; j++) {
+                uchar nib = (qs[qoff + l32 + int(j)] >> shift) & 0xF;
+                sa[row * 64 + col_base + j] = (half)(dl * (float)nib - ml);
+            }
+        }
+        for (uint t = tiitg; t < 64 * 8; t += 256) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
 // elementwise f32 -> f16 cast (activations must be half for simdgroup_load B)
 kernel void cast_f32_f16(device const float * src [[buffer(0)]], device half * dst [[buffer(1)]],
     constant uint &n [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
@@ -666,6 +719,10 @@ m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_g
 m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_q4k, m_pso_q6k, m_pso_cast, m_pso_copy, m_pso_tr_h16, m_pso_tr_f32: ^MTL.ComputePipelineState // Stage 1a
+@(private = "file")
+m_pso_q4k_b64: ^MTL.ComputePipelineState // Stage 1a autotuned bm=64 bk=64 (M%64==0; Q4K only, Q6K regresses)
+@(private = "file")
+g_b64_seen: bool // one-shot dispatch confirmation (debug)
 @(private = "file")
 m_pso_conv_batch, m_pso_conv_update: ^MTL.ComputePipelineState // Stage 2 batched conv1d
 @(private = "file")
@@ -1028,6 +1085,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_conv = make_pso(lib, "conv1d_step_silu"); m_pso_l2norm = make_pso(lib, "l2norm_scale")
 	m_pso_delta = make_pso(lib, "delta_recurrent"); m_pso_rmsgated = make_pso(lib, "rmsnorm_gated")
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
+	m_pso_q4k_b64 = make_pso(lib, "gemm_q4k_f32_b64")
 	m_pso_cast = make_pso(lib, "cast_f32_f16"); m_pso_copy = make_pso(lib, "copy_f32")
 	m_pso_tr_h16 = make_pso(lib, "transpose_to_f16"); m_pso_tr_f32 = make_pso(lib, "transpose_f32")
 	m_pso_conv_batch = make_pso(lib, "conv1d_batch_silu"); m_pso_conv_update = make_pso(lib, "conv1d_update_state")
@@ -1199,17 +1257,29 @@ enc_copy :: proc(enc: ^MTL.ComputeCommandEncoder, src: ^MTL.Buffer, src_off: NS.
 }
 
 // Q4_K MMQ: C[M,N] = A[M,K] @ B[K,N]. A = Q4_K weights (mmap), B = half activations.
-// Tuned kernel: 4 simdgroups (128 threads) compute a 32x8 output tile -> grid y = M/32.
+// Autotuned (gemm_autotune): M%64==0 -> bm=64 bk=64 kernel (+13-18%); else v3 bm=32.
 @(private = "file")
 enc_q4k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
-	enc->setComputePipelineState(m_pso_q4k)
 	enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
 	dims := GemmDims{u32(M), u32(N), u32(K)}
-	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
-	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 32), 1}, MTL.Size{128, 1, 1})
+	if M % 64 == 0 {
+		enc->setComputePipelineState(m_pso_q4k_b64)
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 64), 1}, MTL.Size{256, 1, 1})
+		if !g_b64_seen {
+			g_b64_seen = true
+			fmt.eprintfln("[b64] gemm_q4k_f32_b64 dispatched: M={} N={} K={}", M, N, K)
+		}
+	} else {
+		enc->setComputePipelineState(m_pso_q4k)
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 32), 1}, MTL.Size{128, 1, 1})
+	}
 }
 
-// Q6_K MMQ variant (Q4_K_M stores ffn_down/output/qkv as Q6_K). Tuned (4 sg/tg, M/32).
+// Q6_K MMQ variant (Q4_K_M stores ffn_down/output/qkv as Q6_K). Stays on v3:
+// autotune shows bm=64 bk=64 is a ~0.66x REGRESSION for Q6K (w2 4096x512x12288),
+// v3 bm=32 bk=32 is already at the platform ceiling (~400 GFLOPS).
 @(private = "file")
 enc_q6k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
 	enc->setComputePipelineState(m_pso_q6k)
