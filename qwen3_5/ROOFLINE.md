@@ -50,6 +50,25 @@ GPU f32 ~2.15 TFLOPS / fp16 ~4.3 TFLOPS。
 是否继续推 MMQ 到 ~1.5 TFLOPS(再 ~2×、硬工程)是一个**有数据支撑的收工/继续决策**,
 非直觉押注。
 
+## Continuation 续写缓存收益实测(2026-10-31,A/B 双二进制)
+
+修复前(c2591c0,已含 b64 MMQ)vs 修复后(HEAD,continuation 路径),同一 5 轮中文对话,
+贪心、num_predict=32、冷启动,server 端 prefill= 计时:
+
+| 轮次 | 修复前 prefill | 修复后 prefill | 路径变化 |
+|---|---|---|---|
+| 1 | 5209 ms(含一次性快照保存) | 2314 ms | full prefill(同一路径,差值为噪声) |
+| 2 | 2066 ms | 1122 ms | snapshot HIT → continuation hit |
+| 3 | 3405 ms | 1587 ms | 同上 |
+| 4 | 3808 ms | 1340 ms | 同上 |
+| 5 | 5568 ms | 802 ms(**6.9×**) | 同上 |
+
+- 修复前:每轮 prefill 随会话长度**线性增长**(整段历史从系统边界重算,O(n²) 累计);
+  修复后:每轮只 prefill 新回合 ~15–25 token,**基本恒定**(O(n) 累计)。
+- 轮 2–5 合计:14.8s → 4.9s(**3.0×**);会话越长收益越大,轮 10 外推 ~10s → ~1s。
+- 计数器佐证:修复前 4 次 snapshot hit,修复后 4 次 continuation hit。
+- 保真度:continuation 命中与冷全量 prefill 逐字节相同(test_prefix_bitidentical.py 多轮阶段)。
+
 ## v1.0 Release Status(收工基线)
 - **主线交付**:prefill 122→23 ms/tok(**4.9×**),贪心解码 **bit-identical**
   (`2+2=4`、`Paris`、1062-token 摘要逐字一致),三仓库(origin/main)同步。
