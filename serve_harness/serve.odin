@@ -361,6 +361,12 @@ Engine_State :: struct {
 	prefix_rec:  []u8,
 	prefix_tokens: [dynamic]int,  // token IDs that were prefilled before snapshot
 	prefix_pos:  int,             // position at snapshot time
+	// Hit-rate counters (Ollama handler outcomes). Exposed via /api/state so
+	// prefix-cache effectiveness can be quantified from real traffic instead
+	// of assumed. See docs/PREFIX_SNAPSHOT_PLAN.md Step 0a.
+	pc_snapshot_hits:    int, // restored full-state snapshot at system boundary
+	pc_continuation_hits: int, // extended last_tokens in place (multi-turn)
+	pc_misses:           int, // full re-prefill from pos 0
 }
 
 g_state: Engine_State
@@ -558,7 +564,10 @@ json_state :: proc() -> string {
 	strings.write_string(&out, fmt.tprintf( "\"pos\":%d,", g_state.pos))
 	strings.write_string(&out, fmt.tprintf( "\"last_tps\":%.2f,", g_state.last_tps))
 	strings.write_string(&out, fmt.tprintf( "\"last_ttft_ms\":%d,", g_state.last_ttft))
-	strings.write_string(&out, fmt.tprintf( "\"last_generated\":%d", g_state.last_gen))
+	strings.write_string(&out, fmt.tprintf( "\"last_generated\":%d,", g_state.last_gen))
+	strings.write_string(&out, fmt.tprintf( "\"pc_snapshot_hits\":%d,", g_state.pc_snapshot_hits))
+	strings.write_string(&out, fmt.tprintf( "\"pc_continuation_hits\":%d,", g_state.pc_continuation_hits))
+	strings.write_string(&out, fmt.tprintf( "\"pc_misses\":%d", g_state.pc_misses))
 	strings.write_byte(&out, byte('}'))
 	return strings.to_string(out)
 }
@@ -1589,6 +1598,10 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 
 	max_tokens := parse_int_field(body, "num_predict", 256)
 	if max_tokens == 0 { max_tokens = 256 }
+	// Honor Ollama options.temperature (previously parsed only on the OpenAI
+	// path and ignored there). temperature=0 selects greedy argmax in the
+	// sampler — required by the prefix-cache bit-identical regression test.
+	g_state.samp.temperature = parse_f32_field(body, "temperature", 0.6)
 	has_tools := strings.contains(body, `"tools"`) && strings.contains(body, `"function"`)
 
 	// Syntax-constrained tool-call generation (P0): when the request carries
@@ -1690,6 +1703,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 				_ = q35.engine_forward_batch(&g_state.engine, suffix_tokens, g_state.prefix_pos)
 			}
 			g_state.pos = len(encoded) - 1
+			g_state.pc_snapshot_hits += 1
 			fmt.eprintfln("ollama: PREFIX CACHE HIT (restored %d tokens, prefilling %d new)",
 				g_state.prefix_pos, len(suffix_tokens))
 		}
@@ -1707,6 +1721,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 				_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
 			}
 			g_state.pos = len(encoded) - 1
+			g_state.pc_continuation_hits += 1
 			fmt.eprintfln("ollama: prefix-cache hit (%d/%d tokens), prefilling only %d new",
 				common, len(encoded), len(new_tokens))
 		} else {
@@ -1751,6 +1766,7 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 				_ = q35.engine_forward_batch(&g_state.engine, encoded[prefill_from:len(encoded) - 1], prefill_from)
 			}
 			g_state.pos = len(encoded) - 1
+			g_state.pc_misses += 1
 			fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
 		}
 	}
