@@ -2,6 +2,7 @@
 
 > 来源：NNUE → odin-infer 迁移讨论（稀疏状态检查点 / Finny Tables 思想在 GDN 递归状态上的对应）。
 > 原则：不加速重算，**消除重算**。这是唯一不在 roofline 封顶表上的杠杆（prefill 15 ms/tok 是 dequant-ALU 物理墙，snapshot 不碰 kernel）。
+> **状态：Step 0–3 已闭环（2026-10-31），结案总结见 `WRAPUP_PREFIX_SNAPSHOT.md`。**
 
 ## 背景数字
 
