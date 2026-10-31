@@ -1643,6 +1643,21 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 				m.content, extract_tools_section(body)))
 			continue
 		}
+		if role == "assistant" {
+			// Render past assistant turns with the same empty think stub the
+			// generation prompt uses (line below: "<|im_start|>assistant\n
+			// <think>\n\n</think>\n"). Without it, last_tokens (prompt incl.
+			// stub + generated ids) and any follow-up request diverge right
+			// after "assistant\n", so the continuation path could NEVER hit
+			// in chat — every multi-turn request fell back to the system
+			// snapshot and re-prefilled the whole conversation. Keeping the
+			// stub in history makes the token stream structurally identical
+			// between full prefill and continuation, preserving the
+			// bit-identical invariant.
+			strings.write_string(&prompt_buf, fmt.tprintf(
+				"<|im_start|>assistant\n<think>\n\n</think>\n%s<|im_end|>\n", m.content))
+			continue
+		}
 		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
 	}
 	strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
@@ -1680,51 +1695,56 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 	t_prefill_start := time_to_ms()
 	t_reset_ms: i64 = 0
 
-	// System prompt prefix cache: if we have a snapshot AND the new prompt starts
-	// with the same system prefix tokens, restore snapshot and only prefill the suffix.
-	prefix_restored := false
+	// Does the incoming prompt start with the cached system-prefix tokens?
+	// (Direct compare with cached prefix tokens, not common — common compares
+	// against last request's FULL token set which may have diverged.)
+	prefix_matches := false
 	if len(g_state.prefix_tokens) > 0 && len(encoded) > len(g_state.prefix_tokens) {
-		// Direct compare with cached prefix tokens (not common — that compares
-		// with last request's FULL token set which may have diverged).
-		match := true
+		prefix_matches = true
 		for i in 0 ..< len(g_state.prefix_tokens) {
-			if encoded[i] != g_state.prefix_tokens[i] { match = false; break }
-		}
-		if match {
-			// Restore full state from snapshot — instantly positions us at prefix_pos
-			q35.engine_restore_full_state(&g_state.engine,
-				g_state.prefix_kv_k, g_state.prefix_kv_v,
-				g_state.prefix_conv, g_state.prefix_rec)
-			g_state.pos = g_state.prefix_pos
-			prefix_restored = true
-			// Now prefill only the tokens AFTER the cached prefix
-			suffix_tokens := encoded[g_state.prefix_pos:len(encoded) - 1]  // leave last for per-token fwd
-			if len(suffix_tokens) > 0 {
-				_ = q35.engine_forward_batch(&g_state.engine, suffix_tokens, g_state.prefix_pos)
-			}
-			g_state.pos = len(encoded) - 1
-			g_state.pc_snapshot_hits += 1
-			fmt.eprintfln("ollama: PREFIX CACHE HIT (restored %d tokens, prefilling %d new)",
-				g_state.prefix_pos, len(suffix_tokens))
+			if encoded[i] != g_state.prefix_tokens[i] { prefix_matches = false; break }
 		}
 	}
 
-	if !prefix_restored {
-		// Continuation — sound only when the engine state sits exactly at the
-		// divergence point (g_state.pos == number of tokens forwarded so far).
-		// Otherwise the non-rewindable recurrent state would absorb the tail
-		// tokens a second time.
-		if common == len(g_state.last_tokens) && common > 0 && common < len(encoded) &&
-		   g_state.pos == common {
-			new_tokens := encoded[common:len(encoded) - 1]
-			if len(new_tokens) > 0 {
-				_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
-			}
-			g_state.pos = len(encoded) - 1
-			g_state.pc_continuation_hits += 1
-			fmt.eprintfln("ollama: prefix-cache hit (%d/%d tokens), prefilling only %d new",
-				common, len(encoded), len(new_tokens))
-		} else {
+	// Continuation — sound only when the engine state sits exactly at the
+	// divergence point. g_state.pos is the INDEX of the last forwarded token,
+	// i.e. (tokens forwarded so far) - 1, so the invariant is pos == common-1
+	// (an earlier pos == common check was off by one and could never fire).
+	// Otherwise the non-rewindable recurrent state would absorb the tail
+	// tokens a second time.
+	can_continue := common == len(g_state.last_tokens) && common > 0 &&
+		common < len(encoded) && g_state.pos == common - 1
+
+	// Prefer continuation over the system-boundary snapshot whenever it reuses
+	// at least as many tokens — extending the live state skips re-prefilling
+	// the entire conversation history, not just the system prompt. (The
+	// snapshot check used to run first, so continuation was unreachable
+	// whenever a snapshot existed.)
+	if can_continue && (!prefix_matches || common >= g_state.prefix_pos) {
+		new_tokens := encoded[common:len(encoded) - 1]
+		if len(new_tokens) > 0 {
+			_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
+		}
+		g_state.pos = len(encoded) - 1
+		g_state.pc_continuation_hits += 1
+		fmt.eprintfln("ollama: continuation hit (%d/%d tokens reused), prefilling only %d new",
+			common, len(encoded), len(new_tokens))
+	} else if prefix_matches {
+		// Restore full state from snapshot — instantly positions us at prefix_pos
+		q35.engine_restore_full_state(&g_state.engine,
+			g_state.prefix_kv_k, g_state.prefix_kv_v,
+			g_state.prefix_conv, g_state.prefix_rec)
+		g_state.pos = g_state.prefix_pos
+		// Now prefill only the tokens AFTER the cached prefix
+		suffix_tokens := encoded[g_state.prefix_pos:len(encoded) - 1]  // leave last for per-token fwd
+		if len(suffix_tokens) > 0 {
+			_ = q35.engine_forward_batch(&g_state.engine, suffix_tokens, g_state.prefix_pos)
+		}
+		g_state.pos = len(encoded) - 1
+		g_state.pc_snapshot_hits += 1
+		fmt.eprintfln("ollama: PREFIX CACHE HIT (restored %d tokens, prefilling %d new)",
+			g_state.prefix_pos, len(suffix_tokens))
+	} else {
 			// Reset and full prefill. When the system boundary is known, prefill
 			// up to it FIRST and snapshot the state at exactly that position,
 			// then prefill the rest.
@@ -1769,7 +1789,6 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 			g_state.pc_misses += 1
 			fmt.eprintfln("ollama: full prefill (%d tokens, common=%d)", len(encoded), common)
 		}
-	}
 	t_prefill_ms := time_to_ms() - t_prefill_start
 
 	// Cache this turn's tokens for next time

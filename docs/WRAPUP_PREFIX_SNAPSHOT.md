@@ -80,3 +80,11 @@ M3 Air 上 wall-clock 噪声 ±20%，只用 `[timing] forward_gpu_batch` 行下�
 在"加速重算"路线上拿走了计划外但真实的 ~1.2× prefill。路线图 Step 0–3 闭环，Step 4 有数据
 支撑地搁置。引擎当前状态：prefill ~32 ms/tok（固定前缀场景 TTFT ~1–2s），decode 带宽墙，
 全部有回归测试守护。
+
+## 结案后追加：Continuation 路径修复（2026-10-31 晚）
+
+结案后实测 hit-rate 计数器发现 `pc_continuation_hits` 恒为 0——多轮续写是死代码。
+三因叠加：历史渲染缺空 think 桩（token 流结构性分叉）+ continuation 条件 `pos == common`
+差一永假 + 快照检查顺序截胡。全部修复后：多轮请求整段会话复用（demo 中 64/81 tokens，
+只 prefill 16 个新 token），且与冷全量 prefill **逐字节相同**（`test_prefix_bitidentical.py`
+新增多轮阶段固化）。这正是 Step 0a 埋点的设计目的：没有计数器，这条死路径会永远躺着。

@@ -83,6 +83,18 @@ Step 0–2 约一周拿走几乎全部收益；Step 3–4 是长尾。Step 0 不
 - `serve_harness/test_prefix_cache.py`：快照错位 bug（suffix 在已推进的 recurrent state 上重放 → 24/32 层污染）的回归测试。
 - `serve_harness/test_kv_persist.py`：重启恢复回归，已升级为 bit-identical 判据（冷/暖两轮贪心输出逐字节比对，2026-10-31）。
 
+**Continuation 修复（2026-10-31，hit-rate 实测驱动）**：hit-rate 计数器上线后实测发现
+`pc_continuation_hits` 恒为 0——多轮续写路径在 chat 场景是死代码。三个叠加原因，全部修复：
+1. 模板不对称：生成 prompt 以 `<|im_start|>assistant\n<think>\n\n</think>\n` 结尾，但历史渲染
+   assistant 回合时**不带空 think 桩** → token 流在 `assistant\n` 后必然分叉。修复：历史渲染补同款
+   空 think 桩（全量重算与续算看到同一 token 流，保住 bit-identical）。
+2. pos 语义差一：`g_state.pos` 是"最后转发 token 的下标"（= 已转发数 − 1），continuation 条件
+   写成 `pos == common` 永假。改为 `pos == common - 1`。
+3. 快照检查顺序截胡：快照匹配跑在 continuation 前面，多轮请求总是先命中系统边界快照（25 tokens）
+   而非整段会话（64+ tokens）。修复：continuation 优先，仅当复用量 < 快照时才用快照。
+验证：`test_prefix_bitidentical.py` 新增多轮阶段——continuation hit（64/81 复用，只 prefill 16 新
+token）且与冷启动全量 prefill **逐字节相同**。
+
 **剩余空白（本次开工范围）**：
 
 - Step 0a：prefix cache 命中/未命中/续写命中**计数器**，暴露在 `/api/state`，供 hit rate 量化。 ← 本次做

@@ -23,7 +23,11 @@ What it does
   3. sends the same request twice with temperature=0,
   4. asserts the server log shows MISS then PREFIX CACHE HIT,
   5. asserts the two replies are byte-identical,
-  6. asserts /api/state hit-rate counters moved (pc_misses=1, pc_snapshot_hits=1).
+  6. asserts /api/state hit-rate counters moved (pc_misses=1, pc_snapshot_hits=1),
+  7. multi-turn phase: appends the reply + a new user message, asserts a
+     CONTINUATION hit (whole history reused, only the new turn prefilled),
+  8. restarts cold and re-sends the multi-turn request (full prefill),
+     asserting the continuation-path reply is byte-identical to it.
 
 Usage
 -----
@@ -195,7 +199,52 @@ def main():
         if st.get("pc_snapshot_hits", 0) < 1:
             fail("/api/state: pc_snapshot_hits did not increment on the repeat request")
 
-        print("PASS: snapshot restore bit-identical + hit-rate counters live")
+        print("PASS phase 1: snapshot restore bit-identical + hit-rate counters live")
+
+        # ---- phase 2: multi-turn continuation must reuse the whole history ----
+        messages3 = messages + [
+            {"role": "assistant", "content": reply2},
+            {"role": "user", "content": "那它和前馈网络的区别呢"},
+        ]
+        print("request 3 (expect continuation hit: history reused, new turn only)...")
+        reply3 = chat(messages3)
+        if not reply3.strip():
+            fail("request 3: empty reply")
+        log3 = server_log()
+        if "continuation hit" not in log3:
+            fail("request 3: expected 'continuation hit' in server log "
+                 "(whole-history reuse); got snapshot hit or full prefill instead")
+        st = api_state()
+        print(f"/api/state counters: { {k: st.get(k) for k in ('pc_snapshot_hits', 'pc_continuation_hits', 'pc_misses')} }")
+        if st.get("pc_continuation_hits", 0) < 1:
+            fail("/api/state: pc_continuation_hits did not increment on the follow-up turn")
+    finally:
+        proc.kill()
+
+    # ---- phase 3: cold full prefill of the same multi-turn request ----
+    # The continuation-path reply must be byte-identical to a from-scratch
+    # prefill of the same messages (the live-state reuse changes nothing).
+    proc = start_server()
+    try:
+        print("request 4 (cold restart, full prefill of the multi-turn request)...")
+        reply3_cold = chat(messages3)
+        if not reply3_cold.strip():
+            fail("request 4: empty reply")
+        log4 = server_log()
+        if "full prefill" not in log4[log4.rfind("listening"):]:
+            fail("request 4: expected 'full prefill' after cold restart")
+        print(f"reply 3 (continuation): {reply3[:80]}{'...' if len(reply3) > 80 else ''}")
+        print(f"reply 3 (cold prefill): {reply3_cold[:80]}{'...' if len(reply3_cold) > 80 else ''}")
+        if reply3 != reply3_cold:
+            n = min(len(reply3), len(reply3_cold))
+            div = next((i for i in range(n) if reply3[i] != reply3_cold[i]), n)
+            fail(
+                f"continuation reply differs from cold prefill (first divergence at char {div}):\n"
+                f"  cont[{div}:{div+40}]={reply3[div:div+40]!r}\n"
+                f"  cold[{div}:{div+40}]={reply3_cold[div:div+40]!r}\n"
+                f"continuation reuse is NOT bit-identical to full prefill"
+            )
+        print("PASS phase 2/3: continuation hit bit-identical to cold full prefill")
     finally:
         proc.kill()
 
