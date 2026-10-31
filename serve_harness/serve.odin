@@ -371,6 +371,24 @@ Engine_State :: struct {
 
 g_state: Engine_State
 
+// QDUMP_DIVERGE=1: on a full-prefill MISS, decode and print the token window
+// around the divergence point vs last_tokens / prefix_tokens. Diagnostic for
+// "why did both caches miss" — pinpoints volatile prompt segments.
+g_dump_diverge: bool
+
+// Concatenate the decoded text of a token-id window (diagnostics only).
+// Uses the current allocator — inside the request handler that is the
+// per-request arena, freed at request end.
+detok_window :: proc(ids: []int) -> string {
+	b := strings.builder_make(context.allocator)
+	for id in ids {
+		s := tok35.decode_token_id(&g_state.tok, id)
+		strings.write_string(&b, s)
+		delete(s, context.allocator)
+	}
+	return strings.to_string(b)
+}
+
 // Per-request arena (see handle_client): every allocation scoped to one HTTP
 // request — the 2MB read buffer, header parsing, JSON building, per-token
 // decode strings — bumps this pointer and is released in a single free_all
@@ -1745,6 +1763,31 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		fmt.eprintfln("ollama: PREFIX CACHE HIT (restored %d tokens, prefilling %d new)",
 			g_state.prefix_pos, len(suffix_tokens))
 	} else {
+			// Diagnostics: why did both caches miss? Dump the token window
+			// around the divergence vs last_tokens and vs prefix_tokens.
+			if g_dump_diverge {
+				if common > 0 && common < min(len(encoded), len(g_state.last_tokens)) {
+					lo := max(0, common - 6)
+					hi_new := min(len(encoded), common + 10)
+					hi_old := min(len(g_state.last_tokens), common + 10)
+					fmt.eprintfln("DIVERGE vs last_tokens @%d/%d:", common, len(g_state.last_tokens))
+					fmt.eprintfln("  new: %q", detok_window(encoded[lo:hi_new]))
+					fmt.eprintfln("  old: %q", detok_window(g_state.last_tokens[lo:hi_old]))
+				}
+				if len(g_state.prefix_tokens) > 0 {
+					d := 0
+					max_d := min(len(encoded), len(g_state.prefix_tokens))
+					for d < max_d && encoded[d] == g_state.prefix_tokens[d] { d += 1 }
+					if d < len(g_state.prefix_tokens) {
+						lo := max(0, d - 6)
+						hi_new := min(len(encoded), d + 10)
+						hi_old := min(len(g_state.prefix_tokens), d + 10)
+						fmt.eprintfln("DIVERGE vs prefix_tokens @%d/%d:", d, len(g_state.prefix_tokens))
+						fmt.eprintfln("  new: %q", detok_window(encoded[lo:hi_new]))
+						fmt.eprintfln("  old: %q", detok_window(g_state.prefix_tokens[lo:hi_old]))
+					}
+				}
+			}
 			// Reset and full prefill. When the system boundary is known, prefill
 			// up to it FIRST and snapshot the state at exactly that position,
 			// then prefill the rest.
@@ -2477,6 +2520,9 @@ main :: proc() {
 		_ = os.make_directory(g_kv_dir)
 	}
 	restore_persisted_state()
+
+	// QDUMP_DIVERGE=1: dump divergence windows on cache-miss full prefills.
+	g_dump_diverge = os.get_env("QDUMP_DIVERGE", context.temp_allocator) == "1"
 
 	fmt.printfln("serve: ready (vocab=%d, seq_len=%d, metal=%v)",
 		cfg.vocab_size, cfg.seq_len, g_state.engine.metal_ready)

@@ -69,6 +69,17 @@ GPU f32 ~2.15 TFLOPS / fp16 ~4.3 TFLOPS。
 - 计数器佐证:修复前 4 次 snapshot hit,修复后 4 次 continuation hit。
 - 保真度:continuation 命中与冷全量 prefill 逐字节相同(test_prefix_bitidentical.py 多轮阶段)。
 
+## 客户端契约:prompt 字节必须跨轮稳定(2026-10-31 晚,真实流量教训)
+
+continuation 修复后实测 pie 真实会话仍 100% miss。服务端 QDUMP_DIVERGE=1 打点定位:
+**pie 每轮把工具 schema 经 json.Value(map) 重序列化,Odin map 遍历序不稳定 → system 块
+~600 token 处起字节全变**,快照与 continuation 双双失效,每轮全量重算 1100–1800 token
+(76–218s,热节流加剧)。修复在 pie-odin 侧(Raw_Json 逐字节透传,commit 6e8cda1):
+修复后同 prompt 二次请求 PREFIX CACHE HIT(restored 1119/1137,prefill 81s→3.2s,**25×**)。
+
+**契约**:任何客户端只要改变 system 块/历史消息的**字节**(哪怕语义等价的 JSON 键序),
+前缀缓存即失效。稳定序列化是客户端责任;服务端 `QDUMP_DIVERGE=1` 可打点定位漂移段。
+
 ## v1.0 Release Status(收工基线)
 - **主线交付**:prefill 122→23 ms/tok(**4.9×**),贪心解码 **bit-identical**
   (`2+2=4`、`Paris`、1062-token 摘要逐字一致),三仓库(origin/main)同步。
