@@ -34,12 +34,23 @@ fallback 路径 = 现状，无回归风险。
 - 照 `kv_persist.odin` 模式写盘，server 重启预热即恢复。磁盘读 48 MB < 0.1 s。
 - 不做多版本管理：前缀变了整体失效重存。
 
-## Step 3 — Autotune 基建（2 天，可与 1/2 并行）
+## Step 3 — Autotune 基建（2 天，可与 1/2 并行）✅ 已交付（2026-10-31）
 
-- 参数化 chunk C ∈ {8,16,32}、MMQ tile、`QFASTMATH`；每候选先过正确性门（对 tokenwise-f32 基线），再 median-of-7 benchmark。
-- 顺手结案 C=16 悬案：`QFASTMATH=0` 跑 engine C=16，是 fast-math 就收工，否则指向 host-side dispatch/buffer layout。
+- ✅ `gemm_harness/gemm_autotune.odin`：Odin 端程序化生成 MSL（BM/BK/NT/TPR/RSTEP 编成常量），
+  每候选先过正确性门（随机量化块 + `ggml.dequant_row` + CPU f64 参考，gate 256×64×512，tol 5e-3），
+  再 warmup 3 + median-of-7 计时；结果追加缓存 `gemm_harness/autotune_cache.jsonl`，命中即跳过。
+- 扫描网格：BM ∈ {16,32,64} × BK ∈ {16,32,64} × fastmath ∈ {on,off} = 18 配置 × (Q4K+Q6K) = 36 配置，全过门。
+- **实测结果（M3 Air，median-of-7）**：
+  - Q4K w1 4096×64×4096：v3 基线 874 → **bm=64 bk=64 = 1028 GFLOPS（+18%）**
+  - Q4K hidden_x_T 12288×64×4096：933 → **1052 GFLOPS（+13%）**
+  - Q6K w2 4096×64×12288：~400 GFLOPS 持平，bk=32 必需，bm 不敏感 → v3 已在平台上限
+  - fast-math on/off 全部 <2% 噪声 → 无精度/性能权衡
+- 附带战果：正确性门第一跑抓到泛化 bug（BK≠32 时 qs 索引应用组内列 `e_base&31` 而非 `col_base`；
+  BK=32 时两者恰相等，v3 从未暴露）。
+- ✅ C=16 悬案已先于本步结案（`delta_harness/engine_chunked_gpu.odin`，cp 比率下溢，见 ROOFLINE.md）。
+- 后续：把 bm=64 bk=64 采纳进 engine MMQ（预期端到端 prefill ~10%）。
 
-**期望**：MMQ tile sweep 0–10%（已在 kernel 物理上限）；真正价值是基建 + C=16 结案。
+**期望复盘**：预估 0–10%，实测 Q4K +13–18%，超预期；Q6K 验证了"已在上限"。
 
 ## Step 4 — Stage 2 fused kernel（1–2 周，最后做）
 

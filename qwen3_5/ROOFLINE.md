@@ -30,7 +30,7 @@ GPU f32 ~2.15 TFLOPS / fp16 ~4.3 TFLOPS。
 | Stage 1b 批量投影 + tuned MMQ | prefill 122→23 ms/tok(**4.9×**) | ✅ 已交付 |
 | Stage 2 chunked delta(线性层递推) | ~2 ms/tok | ❌ 数据否决(低 ROI),kernel 验证过但未接 |
 | MMQ dequant/staging 往 1.5 TFLOPS 推 | prefill 15→~9-12 ms/tok(~1.5×) | 硬工程,唯一真杠杆,收益封顶 ~2× |
-| tile sweep(真实 shape) | ~10-20%(900→1100) | 低成本,"若继续"的第一步 |
+| tile sweep(真实 shape) | ~10-20%(900→1100) | ✅ 已交付(`gemm_harness/gemm_autotune.odin`):Q4K bm=64 bk=64 → w1 874→**1028**(+18%)、hidden_x_T 933→**1052**(+13%);Q6K 持平 ~400(bk=32 必需);fm on/off 无差。engine 采纳待做 |
 | fp16 累加路径 | 死路 | ❌ half 操作数已用;全 half 累加 K=4096 精度崩;dequant 是瓶颈非 MAC |
 | 全注意力批量(Stage 1c) | ~1-4 ms/tok | 低 ROI(全注意力只 8 层) |
 | Flash attention | ~5% 以下 | 跳过(Rigel:分解式优于融合) |
