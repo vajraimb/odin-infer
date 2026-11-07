@@ -13,11 +13,12 @@ import NS "core:sys/darwin/Foundation"
 import "core:fmt"
 import "core:math"
 import "core:mem"
+import "core:strings"
 import "core:os"
 import MTL "vendor:darwin/Metal"
 
 PAGE_SIZE :: 16384
-GEMV_ROWS :: 8
+GEMV_ROWS :: 32 // rows per TG; more rows/TG = fewer TG launches (output layer has 248k rows)
 GEMV_TG :: 256
 MAX_BATCH_T :: 512 // max tokens per batched-prefill chunk (Stage 1a)
 
@@ -26,8 +27,8 @@ MSL_SRC := `
 using namespace metal;
 
 struct Dims { uint n; uint d; };
-constant uint GEMV_ROWS = 8;
-constant uint GEMV_SG   = 32;
+constant uint GEMV_ROWS   = 32;  // must match the Odin-side GEMV_ROWS (dispatch shape)
+constant uint GEMV_SG     = 8;   // lanes per row; rows = GEMV_TG / GEMV_SG
 
 inline void get_scale_min_k4(int j, device const uchar *q, thread uchar &d, thread uchar &m) {
     if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
@@ -40,7 +41,12 @@ kernel void gemv_f32(device const uchar *wb [[buffer(0)]], device const float *x
     uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
     if (row < dim.d) { device const float *w = (device const float*)wb + (ulong)row * dim.n;
         for (uint j = lane; j < dim.n; j += GEMV_SG) sum += w[j] * x[j]; }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 kernel void gemv_f16(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
@@ -48,7 +54,12 @@ kernel void gemv_f16(device const uchar *wb [[buffer(0)]], device const float *x
     uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
     if (row < dim.d) { device const half *w = (device const half*)wb + (ulong)row * dim.n;
         for (uint j = lane; j < dim.n; j += GEMV_SG) sum += (float)w[j] * x[j]; }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 kernel void gemv_q8_0(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
@@ -61,7 +72,12 @@ kernel void gemv_q8_0(device const uchar *wb [[buffer(0)]], device const float *
             for (uint j = 0; j < 32; j += 4) { float4 xv = float4(x[base+j],x[base+j+1],x[base+j+2],x[base+j+3]);
                 float4 qv = float4((float)qs[j],(float)qs[j+1],(float)qs[j+2],(float)qs[j+3]); acc += qv * dd * xv; }
             sum += acc.x + acc.y + acc.z + acc.w; } }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 kernel void gemv_q4_0(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
@@ -72,7 +88,12 @@ kernel void gemv_q4_0(device const uchar *wb [[buffer(0)]], device const float *
             float dd = (float)(*(device const half*)blk); device const uchar *qs = blk + 2; uint base = b * 32;
             for (uint j = 0; j < 16; ++j) { float w0 = (float)((int)(qs[j] & 0xF) - 8); float w1 = (float)((int)(qs[j] >> 4) - 8);
                 sum += w0 * dd * x[base + j]; sum += w1 * dd * x[base + j + 16]; } } }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 kernel void gemv_q4_1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
@@ -84,7 +105,12 @@ kernel void gemv_q4_1(device const uchar *wb [[buffer(0)]], device const float *
             device const uchar *qs = blk + 4; uint base = b * 32;
             for (uint j = 0; j < 16; ++j) { sum += ((float)(qs[j] & 0xF) * dd + mm) * x[base + j];
                 sum += ((float)(qs[j] >> 4) * dd + mm) * x[base + j + 16]; } } }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 kernel void gemv_q5_0(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
@@ -97,7 +123,12 @@ kernel void gemv_q5_0(device const uchar *wb [[buffer(0)]], device const float *
             for (uint j = 0; j < 16; ++j) { uchar xh0 = (uchar)((qh >> j) << 4) & 0x10; uchar xh1 = (uchar)(qh >> (j + 12)) & 0x10;
                 float w0 = (float)((int)((qs[j] & 0xF) | xh0) - 16); float w1 = (float)((int)((qs[j] >> 4) | xh1) - 16);
                 sum += w0 * dd * x[base + j]; sum += w1 * dd * x[base + j + 16]; } } }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 kernel void gemv_q5_1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
@@ -110,26 +141,47 @@ kernel void gemv_q5_1(device const uchar *wb [[buffer(0)]], device const float *
             for (uint j = 0; j < 16; ++j) { uchar xh0 = (uchar)((qh >> j) << 4) & 0x10; uchar xh1 = (uchar)(qh >> (j + 12)) & 0x10;
                 float w0 = (float)((qs[j] & 0xF) | xh0); float w1 = (float)((qs[j] >> 4) | xh1);
                 sum += (w0 * dd + mm) * x[base + j]; sum += (w1 * dd + mm) * x[base + j + 16]; } } }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 kernel void gemv_q4_k(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
     uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    // v2: float4 dot() accumulation with two chains (lo/hi nibble groups) per row.
+    // Same products as v1; only the addition grouping changed -> 8x shorter
+    // dependency chains. Row mapping unchanged (1 simdgroup per row).
     uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
     if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 144;
+        float slo = 0.0, shi = 0.0;
         for (uint sb = lane; sb < nsb; sb += GEMV_SG) { device const uchar *blk = wr + sb * 144;
             float dall = (float)(*(device const half*)blk); float dmin = (float)(*(device const half*)(blk + 2));
             device const uchar *scales = blk + 4; device const uchar *qs = blk + 16; uint ybase = sb * 256; int is = 0; uint qoff = 0;
             for (uint j = 0; j < 256; j += 64) { uchar sc, m; get_scale_min_k4(is + 0, scales, sc, m); float d1 = dall * sc, m1 = dmin * m;
                 get_scale_min_k4(is + 1, scales, sc, m); float d2 = dall * sc, m2 = dmin * m;
-                for (uint l = 0; l < 32; ++l) { sum += (d1 * (float)(qs[qoff + l] & 0xF) - m1) * x[ybase + j + l];
-                    sum += (d2 * (float)(qs[qoff + l] >> 4) - m2) * x[ybase + j + 32 + l]; }
-                qoff += 32; is += 2; } } }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+                for (uint l = 0; l < 32; l += 4) {
+                    float4 wl = float4((float)(qs[qoff+l]&0xF),(float)(qs[qoff+l+1]&0xF),(float)(qs[qoff+l+2]&0xF),(float)(qs[qoff+l+3]&0xF));
+                    float4 wh = float4((float)(qs[qoff+l]>>4),(float)(qs[qoff+l+1]>>4),(float)(qs[qoff+l+2]>>4),(float)(qs[qoff+l+3]>>4));
+                    float4 xl = float4(x[ybase+j+l],x[ybase+j+l+1],x[ybase+j+l+2],x[ybase+j+l+3]);
+                    float4 xh = float4(x[ybase+j+32+l],x[ybase+j+32+l+1],x[ybase+j+32+l+2],x[ybase+j+32+l+3]);
+                    slo += dot(wl * d1 - m1, xl);
+                    shi += dot(wh * d2 - m2, xh);
+                }
+                qoff += 32; is += 2; } }
+        sum = slo + shi; }
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
-inline float dot_q6_superblock(device const uchar *blk, device const float *x, uint ybase) {
+inline float2 dot_q6_superblock2(device const uchar *blk, device const float *x, uint ybase) {
     device const uchar *ql = blk; device const uchar *qh = blk + 128; device const char *sc = (device const char*)(blk + 192);
-    float dall = (float)(*(device const half*)(blk + 208)); float sum = 0.0;
+    float dall = (float)(*(device const half*)(blk + 208)); float s0 = 0.0, s1 = 0.0;
     for (int hf = 0; hf < 2; ++hf) { uint qlo = hf * 64, qho = hf * 32, sco = hf * 8, yo = ybase + hf * 128;
         float ds0=dall*(float)sc[sco+0],ds1=dall*(float)sc[sco+1],ds2=dall*(float)sc[sco+2],ds3=dall*(float)sc[sco+3];
         float ds4=dall*(float)sc[sco+4],ds5=dall*(float)sc[sco+5],ds6=dall*(float)sc[sco+6],ds7=dall*(float)sc[sco+7];
@@ -140,7 +192,7 @@ inline float dot_q6_superblock(device const uchar *blk, device const float *x, u
             float4 w4=float4((float)((int)((ql[qlo+l+32]>>4)|(((qh[qho+l+0]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+33]>>4)|(((qh[qho+l+1]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+34]>>4)|(((qh[qho+l+2]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+35]>>4)|(((qh[qho+l+3]>>6)&3)<<4))-32));
             float4 xv1=float4(x[yo+l],x[yo+l+1],x[yo+l+2],x[yo+l+3]); float4 xv2=float4(x[yo+l+32],x[yo+l+33],x[yo+l+34],x[yo+l+35]);
             float4 xv3=float4(x[yo+l+64],x[yo+l+65],x[yo+l+66],x[yo+l+67]); float4 xv4=float4(x[yo+l+96],x[yo+l+97],x[yo+l+98],x[yo+l+99]);
-            sum += ds0*dot(w1,xv1)+ds2*dot(w2,xv2)+ds4*dot(w3,xv3)+ds6*dot(w4,xv4);
+            s0 += ds0*dot(w1,xv1)+ds2*dot(w2,xv2)+ds4*dot(w3,xv3)+ds6*dot(w4,xv4);
         }
         for (int l = 16; l < 32; l += 4) {
             float4 w1=float4((float)((int)((ql[qlo+l+0]&0xF)|(((qh[qho+l+0]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+1]&0xF)|(((qh[qho+l+1]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+2]&0xF)|(((qh[qho+l+2]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+3]&0xF)|(((qh[qho+l+3]>>0)&3)<<4))-32));
@@ -149,18 +201,225 @@ inline float dot_q6_superblock(device const uchar *blk, device const float *x, u
             float4 w4=float4((float)((int)((ql[qlo+l+32]>>4)|(((qh[qho+l+0]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+33]>>4)|(((qh[qho+l+1]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+34]>>4)|(((qh[qho+l+2]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+35]>>4)|(((qh[qho+l+3]>>6)&3)<<4))-32));
             float4 xv1=float4(x[yo+l],x[yo+l+1],x[yo+l+2],x[yo+l+3]); float4 xv2=float4(x[yo+l+32],x[yo+l+33],x[yo+l+34],x[yo+l+35]);
             float4 xv3=float4(x[yo+l+64],x[yo+l+65],x[yo+l+66],x[yo+l+67]); float4 xv4=float4(x[yo+l+96],x[yo+l+97],x[yo+l+98],x[yo+l+99]);
-            sum += ds1*dot(w1,xv1)+ds3*dot(w2,xv2)+ds5*dot(w3,xv3)+ds7*dot(w4,xv4);
+            s1 += ds1*dot(w1,xv1)+ds3*dot(w2,xv2)+ds5*dot(w3,xv3)+ds7*dot(w4,xv4);
         }
     }
-    return sum;
+    return float2(s0, s1);
 }
 kernel void gemv_q6_k(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
     device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
     uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
     uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
     if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 210;
-        for (uint sb = lane; sb < nsb; sb += GEMV_SG) sum += dot_q6_superblock(wr + sb * 210, x, sb * 256); }
-    sum = simd_sum(sum); if (lane == 0 && row < dim.d) out[row] = sum;
+        for (uint sb = lane; sb < nsb; sb += GEMV_SG) {
+            float2 acc = dot_q6_superblock2(wr + sb * 210, x, sb * 256);
+            sum += acc.x + acc.y; } }
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+// ============ GEMV v4: 2 rows per lane, 8-lane cooperation (QGEMV2R=1) ============
+// 64 rows per TG (256 threads / 8 lanes per row-pair * 2 rows). Same chunk
+// dequant math as the v2 kernels; each lane accumulates both rows of its pair.
+kernel void gemv_q4_k_2r(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint grp = tid / 8, lane = tid % 8;
+    uint row0 = tg * 64 + grp * 2;
+    if (row0 >= dim.d) return;
+    uint nsb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nsb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + nsb * 144 : wr0;
+    float s0l = 0.0, s0h = 0.0, s1l = 0.0, s1h = 0.0;
+    for (uint sb = lane; sb < nsb; sb += 8) {
+        uint ybase = sb * 256;
+        device const uchar *blk0 = wr0 + sb * 144;
+        device const uchar *blk1 = wr1 + sb * 144;
+        float dall0 = (float)(*(device const half*)blk0); float dmin0 = (float)(*(device const half*)(blk0 + 2));
+        float dall1 = (float)(*(device const half*)blk1); float dmin1 = (float)(*(device const half*)(blk1 + 2));
+        device const uchar *scales0 = blk0 + 4; device const uchar *qs0 = blk0 + 16;
+        device const uchar *scales1 = blk1 + 4; device const uchar *qs1 = blk1 + 16;
+        int is = 0; uint qoff = 0;
+        for (uint j = 0; j < 256; j += 64) {
+            uchar sc, m;
+            get_scale_min_k4(is + 0, scales0, sc, m); float d01 = dall0 * sc, m01 = dmin0 * m;
+            get_scale_min_k4(is + 1, scales0, sc, m); float d02 = dall0 * sc, m02 = dmin0 * m;
+            get_scale_min_k4(is + 0, scales1, sc, m); float d11 = dall1 * sc, m11 = dmin1 * m;
+            get_scale_min_k4(is + 1, scales1, sc, m); float d12 = dall1 * sc, m12 = dmin1 * m;
+            for (uint l = 0; l < 32; l += 4) {
+                float4 xl = float4(x[ybase+j+l],x[ybase+j+l+1],x[ybase+j+l+2],x[ybase+j+l+3]);
+                float4 xh = float4(x[ybase+j+32+l],x[ybase+j+32+l+1],x[ybase+j+32+l+2],x[ybase+j+32+l+3]);
+                float4 w0l = float4((float)(qs0[qoff+l]&0xF),(float)(qs0[qoff+l+1]&0xF),(float)(qs0[qoff+l+2]&0xF),(float)(qs0[qoff+l+3]&0xF));
+                float4 w0h = float4((float)(qs0[qoff+l]>>4),(float)(qs0[qoff+l+1]>>4),(float)(qs0[qoff+l+2]>>4),(float)(qs0[qoff+l+3]>>4));
+                float4 w1l = float4((float)(qs1[qoff+l]&0xF),(float)(qs1[qoff+l+1]&0xF),(float)(qs1[qoff+l+2]&0xF),(float)(qs1[qoff+l+3]&0xF));
+                float4 w1h = float4((float)(qs1[qoff+l]>>4),(float)(qs1[qoff+l+1]>>4),(float)(qs1[qoff+l+2]>>4),(float)(qs1[qoff+l+3]>>4));
+                s0l += dot(w0l * d01 - m01, xl); s0h += dot(w0h * d02 - m02, xh);
+                s1l += dot(w1l * d11 - m11, xl); s1h += dot(w1h * d12 - m12, xh);
+            }
+            qoff += 32; is += 2;
+        }
+    }
+    float t0 = s0l + s0h, t1 = s1l + s1h;
+    t0 += simd_shuffle_xor(t0, 4); t0 += simd_shuffle_xor(t0, 2); t0 += simd_shuffle_xor(t0, 1);
+    t1 += simd_shuffle_xor(t1, 4); t1 += simd_shuffle_xor(t1, 2); t1 += simd_shuffle_xor(t1, 1);
+    if (lane == 0) {
+        if (row0 < dim.d) out[row0] = t0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = t1;
+    }
+}
+
+kernel void gemv_q6_k_2r(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint grp = tid / 8, lane = tid % 8;
+    uint row0 = tg * 64 + grp * 2;
+    if (row0 >= dim.d) return;
+    uint nsb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nsb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + nsb * 210 : wr0;
+    float s0 = 0.0, s1 = 0.0;
+    for (uint sb = lane; sb < nsb; sb += 8) {
+        uint ybase = sb * 256;
+        float2 a0 = dot_q6_superblock2(wr0 + sb * 210, x, ybase);
+        float2 a1 = dot_q6_superblock2(wr1 + sb * 210, x, ybase);
+        s0 += a0.x + a0.y;
+        s1 += a1.x + a1.y;
+    }
+    s0 += simd_shuffle_xor(s0, 4); s0 += simd_shuffle_xor(s0, 2); s0 += simd_shuffle_xor(s0, 1);
+    s1 += simd_shuffle_xor(s1, 4); s1 += simd_shuffle_xor(s1, 2); s1 += simd_shuffle_xor(s1, 1);
+    if (lane == 0) {
+        if (row0 < dim.d) out[row0] = s0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = s1;
+    }
+}
+
+// ============ GEMV v3 (llama.cpp kernel_mul_mv_ext_q4x4 structure) ============
+// Row-split GEMV: each row is computed by NXPSG threads of a simdgroup, each
+// thread dequantizes 16-element chunks into float4x4 registers and dots them
+// against float4 activations; R1PTG rows per thread; reduced with shuffle_down.
+constant uint GEMV3_NXPSG = 8;    // threads cooperating on one row
+constant uint GEMV3_R1PTG = 2;    // rows per thread
+constant uint GEMV3_ROWS  = 64;   // rows per TG = 8 simdgroups * (32/8) * 2
+
+inline void deq_q4_k_chunk16(device const uchar *blk, uint il, thread float4 reg[4]) {
+    device const uchar *qs = blk + 16;
+    device const uchar *scales = blk + 4;
+    float dall = (float)(*(device const half*)blk);
+    float dmin = (float)(*(device const half*)(blk + 2));
+    uchar sc, m; get_scale_min_k4((int)(il >> 1), scales, sc, m);
+    float d = dall * sc, mn = dmin * m;
+    uint qo = (il >> 2) * 32 + (il & 1) * 16;
+    if ((il & 3) < 2) {
+        for (uint j = 0; j < 16; j += 4) {
+            reg[j/4] = float4((float)(qs[qo+j]&0xF)*d - mn, (float)(qs[qo+j+1]&0xF)*d - mn,
+                              (float)(qs[qo+j+2]&0xF)*d - mn, (float)(qs[qo+j+3]&0xF)*d - mn);
+        }
+    } else {
+        for (uint j = 0; j < 16; j += 4) {
+            reg[j/4] = float4((float)(qs[qo+j]>>4)*d - mn, (float)(qs[qo+j+1]>>4)*d - mn,
+                              (float)(qs[qo+j+2]>>4)*d - mn, (float)(qs[qo+j+3]>>4)*d - mn);
+        }
+    }
+}
+
+inline void deq_q6_k_chunk16(device const uchar *blk, uint il, thread float4 reg[4]) {
+    // 16-element chunk c of half hf (il = 8*hf + c). Element r = 16c+j of the half:
+    //   ql byte = (r < 64) ? r : r-64, nibble = low (r<64) / high (r>=64)
+    //   qh byte = 32*hf + 16*(c&1) + j, 2-bit field shift = (c & 6)
+    //   value = ((nibble | (qh_bits << 4)) - 32) * dall * scales[8*hf + c]
+    device const uchar *ql = blk;
+    device const uchar *qh = blk + 128;
+    device const char *scales = (device const char *)(blk + 192);
+    float dall = (float)(*(device const half*)(blk + 208));
+    uint hf = il >> 3, c = il & 7;
+    float dsc = dall * (float)scales[8*hf + c];
+    uint qhshift = (c & 6);
+    int qloff = 64 * (int)hf + 16 * (int)c - ((c >= 4) ? 64 : 0);
+    uint qhoff = 32 * hf + 16 * (c & 1);
+    bool hi = c >= 4;
+    for (uint j = 0; j < 16; j += 4) {
+        float4 hb = float4((float)((qh[qhoff+j] >> qhshift) & 3), (float)((qh[qhoff+j+1] >> qhshift) & 3),
+                           (float)((qh[qhoff+j+2] >> qhshift) & 3), (float)((qh[qhoff+j+3] >> qhshift) & 3));
+        float4 lb;
+        if (!hi) {
+            lb = float4((float)(ql[qloff+j]&0xF), (float)(ql[qloff+j+1]&0xF), (float)(ql[qloff+j+2]&0xF), (float)(ql[qloff+j+3]&0xF));
+        } else {
+            lb = float4((float)(ql[qloff+j]>>4), (float)(ql[qloff+j+1]>>4), (float)(ql[qloff+j+2]>>4), (float)(ql[qloff+j+3]>>4));
+        }
+        reg[j/4] = (lb + hb * 16.0f - 32.0f) * dsc;
+    }
+}
+
+kernel void gemv_q4_k_v3(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    uint tx = lane % GEMV3_NXPSG, ty = lane / GEMV3_NXPSG;
+    uint row0 = tg * GEMV3_ROWS + sg * ((32 / GEMV3_NXPSG) * GEMV3_R1PTG) + ty * GEMV3_R1PTG;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0, sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += GEMV3_NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += 32;   // NXPSG * 4 float4 per step
+    }
+    sum0 += simd_shuffle_down(sum0, 4);
+    sum0 += simd_shuffle_down(sum0, 2);
+    sum0 += simd_shuffle_down(sum0, 1);
+    sum1 += simd_shuffle_down(sum1, 4);
+    sum1 += simd_shuffle_down(sum1, 2);
+    sum1 += simd_shuffle_down(sum1, 1);
+    if (tx == 0) {
+        if (row0 < dim.d) out[row0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q6_k_v3(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    uint tx = lane % GEMV3_NXPSG, ty = lane / GEMV3_NXPSG;
+    uint row0 = tg * GEMV3_ROWS + sg * ((32 / GEMV3_NXPSG) * GEMV3_R1PTG) + ty * GEMV3_R1PTG;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0, sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += GEMV3_NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += 32;
+    }
+    sum0 += simd_shuffle_down(sum0, 4);
+    sum0 += simd_shuffle_down(sum0, 2);
+    sum0 += simd_shuffle_down(sum0, 1);
+    sum1 += simd_shuffle_down(sum1, 4);
+    sum1 += simd_shuffle_down(sum1, 2);
+    sum1 += simd_shuffle_down(sum1, 1);
+    if (tx == 0) {
+        if (row0 < dim.d) out[row0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
 }
 
 // ---------- elementwise / attention ----------
@@ -704,6 +963,8 @@ g_timing: bool       // print per-prefill GPU ms (env QTIMING=1)
 g_prof_nolin: bool   // ablation: skip linear-layer per-token stateful loop (env QPROF_NOLIN=1; output garbage, GPU time valid)
 @(private = "file")
 g_prof_nofull: bool  // ablation: skip full-attention per-token block (env QPROF_NOFULL=1)
+g_gemv3: bool       // use row-split v3 GEMV kernels (env QGEMV3=1)
+g_gemv2r: bool      // use 2-rows-per-lane GEMV kernels (env QGEMV2R=1)
 @(private = "file")
 m_weights: ^MTL.Buffer
 @(private = "file")
@@ -713,6 +974,8 @@ metal_enabled: bool
 
 @(private = "file")
 m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1, m_pso_q4_k, m_pso_q6_k: ^MTL.ComputePipelineState
+	m_pso_q4_k3, m_pso_q6_k3: ^MTL.ComputePipelineState // row-split v3 GEMV kernels (QGEMV3=1)
+	m_pso_q4_k2r, m_pso_q6_k2r: ^MTL.ComputePipelineState // 2 rows/lane GEMV kernels (QGEMV2R=1)
 @(private = "file")
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
 @(private = "file")
@@ -1058,6 +1321,8 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	g_timing = os.get_env("QTIMING", context.temp_allocator) == "1"
 	g_prof_nolin = os.get_env("QPROF_NOLIN", context.temp_allocator) == "1"
 	g_prof_nofull = os.get_env("QPROF_NOFULL", context.temp_allocator) == "1"
+	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
+	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	fmt.printfln("metal: shader fastMath={} (QFASTMATH=0 to disable)", g_fast_math)
 	fmt.printfln("metal: maxThreadgroupMemoryLength={} bytes", m_device->maxThreadgroupMemoryLength())
 
@@ -1078,6 +1343,8 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_q4_1 = make_pso(lib, "gemv_q4_1"); m_pso_q5_0 = make_pso(lib, "gemv_q5_0")
 	m_pso_q5_1 = make_pso(lib, "gemv_q5_1"); m_pso_q4_k = make_pso(lib, "gemv_q4_k")
 	m_pso_q6_k = make_pso(lib, "gemv_q6_k")
+	m_pso_q4_k3 = make_pso(lib, "gemv_q4_k_v3"); m_pso_q6_k3 = make_pso(lib, "gemv_q6_k_v3")
+	m_pso_q4_k2r = make_pso(lib, "gemv_q4_k_2r"); m_pso_q6_k2r = make_pso(lib, "gemv_q6_k_2r")
 	m_pso_rmsnorm = make_pso(lib, "rmsnorm"); m_pso_rope = make_pso(lib, "rope_partial")
 	m_pso_qnorm = make_pso(lib, "qnorm_extract"); m_pso_store_kv = make_pso(lib, "store_kv")
 	m_pso_attn = make_pso(lib, "attention"); m_pso_attn_gate = make_pso(lib, "attn_gate")
@@ -1198,8 +1465,14 @@ pso_for :: proc(k: ggml.GGML_Type) -> ^MTL.ComputePipelineState {
 	case .Q4_1: return m_pso_q4_1
 	case .Q5_0: return m_pso_q5_0
 	case .Q5_1: return m_pso_q5_1
-	case .Q4_K: return m_pso_q4_k
-	case .Q6_K: return m_pso_q6_k
+	case .Q4_K:
+		if g_gemv3 { return m_pso_q4_k3 }
+		if g_gemv2r { return m_pso_q4_k2r }
+		return m_pso_q4_k
+	case .Q6_K:
+		if g_gemv3 { return m_pso_q6_k3 }
+		if g_gemv2r { return m_pso_q6_k2r }
+		return m_pso_q6_k
 	}
 	return nil
 }
@@ -1217,6 +1490,12 @@ enc_gemv :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off: N
 	enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
 	dims := [2]u32{u32(n), u32(d)}
 	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	if (kind == .Q4_K || kind == .Q6_K) && (g_gemv3 || g_gemv2r) {
+		// v3 / 2r kernels: 256 threads/TG, 64 rows/TG
+		tg_x := (d + 63) / 64
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
+		return
+	}
 	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{GEMV_TG, 1, 1})
 }
@@ -1415,6 +1694,20 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	x_slice := m_b_x->contentsAsSlice([]f32)
 	get_embedding_row(&w.token_embedding, token, dim, x_slice[:dim])
 
+	// ablation switches: read /tmp/qprof_flags per call so they can be toggled
+	// WITHOUT restart (comma-separated: noout, nomlp, nosmall)
+	prof: []u8
+	if data, ferr := os.read_entire_file("/tmp/qprof_flags", context.temp_allocator); ferr == os.ERROR_NONE {
+		prof = data
+	}
+	prof_s := string(prof)
+	noout := strings.contains(prof_s, "noout")
+	nomlp := strings.contains(prof_s, "nomlp")
+	nosmall := strings.contains(prof_s, "nosmall")
+	nonorm := nosmall || strings.contains(prof_s, "nonorm")
+	noattn := nosmall || strings.contains(prof_s, "noattn")
+	nodelta := nosmall || strings.contains(prof_s, "nodelta")
+
 	cmd := m_queue->commandBuffer()
 	enc := cmd->computeCommandEncoder()
 	kv_layer_bytes := NS.UInteger(seq_len * kv_dim * 2)
@@ -1424,7 +1717,9 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	for l in 0 ..< p.n_layers {
 		lw := &w.layers[l]
 		// shared: input norm + MLP (post_attention_norm)
-		enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.attn_norm), dim, 1, eps)
+		if !nonorm {
+			enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.attn_norm), dim, 1, eps)
+		}
 
 		switch lw.layer_type {
 		case .Full_Attention:
@@ -1435,6 +1730,7 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			enc_gemv(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), m_b_xb, 0, m_b_ktmp, 0, dim, kv_dim)
 			enc_gemv(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), m_b_xb, 0, m_b_vtmp, 0, dim, kv_dim)
 			// extract + norm q (per head, strided in qproj); norm k (contiguous per kv head)
+			if !noattn {
 			enc->setComputePipelineState(m_pso_qnorm)
 			enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
 			qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
@@ -1468,6 +1764,7 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			hd_u32 := u32(head_dim)
 			enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
 			enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+			} // !nosmall
 			enc_gemv(enc, fa.wo.kind, woff(raw_data(fa.wo.data)), m_b_xb3, 0, m_b_xb2, 0, att_head_dim, dim)
 			enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb2, dim)
 
@@ -1481,6 +1778,7 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			enc_gemv(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), m_b_xb, 0, m_b_b, 0, dim, n_vh)
 			enc_gemv(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), m_b_xb, 0, m_b_a, 0, dim, n_vh)
 			// conv1d step + silu (weight is F32 in mmap)
+			if !nodelta {
 			enc->setComputePipelineState(m_pso_conv)
 			enc->setBuffer(m_b_qkv2, 0, 0); enc->setBuffer(m_b_qkv, 0, 1)
 			enc->setBuffer(m_b_conv_states, conv_off, 2); enc->setBuffer(m_weights, woff(raw_data(la.conv.data)), 3)
@@ -1512,25 +1810,40 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
 			enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
 			enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
+			} // !nosmall
 			enc_gemv(enc, la.out.kind, woff(raw_data(la.out.data)), m_b_lout, 0, m_b_xb2, 0, value_dim, dim)
 			enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb2, dim)
 		}
 
 		// shared MLP (post_attention_norm)
-		enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.ffn_norm), dim, 1, eps)
-		enc_gemv(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), m_b_xb, 0, m_b_hb, 0, dim, hidden_dim)
-		enc_gemv(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), m_b_xb, 0, m_b_hb2, 0, dim, hidden_dim)
-		enc_elementwise(enc, m_pso_swiglu, m_b_hb, m_b_hb2, hidden_dim)
-		enc_gemv(enc, lw.w2.kind, woff(raw_data(lw.w2.data)), m_b_hb, 0, m_b_xb, 0, hidden_dim, dim)
+		if !nonorm {
+			enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.ffn_norm), dim, 1, eps)
+		}
+		if !nomlp {
+			enc_gemv(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), m_b_xb, 0, m_b_hb, 0, dim, hidden_dim)
+			enc_gemv(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), m_b_xb, 0, m_b_hb2, 0, dim, hidden_dim)
+			if !nosmall {
+			enc_elementwise(enc, m_pso_swiglu, m_b_hb, m_b_hb2, hidden_dim)
+		}
+			enc_gemv(enc, lw.w2.kind, woff(raw_data(lw.w2.data)), m_b_hb, 0, m_b_xb, 0, hidden_dim, dim)
+		}
 		enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb, dim)
 	}
 
-	enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, eps)
-	enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)
+	if !nonorm {
+		enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, eps)
+	}
+	if !noout {
+		enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)
+	}
 
 	enc->endEncoding()
 	cmd->commit()
 	cmd->waitUntilCompleted()
+	if g_timing {
+		gpu_ms := f64(cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0
+		fmt.eprintfln("[timing] forward_gpu pos={} GPU={:.2f} ms", pos, gpu_ms)
+	}
 	return m_b_logits->contentsAsSlice([]f32)[:p.vocab_size]
 }
 
@@ -1539,7 +1852,7 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 // runs per-token on single-token scratch (its projections are GEMV; batching them
 // is Stage 1b). T must be a multiple of 8 and <= MAX_BATCH_T (caller chunks; the
 // trailing <8 remainder goes through forward_gpu). Returns the LAST token's logits.
-forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: int) -> []f32 {
+forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: int, n_real: int) -> []f32 {
 	NS.scoped_autoreleasepool()
 	p := &transformer.config
 	w := &transformer.weights
@@ -1548,6 +1861,15 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 	if T == 0 { fmt.eprintln("forward_gpu_batch: empty"); os.exit(1) }
 	if T > MAX_BATCH_T || (T % 8) != 0 {
 		fmt.eprintf("forward_gpu_batch: T=%d must be in (0,%d] and %%8==0\n", T, MAX_BATCH_T)
+		os.exit(1)
+	}
+	if n_real < 1 || n_real > T {
+		fmt.eprintf("forward_gpu_batch: n_real=%d must be in [1,%d]\n", n_real, T)
+		os.exit(1)
+	}
+	if n_real < p.lin_conv_kernel - 1 {
+		// conv1d_update_state slides to the last km1 inputs and needs n_real >= km1
+		fmt.eprintf("forward_gpu_batch: n_real=%d too small for conv update (need >= %d)\n", n_real, p.lin_conv_kernel - 1)
 		os.exit(1)
 	}
 
@@ -1595,7 +1917,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			kv_loff := NS.UInteger(slot) * kv_layer_bytes
 			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
 			if !g_prof_nofull { // QPROF_NOFULL ablation
-			for t in 0 ..< T {
+			for t in 0 ..< n_real {
 				pos := pos_start + t
 				oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
 				enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
@@ -1656,7 +1978,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
 			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
 			if !g_prof_nolin { // QPROF_NOLIN ablation: skip to measure linear per-token stateful share
-			for t in 0 ..< T {
+			for t in 0 ..< n_real {
 				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
 				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim)
 				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
@@ -1687,7 +2009,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
 			} // end QPROF_NOLIN guard
-			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, T, kernel)
+			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 		}
@@ -1704,8 +2026,8 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 		enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_bxb, T * dim)                  // batch_x += mlp_out
 	}
 
-	// final norm + output projection: LAST token only
-	last_off := NS.UInteger(T - 1) * dim_bytes
+	// final norm + output projection: LAST REAL token only (padded tail: skip filler)
+	last_off := NS.UInteger(n_real - 1) * dim_bytes
 	enc_copy(enc, m_b_bx, last_off, m_b_x, 0, dim)
 	enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, eps)
 	enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)

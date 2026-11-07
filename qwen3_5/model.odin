@@ -255,6 +255,15 @@ load_config :: proc(t: ^Transformer) {
 	c.dim        = gu(g, "qwen35.embedding_length", "qwen3_5.embedding_length", 4096)
 	c.hidden_dim = gu(g, "qwen35.feed_forward_length", "qwen3_5.feed_forward_length", 12288)
 	c.n_layers   = gu(g, "qwen35.block_count", "qwen3_5.block_count", 32)
+
+	// llama.cpp counts MTP/NextN layers inside block_count; this engine runs
+	// only the main trunk (MTP is ignored on inference), so subtract them.
+	// Some conversions (e.g. mradermacher Qwen3.5 GGUFs) write block_count =
+	// num_hidden_layers + nextn_predict_layers but ship only the trunk blocks.
+	mtp_layers := gu(g, "qwen35.nextn_predict_layers", "qwen3_5.nextn_predict_layers", 0)
+	if mtp_layers > 0 && mtp_layers < c.n_layers {
+		c.n_layers -= mtp_layers
+	}
 	c.n_heads    = gu(g, "qwen35.attention.head_count", "qwen3_5.attention.head_count", 16)
 	c.n_kv_heads = gu(g, "qwen35.attention.head_count_kv", "qwen3_5.attention.head_count_kv", 4)
 	c.head_dim   = gu(g, "qwen35.attention.key_length", "qwen3_5.attention.key_length", 256)

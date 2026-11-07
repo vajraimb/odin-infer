@@ -74,8 +74,17 @@ engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32
 				if rem >= 8 {
 					chunk := min(MAX_BATCH_T, rem)
 					chunk -= chunk % 8
-					logits = forward_gpu_batch(&e.transformer, tokens[i : i + chunk], pos_start + i)
+					logits = forward_gpu_batch(&e.transformer, tokens[i : i + chunk], pos_start + i, chunk)
 					i += chunk
+				} else if rem >= 3 {
+					// pad the tail to 8 with repeats of the last real token; the
+					// stateful per-token loops inside skip the filler slots
+					padded: [8]int
+					for j in 0 ..< 8 {
+						padded[j] = tokens[i + min(j, rem - 1)]
+					}
+					logits = forward_gpu_batch(&e.transformer, padded[:], pos_start + i, rem)
+					i += rem
 				} else {
 					logits = forward_gpu(&e.transformer, tokens[i], pos_start + i)
 					i += 1
@@ -166,7 +175,7 @@ engine_restore_spec_state :: proc(e: ^Engine, conv: []u8, rec: []u8) {
 engine_verify_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
 	when ODIN_OS == .Darwin {
 		if e.metal_ready {
-			_ = forward_gpu_batch(&e.transformer, tokens, pos_start)
+			_ = forward_gpu_batch(&e.transformer, tokens, pos_start, len(tokens))
 			return metal_verify_batch_logits(&e.transformer, len(tokens))
 		}
 	}

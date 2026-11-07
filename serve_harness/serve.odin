@@ -64,7 +64,20 @@ start_server :: proc(port: u16, handler: Server_Handler) -> bool {
 		address = net.IP4_Address{127, 0, 0, 1},
 		port    = int(port),
 	}
-	sock, err := net.listen_tcp(addr, 16)
+	// Retry with backoff: after a kill -9, lingering TIME_WAIT connections can
+	// make bind() fail with Address_In_Use for up to ~60s (no SO_REUSEADDR in
+	// core:net's listen_tcp). Most failures clear within 5-10s.
+	sock: net.TCP_Socket
+	err: net.Network_Error
+	for attempt in 0 ..< 12 {
+		sock, err = net.listen_tcp(addr, 16)
+		if err == nil && sock != 0 {
+			break
+		}
+		if attempt < 11 {
+			time.sleep(5 * time.Second)
+		}
+	}
 	if err != nil || sock == 0 {
 		fmt.eprintf("serve: listen_tcp on port %d failed (in use? err=%v)\n", port, err)
 		return false
@@ -84,6 +97,7 @@ start_server :: proc(port: u16, handler: Server_Handler) -> bool {
 }
 
 handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
+	t0 := time_to_ms()
 	// Per-request arena: swap context.allocator for the request's duration and
 	// release everything in one shot on exit — no per-allocation delete pairs,
 	// and no dangling-pointer risk for request-scoped data. Requests run
@@ -167,6 +181,7 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 	}
 
 	req_str := string(buf[:header_end])
+	t_read := time_to_ms()
 	lines := strings.split(req_str, "\r\n", context.allocator)
 	defer delete(lines)
 	if len(lines) < 1 { return }
@@ -205,9 +220,12 @@ handle_client :: proc(client: net.TCP_Socket, handler: Server_Handler) {
 	resp.headers = make(map[string]string)
 	defer delete_resp_headers(&resp)
 	streamed := handler(client, &req, &resp)
+	t1 := time_to_ms()
 	if !streamed {
 		write_full_response(client, &resp)
 	}
+	t2 := time_to_ms()
+	fmt.eprintfln("[perf] client: read={}ms parse+handler={}ms write={}ms total={}ms", t_read-t0, t1-t_read, t2-t1, t2-t0)
 }
 
 // Look for chunked-body terminator "0\r\n\r\n" anywhere in body
@@ -2451,6 +2469,7 @@ openai_models_list :: proc() -> string {
 }
 
 handle_openai_chat :: proc(body: string) -> string {
+	t0 := time_to_ms()
 	// Extract messages array
 	msgs := openai_extract_messages(body)
 	defer free_message_pairs(msgs)
@@ -2479,21 +2498,25 @@ handle_openai_chat :: proc(body: string) -> string {
 
 	prompt := strings.clone(strings.to_string(prompt_buf))
 	defer delete(prompt)
+	t1 := time_to_ms()
 
 	// RESET engine state for stateless OpenAI semantics
 	q35.engine_reset_state(&g_state.engine)
 	g_state.pos = 0
+	t2 := time_to_ms()
 
 	encoded, err := tok35.encode(&g_state.tok, prompt)
 	if err != nil {
 		return `{"error":{"message":"encode failed","type":"internal_error"}}`
 	}
+	t3 := time_to_ms()
 
 	// Prefill all but last token
 	if len(encoded) > 1 {
 		_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
 		g_state.pos = len(encoded) - 1
 	}
+	t4 := time_to_ms()
 
 	// Generate
 	gen_buf: strings.Builder
@@ -2503,11 +2526,14 @@ handle_openai_chat :: proc(body: string) -> string {
 	t_start := time_to_ms()
 	t_first := t_start
 	gen := 0
+	fwd_cpu_ms: i64 = 0
 	next: int = 0
 
 	if g_state.pos > 0 && len(encoded) > 0 {
 		last := encoded[len(encoded) - 1]
+		t_fwd0 := time_to_ms()
 		logits := q35.engine_forward(&g_state.engine, last, g_state.pos)
+		fwd_cpu_ms += time_to_ms() - t_fwd0
 		next = sampler.sample(&g_state.samp, logits)
 	} else {
 		return `{"error":{"message":"empty prompt","type":"internal_error"}}`
@@ -2521,8 +2547,11 @@ handle_openai_chat :: proc(body: string) -> string {
 		if gen == 0 { t_first = time_to_ms() }
 		gen += 1
 		g_state.pos += 1
+		if gen >= max_tokens { break }
 		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
+		t_fwd0 := time_to_ms()
 		logits := q35.engine_forward(&g_state.engine, next, g_state.pos)
+		fwd_cpu_ms += time_to_ms() - t_fwd0
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
@@ -2534,6 +2563,7 @@ handle_openai_chat :: proc(body: string) -> string {
 	g_state.last_gen = gen
 
 	response_text := strings.to_string(gen_buf)
+	t5 := time_to_ms()
 
 	// Build OpenAI-format response
 	out: strings.Builder
@@ -2557,6 +2587,8 @@ handle_openai_chat :: proc(body: string) -> string {
 	strings.write_string(&out, fmt.tprintf(`"total_tokens":%d`, len(encoded) + gen))
 	strings.write_string(&out, "}}")
 	final := strings.clone(strings.to_string(out))
+	fmt.eprintfln("[perf] openai_chat: parse/render={}ms reset={}ms encode={}ms prefill={}ms decode={}ms (ttft={}ms, tps={:.2f}, fwd_cpu={}ms) build_resp={}ms total={}ms (gen={})",
+		t1-t0, t2-t1, t3-t2, t4-t3, t_total, ttft, tps, fwd_cpu_ms, time_to_ms()-t5, time_to_ms()-t0, gen)
 	return final
 }
 

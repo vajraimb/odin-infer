@@ -22,6 +22,90 @@ collection for GGUF parsing and quantized dot products.
 (verified: prompt "What is 2+2?" yields reasoning text like "The user asked a
 \"2+\"" / "The user wants" with proper `<think>`/`</think>` structure).
 
+Also smoke-tested against `mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF`
+(Q4_K_M): loads and produces coherent EN/ZH replies ("2+2 equals 4.", 中文介绍北京).
+That conversion writes `qwen35.block_count = num_hidden_layers + nextn_predict_layers`
+(33 = 32 trunk + 1 MTP) while shipping only the 32 trunk blocks, so the loader
+subtracts `qwen35.nextn_predict_layers` (llama.cpp's convention) and runs the
+trunk only — MTP is ignored on inference.
+
+## Decode-path performance (Apple M3, heretic Q4_K_M, Metal)
+
+Benchmarked solo (one engine resident at a time; with two 9B engines resident
+the 16 GB machine swaps and both slow down ~2×):
+
+| step | before | after |
+|------|--------|-------|
+| decode throughput (EN 128 tok) | 8.8 tok/s | **12.0–13.7 tok/s** (ollama/llama.cpp: 14.9) |
+| wall, 128-token reply | 26.4 s | **10.0–11.5 s** (ollama: 8.7 s) |
+| prefill 19-23 tok | 1.2–3.7 s | **0.5 s** |
+| output-layer GEMV share/token | 25 ms | **~8 ms** |
+| per-token GPU time | 100 ms | **~73–77 ms** |
+
+> Numbers are best-of-session on a cool machine. With the M3 run continuously for
+> hours, thermal throttling + the 16 GB RAM ceiling cut both engines ~2×; always
+> benchmark solo (one engine resident at a time).
+>
+> Final clean A/B (same prompt, solo residency, cooled machine, 3 runs):
+> decode 13.1–13.4 vs ollama 14.4–15.5 tok/s (~0.88×); wall for a 128-token
+> reply 10.3–10.5 s vs 7.1–9.1 s.
+
+What moved the needle:
+- **GEMV threadgroup shape tuning** (the single biggest lever): the output
+  projection (248k rows = 31k TGs at 8 rows/TG) was launch-overhead bound.
+  Swept rows-per-TG x lanes-per-row on the M3:
+  | config | per-token GPU |
+  |---|---|
+  | 256 thr / 8 rows / 32 lanes (original) | ~100 ms |
+  | 1024 thr / 32 rows / 32 lanes | ~89 ms |
+  | 512 thr / 32 rows / 16 lanes | ~80 ms |
+  | **256 thr / 32 rows / 8 lanes (final)** | **~73–77 ms** |
+  | 128 thr / 32 rows / 4 lanes | ~92 ms |
+  | 512 thr / 64 rows / 8 lanes | ~130 ms |
+  | 256 thr / 64 rows / 2 rows-per-lane x 8 lanes | ~105 ms |
+  | 256 thr / 64 rows / 4 rows-per-lane x 32 lanes | ~165 ms |
+  Since rows share simdgroups at <32 lanes, the GEMV reduction switched from
+  `simd_sum` (which would mix two rows per simdgroup) to
+  `simd_shuffle_xor` butterflies (8-lane groups) with `lane % 8 == 0` writes.
+- **Padded-tail batched prefill**: prompt tails of 3–7 tokens were running
+  through the per-token GEMV path (~90 ms each); `engine_forward_batch` now
+  pads the tail to a multiple of 8 with filler tokens and `forward_gpu_batch`
+  takes `n_real`, so stateful per-token loops skip the filler slots. Tails of
+  1–2 tokens still fall back to per-token (conv-state update needs n≥3).
+- **Dropped the wasted final forward** per request (one unsampled logits pass).
+
+What did NOT help (reverted, kept as regression notes): 4-rows-per-thread
+vectorized GEMV (2× slower), uint-packed nibble loads (~8% slower), float4-dot
+accumulation (neutral), and a faithful port of llama.cpp's current
+`kernel_mul_mv_ext_q4x4` row-split structure (~108 ms — their tuned nxpsg/r1ptg
+combos do not transfer to this engine). The port is preserved as validated-but-
+disabled `gemv_q4_k_v3`/`gemv_q6_k_v3` (env `QGEMV3=1`), with a standalone
+correctness/perf harness at `gemm_harness/gemv3_test.odin` (both kernels match
+CPU references to <0.03 max_abs on synthetic weights). The remaining gap to
+llama.cpp (~65 vs ~84 GB/s effective weight-read bandwidth at 32 lanes) narrowed
+to ~10% at the 8-lane sweet spot; closing it fully likely needs Xcode GPU
+profiling, which this machine lacks (`xcrun metal` unavailable).
+
+Decode composition at the 8-lane sweet spot (per-token GPU, flag-file ablation
+`/tmp/qprof_flags`, no restart needed):
+
+| part | ms/token | eff. BW |
+|---|---|---|
+| MLP GEMVs (w1/w3/w2, 3.1 GB) | ~41 | ~76 GB/s |
+| attention+linear GEMVs (1.9 GB) | ~21 | ~90 GB/s |
+| output GEMV (572 MB, 7760 TGs) | ~9 | ~64 GB/s |
+| small kernels (norms/attn/conv/delta, ~330 dispatches) | ~3 | — |
+
+The 8-lane sweet spot already puts the big GEMVs near the M3's practical
+bandwidth; the output layer's 7760 tiny TGs and the small-kernel dispatch
+overhead are the remaining ~12 ms, and every multi-row-per-lane or
+dispatch-shape alternative measured so far regresses. A/B switches kept for
+future profiling: `QGEMV3=1` (llama.cpp row-split port, ~108 ms) and
+`QGEMV2R=1` (2 rows/lane, ~105 ms).
+
+Also: the server now retries `listen_tcp` with backoff (TIME_WAIT after a kill
+used to make restarts flaky ~50% of the time).
+
 | Component | State |
 |-----------|-------|
 | GGUF config loader | done |
