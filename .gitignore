@@ -2,9 +2,8 @@
 *.dSYM/
 *.log
 .DS_Store
-serve.bin
-oracle.bin
-serve_harness/.test-serve.bin
+bin/
 .kv-cache/
-serve_harness/.test-kv-cache/
-serve_harness/.test-serve-old.bin
+server/serve_harness/.test-serve.bin
+server/serve_harness/.test-kv-cache/
+server/serve_harness/.test-serve-old.bin

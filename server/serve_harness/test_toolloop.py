@@ -25,7 +25,7 @@ What this test does
 
 Usage
 -----
-    python3 serve_harness/test_toolloop.py
+    python3 server/serve_harness/test_toolloop.py
 
 Env: MODEL (gguf path), PORT (9766). Exit code 0 on PASS, 1 on FAIL.
 """
@@ -82,10 +82,10 @@ def build_if_stale():
         return
     print("build: compiling serve.odin ...")
     cmd = [
-        "odin", "build", "serve_harness/serve.odin", "-file", "-o:speed",
-        "-collection:ggml=.", "-collection:infer=.",
-        "-collection:qwen3_5=.", "-collection:qwen3_5_tokenizer=.",
-        "-collection:sampler=.", "-collection:tokenizer=.",
+        "odin", "build", "server/serve_harness/serve.odin", "-file", "-o:speed",
+        "-collection:ggml=packages", "-collection:infer=packages",
+        "-collection:qwen3_5=packages", "-collection:qwen3_5_tokenizer=packages",
+        "-collection:sampler=packages", "-collection:tokenizer=packages",
         f"-out:{TEST_BIN}",
     ]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)

@@ -8,7 +8,7 @@ Inspired by colibri's `coli web` (live token metrics, browser-based chat).
 ## Run
 
 ```sh
-odin run serve_harness/serve.odin -file -- \
+odin run server/serve_harness/serve.odin -file -- \
   /path/to/ornith.gguf --metal --max-ctx 1024 --port 9748 \
   -collection:ggml=. -collection:infer=. \
   -collection:qwen3_5=. -collection:qwen3_5_tokenizer=. \
@@ -97,10 +97,10 @@ recurrent state, and against JSON `\uXXXX` escapes reaching the model as
 literal text):
 
 ```sh
-python3 serve_harness/test_prefix_cache.py   # MODEL=... PORT=... to override
+python3 server/serve_harness/test_prefix_cache.py   # MODEL=... PORT=... to override
 ```
 
-Builds a cached test binary (`serve_harness/.test-serve.bin`), starts a
+Builds a cached test binary (`server/serve_harness/.test-serve.bin`), starts a
 throwaway server, runs 3 Chinese turns via `/api/chat` plus a 4th turn with a
 `tools` payload (asserts the model's native
 `<tool_call><function=...><parameter=...>` form is parsed back into structured

@@ -6,7 +6,7 @@ greedy (temperature=0) requests to both, and asserts byte-identical replies.
 Perf signal: QTIMING=1 per-chunk GPU ms/tok lines from the server log
 (median over chunks), immune to host-side wall-clock noise.
 
-Usage: python3 serve_harness/ab_b64_check.py
+Usage: python3 server/serve_harness/ab_b64_check.py
 Env: MODEL, ports fixed at 9765 (old) / 9766 (new).
 """
 import json
