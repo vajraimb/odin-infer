@@ -120,6 +120,21 @@ llama.cpp family on every shape — the remaining gap to llama.cpp end-to-end is
 NOT in GEMV structure. `gemv_q4_k_o` (llama.cpp default 32x4 shape) is kept
 compiled but unselected as a live counter-example.
 
+### Small-kernel fusion attempts (both regressed, reverted)
+
+- **Norm-fused GEMV** (`QGEMVNORM=1`, kernels `gemv_q4_k_norm`/`gemv_q6_k_norm`):
+  each GEMV recomputes rms(x) cooperatively (256-thread threadgroup reduce with
+  8 barriers) and folds the norm weight in, eliminating 64 standalone norm
+  dispatches + the xb round trip per token. Result: correct, but ~134 ms/token
+  (1.9x slower) — the per-GEMV barrier cost dwarfs the saved dispatch.
+- **Widened rmsnorm** (32 -> 256 threads with the same barrier reduce): correct,
+  ~120 ms/token. On this M3, 32-thread `simd_sum` mini-kernels beat every
+  barrier-based cooperative variant; reverted to the 32-thread version.
+
+Conclusion after 10 structural variants: the production configuration (8-lane
+GEMV + 32-thread simd_sum norms) is a measured local optimum for every kernel
+on this device; the residual ~11% vs llama.cpp needs GPU-profiler guidance.
+
 Also: the server now retries `listen_tcp` with backoff (TIME_WAIT after a kill
 used to make restarts flaky ~50% of the time).
 

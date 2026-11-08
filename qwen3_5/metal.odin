@@ -179,6 +179,107 @@ kernel void gemv_q4_k(device const uchar *wb [[buffer(0)]], device const float *
     sum += simd_shuffle_xor(sum, 1);
     if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
+// ============ norm-fused GEMV (QGEMVNORM=1) ============
+// Each dispatch recomputes rms(x) cooperatively (256 threads) and folds the
+// norm weight into the activation: y[j] = x[j] * wn[j] * rms. Eliminates the
+// 64 standalone 32-thread rmsnorm dispatches per token and the xb round trip.
+kernel void gemv_q4_k_norm(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    device const float *wn [[buffer(4)]], constant float &eps [[buffer(5)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float red[256];
+    float ss = 0.0;
+    for (uint j = tid; j < dim.n; j += 256) { float v = x[j]; ss += v * v; }
+    red[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint sh = 128; sh > 0; sh >>= 1) {
+        if (tid < sh) { red[tid] += red[tid + sh]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms = rsqrt(red[0] / (float)dim.n + eps);
+
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 144;
+        float slo = 0.0, shi = 0.0;
+        for (uint sb = lane; sb < nsb; sb += GEMV_SG) { device const uchar *blk = wr + sb * 144;
+            float dall = (float)(*(device const half*)blk); float dmin = (float)(*(device const half*)(blk + 2));
+            device const uchar *scales = blk + 4; device const uchar *qs = blk + 16; uint ybase = sb * 256; int is = 0; uint qoff = 0;
+            for (uint j = 0; j < 256; j += 64) { uchar sc, m; get_scale_min_k4(is + 0, scales, sc, m); float d1 = dall * sc, m1 = dmin * m;
+                get_scale_min_k4(is + 1, scales, sc, m); float d2 = dall * sc, m2 = dmin * m;
+                for (uint l = 0; l < 32; l += 4) {
+                    float4 wl = float4((float)(qs[qoff+l]&0xF),(float)(qs[qoff+l+1]&0xF),(float)(qs[qoff+l+2]&0xF),(float)(qs[qoff+l+3]&0xF));
+                    float4 wh = float4((float)(qs[qoff+l]>>4),(float)(qs[qoff+l+1]>>4),(float)(qs[qoff+l+2]>>4),(float)(qs[qoff+l+3]>>4));
+                    float4 xl = float4(x[ybase+j+l]*wn[ybase+j+l]*rms, x[ybase+j+l+1]*wn[ybase+j+l+1]*rms, x[ybase+j+l+2]*wn[ybase+j+l+2]*rms, x[ybase+j+l+3]*wn[ybase+j+l+3]*rms);
+                    float4 xh = float4(x[ybase+j+32+l]*wn[ybase+j+32+l]*rms, x[ybase+j+32+l+1]*wn[ybase+j+32+l+1]*rms, x[ybase+j+32+l+2]*wn[ybase+j+32+l+2]*rms, x[ybase+j+32+l+3]*wn[ybase+j+32+l+3]*rms);
+                    slo += dot(wl * d1 - m1, xl);
+                    shi += dot(wh * d2 - m2, xh);
+                }
+                qoff += 32; is += 2; } }
+        sum = slo + shi; }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+inline float2 dot_q6_superblock2n(device const uchar *blk, device const float *x, device const float *wn, float rms, uint ybase) {
+    device const uchar *ql = blk; device const uchar *qh = blk + 128; device const char *sc = (device const char*)(blk + 192);
+    float dall = (float)(*(device const half*)(blk + 208)); float s0 = 0.0, s1 = 0.0;
+    for (int hf = 0; hf < 2; ++hf) { uint qlo = hf * 64, qho = hf * 32, sco = hf * 8, yo = ybase + hf * 128;
+        float ds0=dall*(float)sc[sco+0],ds1=dall*(float)sc[sco+1],ds2=dall*(float)sc[sco+2],ds3=dall*(float)sc[sco+3];
+        float ds4=dall*(float)sc[sco+4],ds5=dall*(float)sc[sco+5],ds6=dall*(float)sc[sco+6],ds7=dall*(float)sc[sco+7];
+        for (int l = 0; l < 16; l += 4) {
+            float4 w1=float4((float)((int)((ql[qlo+l+0]&0xF)|(((qh[qho+l+0]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+1]&0xF)|(((qh[qho+l+1]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+2]&0xF)|(((qh[qho+l+2]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+3]&0xF)|(((qh[qho+l+3]>>0)&3)<<4))-32));
+            float4 w2=float4((float)((int)((ql[qlo+l+32]&0xF)|(((qh[qho+l+0]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+33]&0xF)|(((qh[qho+l+1]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+34]&0xF)|(((qh[qho+l+2]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+35]&0xF)|(((qh[qho+l+3]>>2)&3)<<4))-32));
+            float4 w3=float4((float)((int)((ql[qlo+l+0]>>4)|(((qh[qho+l+0]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+1]>>4)|(((qh[qho+l+1]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+2]>>4)|(((qh[qho+l+2]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+3]>>4)|(((qh[qho+l+3]>>4)&3)<<4))-32));
+            float4 w4=float4((float)((int)((ql[qlo+l+32]>>4)|(((qh[qho+l+0]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+33]>>4)|(((qh[qho+l+1]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+34]>>4)|(((qh[qho+l+2]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+35]>>4)|(((qh[qho+l+3]>>6)&3)<<4))-32));
+            float4 xv1=float4(x[yo+l]*wn[yo+l]*rms,x[yo+l+1]*wn[yo+l+1]*rms,x[yo+l+2]*wn[yo+l+2]*rms,x[yo+l+3]*wn[yo+l+3]*rms);
+            float4 xv2=float4(x[yo+l+32]*wn[yo+l+32]*rms,x[yo+l+33]*wn[yo+l+33]*rms,x[yo+l+34]*wn[yo+l+34]*rms,x[yo+l+35]*wn[yo+l+35]*rms);
+            float4 xv3=float4(x[yo+l+64]*wn[yo+l+64]*rms,x[yo+l+65]*wn[yo+l+65]*rms,x[yo+l+66]*wn[yo+l+66]*rms,x[yo+l+67]*wn[yo+l+67]*rms);
+            float4 xv4=float4(x[yo+l+96]*wn[yo+l+96]*rms,x[yo+l+97]*wn[yo+l+97]*rms,x[yo+l+98]*wn[yo+l+98]*rms,x[yo+l+99]*wn[yo+l+99]*rms);
+            s0 += ds0*dot(w1,xv1)+ds2*dot(w2,xv2)+ds4*dot(w3,xv3)+ds6*dot(w4,xv4);
+        }
+        for (int l = 16; l < 32; l += 4) {
+            float4 w1=float4((float)((int)((ql[qlo+l+0]&0xF)|(((qh[qho+l+0]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+1]&0xF)|(((qh[qho+l+1]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+2]&0xF)|(((qh[qho+l+2]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+3]&0xF)|(((qh[qho+l+3]>>0)&3)<<4))-32));
+            float4 w2=float4((float)((int)((ql[qlo+l+32]&0xF)|(((qh[qho+l+0]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+33]&0xF)|(((qh[qho+l+1]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+34]&0xF)|(((qh[qho+l+2]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+35]&0xF)|(((qh[qho+l+3]>>2)&3)<<4))-32));
+            float4 w3=float4((float)((int)((ql[qlo+l+0]>>4)|(((qh[qho+l+0]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+1]>>4)|(((qh[qho+l+1]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+2]>>4)|(((qh[qho+l+2]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+3]>>4)|(((qh[qho+l+3]>>4)&3)<<4))-32));
+            float4 w4=float4((float)((int)((ql[qlo+l+32]>>4)|(((qh[qho+l+0]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+33]>>4)|(((qh[qho+l+1]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+34]>>4)|(((qh[qho+l+2]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+35]>>4)|(((qh[qho+l+3]>>6)&3)<<4))-32));
+            float4 xv1=float4(x[yo+l]*wn[yo+l]*rms,x[yo+l+1]*wn[yo+l+1]*rms,x[yo+l+2]*wn[yo+l+2]*rms,x[yo+l+3]*wn[yo+l+3]*rms);
+            float4 xv2=float4(x[yo+l+32]*wn[yo+l+32]*rms,x[yo+l+33]*wn[yo+l+33]*rms,x[yo+l+34]*wn[yo+l+34]*rms,x[yo+l+35]*wn[yo+l+35]*rms);
+            float4 xv3=float4(x[yo+l+64]*wn[yo+l+64]*rms,x[yo+l+65]*wn[yo+l+65]*rms,x[yo+l+66]*wn[yo+l+66]*rms,x[yo+l+67]*wn[yo+l+67]*rms);
+            float4 xv4=float4(x[yo+l+96]*wn[yo+l+96]*rms,x[yo+l+97]*wn[yo+l+97]*rms,x[yo+l+98]*wn[yo+l+98]*rms,x[yo+l+99]*wn[yo+l+99]*rms);
+            s1 += ds1*dot(w1,xv1)+ds3*dot(w2,xv2)+ds5*dot(w3,xv3)+ds7*dot(w4,xv4);
+        }
+    }
+    return float2(s0, s1);
+}
+
+kernel void gemv_q6_k_norm(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    device const float *wn [[buffer(4)]], constant float &eps [[buffer(5)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float red[256];
+    float ss = 0.0;
+    for (uint j = tid; j < dim.n; j += 256) { float v = x[j]; ss += v * v; }
+    red[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint sh = 128; sh > 0; sh >>= 1) {
+        if (tid < sh) { red[tid] += red[tid + sh]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms = rsqrt(red[0] / (float)dim.n + eps);
+
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 210;
+        for (uint sb = lane; sb < nsb; sb += GEMV_SG) {
+            float2 acc = dot_q6_superblock2n(wr + sb * 210, x, wn, rms, sb * 256);
+            sum += acc.x + acc.y; } }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
 inline float2 dot_q6_superblock2(device const uchar *blk, device const float *x, uint ybase) {
     device const uchar *ql = blk; device const uchar *qh = blk + 128; device const char *sc = (device const char*)(blk + 192);
     float dall = (float)(*(device const half*)(blk + 208)); float s0 = 0.0, s1 = 0.0;
@@ -1026,6 +1127,7 @@ g_prof_nolin: bool   // ablation: skip linear-layer per-token stateful loop (env
 g_prof_nofull: bool  // ablation: skip full-attention per-token block (env QPROF_NOFULL=1)
 g_gemv3: bool       // use row-split v3 GEMV kernels (env QGEMV3=1)
 g_gemv2r: bool      // use 2-rows-per-lane GEMV kernels (env QGEMV2R=1)
+g_normfuse: bool    // fuse rmsnorm into GEMV dispatches (env QGEMVNORM=1)
 @(private = "file")
 m_weights: ^MTL.Buffer
 @(private = "file")
@@ -1037,6 +1139,7 @@ metal_enabled: bool
 m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1, m_pso_q4_k, m_pso_q6_k: ^MTL.ComputePipelineState
 	m_pso_q4_k3, m_pso_q6_k3: ^MTL.ComputePipelineState // row-split v3 GEMV kernels (QGEMV3=1)
 	m_pso_q4_k2r, m_pso_q6_k2r: ^MTL.ComputePipelineState // 2 rows/lane GEMV kernels (QGEMV2R=1)
+	m_pso_q4_knorm, m_pso_q6_knorm: ^MTL.ComputePipelineState // norm-fused GEMV (QGEMVNORM=1)
 	m_pso_q4_k_o: ^MTL.ComputePipelineState           // output-layer GEMV (32 lanes/row x 4 rows/thread, llama.cpp default shape)
 @(private = "file")
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
@@ -1385,6 +1488,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	g_prof_nofull = os.get_env("QPROF_NOFULL", context.temp_allocator) == "1"
 	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
+	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
 	fmt.printfln("metal: shader fastMath={} (QFASTMATH=0 to disable)", g_fast_math)
 	fmt.printfln("metal: maxThreadgroupMemoryLength={} bytes", m_device->maxThreadgroupMemoryLength())
 
@@ -1407,6 +1511,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_q6_k = make_pso(lib, "gemv_q6_k")
 	m_pso_q4_k3 = make_pso(lib, "gemv_q4_k_v3"); m_pso_q6_k3 = make_pso(lib, "gemv_q6_k_v3")
 	m_pso_q4_k2r = make_pso(lib, "gemv_q4_k_2r"); m_pso_q6_k2r = make_pso(lib, "gemv_q6_k_2r")
+	m_pso_q4_knorm = make_pso(lib, "gemv_q4_k_norm"); m_pso_q6_knorm = make_pso(lib, "gemv_q6_k_norm")
 	m_pso_q4_k_o = make_pso(lib, "gemv_q4_k_o")
 	m_pso_rmsnorm = make_pso(lib, "rmsnorm"); m_pso_rope = make_pso(lib, "rope_partial")
 	m_pso_qnorm = make_pso(lib, "qnorm_extract"); m_pso_store_kv = make_pso(lib, "store_kv")
@@ -1564,6 +1669,25 @@ enc_gemv :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off: N
 		enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
 		return
 	}
+	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{GEMV_TG, 1, 1})
+}
+
+// Norm-fused GEMV: the kernel recomputes rms(x) cooperatively and folds the
+// norm weight (at wn_off in m_weights) into the activation. Requires the fused
+// kernel variants for Q4_K/Q6_K; caller guards on g_normfuse.
+@(private = "file")
+enc_gemv_norm :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off, wn_off: NS.UInteger,
+	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int, eps: f32) {
+	pso := m_pso_q4_knorm
+	if kind == .Q6_K { pso = m_pso_q6_knorm }
+	enc->setComputePipelineState(pso)
+	enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+	dims := [2]u32{u32(n), u32(d)}
+	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	enc->setBuffer(m_weights, wn_off, 4)
+	eps_local := eps
+	enc->setBytes(bytes_of(&eps_local, size_of(eps_local)), 5)
 	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{GEMV_TG, 1, 1})
 }
@@ -1785,7 +1909,7 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	for l in 0 ..< p.n_layers {
 		lw := &w.layers[l]
 		// shared: input norm + MLP (post_attention_norm)
-		if !nonorm {
+		if !nonorm && !g_normfuse {
 			enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.attn_norm), dim, 1, eps)
 		}
 
@@ -1794,9 +1918,15 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			fa := &lw.full
 			slot := transformer.full_slot[l]
 			kv_loff := NS.UInteger(slot) * kv_layer_bytes
-			enc_gemv(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), m_b_xb, 0, m_b_qproj, 0, dim, n_heads * head_dim * 2)
-			enc_gemv(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), m_b_xb, 0, m_b_ktmp, 0, dim, kv_dim)
-			enc_gemv(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), m_b_xb, 0, m_b_vtmp, 0, dim, kv_dim)
+			if g_normfuse {
+				enc_gemv_norm(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_qproj, 0, dim, n_heads * head_dim * 2, eps)
+				enc_gemv_norm(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_ktmp, 0, dim, kv_dim, eps)
+				enc_gemv_norm(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_vtmp, 0, dim, kv_dim, eps)
+			} else {
+				enc_gemv(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), m_b_xb, 0, m_b_qproj, 0, dim, n_heads * head_dim * 2)
+				enc_gemv(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), m_b_xb, 0, m_b_ktmp, 0, dim, kv_dim)
+				enc_gemv(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), m_b_xb, 0, m_b_vtmp, 0, dim, kv_dim)
+			}
 			// extract + norm q (per head, strided in qproj); norm k (contiguous per kv head)
 			if !noattn {
 			enc->setComputePipelineState(m_pso_qnorm)
@@ -1841,10 +1971,17 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			slot := transformer.lin_slot[l]
 			conv_off := NS.UInteger(slot * conv_state_stride * 4)
 			rec_off := NS.UInteger(slot * rec_state_stride * 4)
-			enc_gemv(enc, la.in_qkv.kind, woff(raw_data(la.in_qkv.data)), m_b_xb, 0, m_b_qkv, 0, dim, conv_dim)
-			enc_gemv(enc, la.in_z.kind, woff(raw_data(la.in_z.data)), m_b_xb, 0, m_b_z, 0, dim, value_dim)
-			enc_gemv(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), m_b_xb, 0, m_b_b, 0, dim, n_vh)
-			enc_gemv(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), m_b_xb, 0, m_b_a, 0, dim, n_vh)
+			if g_normfuse {
+				enc_gemv_norm(enc, la.in_qkv.kind, woff(raw_data(la.in_qkv.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_qkv, 0, dim, conv_dim, eps)
+				enc_gemv_norm(enc, la.in_z.kind, woff(raw_data(la.in_z.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_z, 0, dim, value_dim, eps)
+				enc_gemv_norm(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_b, 0, dim, n_vh, eps)
+				enc_gemv_norm(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_a, 0, dim, n_vh, eps)
+			} else {
+				enc_gemv(enc, la.in_qkv.kind, woff(raw_data(la.in_qkv.data)), m_b_xb, 0, m_b_qkv, 0, dim, conv_dim)
+				enc_gemv(enc, la.in_z.kind, woff(raw_data(la.in_z.data)), m_b_xb, 0, m_b_z, 0, dim, value_dim)
+				enc_gemv(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), m_b_xb, 0, m_b_b, 0, dim, n_vh)
+				enc_gemv(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), m_b_xb, 0, m_b_a, 0, dim, n_vh)
+			}
 			// conv1d step + silu (weight is F32 in mmap)
 			if !nodelta {
 			enc->setComputePipelineState(m_pso_conv)
@@ -1884,12 +2021,17 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 		}
 
 		// shared MLP (post_attention_norm)
-		if !nonorm {
+		if !nonorm && !g_normfuse {
 			enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.ffn_norm), dim, 1, eps)
 		}
 		if !nomlp {
-			enc_gemv(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), m_b_xb, 0, m_b_hb, 0, dim, hidden_dim)
-			enc_gemv(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), m_b_xb, 0, m_b_hb2, 0, dim, hidden_dim)
+			if g_normfuse {
+				enc_gemv_norm(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb, 0, dim, hidden_dim, eps)
+				enc_gemv_norm(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb2, 0, dim, hidden_dim, eps)
+			} else {
+				enc_gemv(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), m_b_xb, 0, m_b_hb, 0, dim, hidden_dim)
+				enc_gemv(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), m_b_xb, 0, m_b_hb2, 0, dim, hidden_dim)
+			}
 			if !nosmall {
 			enc_elementwise(enc, m_pso_swiglu, m_b_hb, m_b_hb2, hidden_dim)
 		}
@@ -1898,11 +2040,15 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 		enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb, dim)
 	}
 
-	if !nonorm {
+	if !nonorm && !g_normfuse {
 		enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, eps)
 	}
 	if !noout {
-		enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)
+		if g_normfuse {
+			enc_gemv_norm(enc, w.output.kind, woff(raw_data(w.output.data)), woff(raw_data(w.output_norm)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size, eps)
+		} else {
+			enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)
+		}
 	}
 
 	enc->endEncoding()
