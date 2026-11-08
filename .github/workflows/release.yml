@@ -24,6 +24,12 @@ jobs:
           export PATH="$PATH:${ODIN_DIR%/}"      # this step too
           odin version
 
+      - name: Install numpy (MoE reference generator)
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q numpy
+          echo "/tmp/venv/bin" >> "$GITHUB_PATH"
+
       - name: Build + unit tests
         run: ./build.sh
 
