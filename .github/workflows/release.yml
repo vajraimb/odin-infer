@@ -11,10 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Odin
+      - name: Install Odin (pinned to the version this repo is built with)
         run: |
-          brew update
-          brew install odin
+          curl -sSL -o /tmp/odin.tar.gz \
+            https://github.com/odin-lang/Odin/releases/download/dev-2026-07/odin-macos-arm64-dev-2026-07.tar.gz
+          tar -xzf /tmp/odin.tar.gz -C /tmp
+          ODIN_DIR=$(echo /tmp/odin-macos-arm64-*/)
+          echo "$ODIN_DIR/bin" >> "$GITHUB_PATH"
           odin version
 
       - name: Build + unit tests
