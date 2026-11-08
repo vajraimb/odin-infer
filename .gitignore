@@ -12,3 +12,4 @@ server/serve_harness/.test-serve-old.bin
 /tokenizer
 /serve
 .tmp-cache/
+__pycache__/

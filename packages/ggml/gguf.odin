@@ -48,6 +48,8 @@ GGUF_Meta :: struct {
 	str:      string, // strings (slice into mmap)
 	arr_type: GGUF_Type,
 	arr_len:  u64,
+	arr_u64:  [dynamic]u64, // array values (numeric element types only)
+	arr_str:  [dynamic]string, // array values (string element type)
 }
 
 GGUF_Tensor :: struct {
@@ -135,7 +137,7 @@ skip_gguf_value :: proc(r: ^Reader, t: GGUF_Type) {
 read_gguf_value :: proc(r: ^Reader, t: GGUF_Type) -> GGUF_Meta {
 	m: GGUF_Meta
 	m.type = t
-	switch t {
+	#partial switch t {
 	case .UINT8, .INT8, .BOOL:
 		m.u = u64(read_u8(r))
 	case .UINT16, .INT16:
@@ -153,8 +155,32 @@ read_gguf_value :: proc(r: ^Reader, t: GGUF_Type) -> GGUF_Meta {
 	case .ARRAY:
 		m.arr_type = GGUF_Type(read_u32(r))
 		m.arr_len = read_u64(r)
-		for _ in 0 ..< m.arr_len {
-			skip_gguf_value(r, m.arr_type)
+		#partial switch m.arr_type {
+		case .UINT8, .INT8, .BOOL:
+			m.arr_u64 = make([dynamic]u64, 0, int(m.arr_len))
+			for _ in 0 ..< m.arr_len { append(&m.arr_u64, u64(read_u8(r))) }
+		case .UINT16, .INT16:
+			m.arr_u64 = make([dynamic]u64, 0, int(m.arr_len))
+			for _ in 0 ..< m.arr_len { append(&m.arr_u64, u64(read_u16(r))) }
+		case .UINT32, .INT32:
+			m.arr_u64 = make([dynamic]u64, 0, int(m.arr_len))
+			for _ in 0 ..< m.arr_len { append(&m.arr_u64, u64(read_u32(r))) }
+		case .UINT64, .INT64:
+			m.arr_u64 = make([dynamic]u64, 0, int(m.arr_len))
+			for _ in 0 ..< m.arr_len { append(&m.arr_u64, read_u64(r)) }
+		case .FLOAT32:
+			m.arr_u64 = make([dynamic]u64, 0, int(m.arr_len))
+			for _ in 0 ..< m.arr_len { append(&m.arr_u64, u64(transmute(u32)transmute(f32)read_u32(r))) }
+		case .FLOAT64:
+			m.arr_u64 = make([dynamic]u64, 0, int(m.arr_len))
+			for _ in 0 ..< m.arr_len { append(&m.arr_u64, u64(transmute(u64)transmute(f64)read_u64(r))) }
+		case .STRING:
+			m.arr_str = make([dynamic]string, 0, int(m.arr_len))
+			for _ in 0 ..< m.arr_len { append(&m.arr_str, read_gguf_string(r)) }
+		case:
+			for _ in 0 ..< m.arr_len {
+				skip_gguf_value(r, m.arr_type)
+			}
 		}
 	}
 	return m
@@ -232,6 +258,10 @@ free_gguf :: proc(g: ^GGUF_File) {
 	for &t in g.tensors {
 		delete(t.dims)
 	}
+	for _, &m in g.metadata {
+		delete(m.arr_u64)
+		delete(m.arr_str)
+	}
 	delete(g.tensors)
 	delete(g.tensor_map)
 	delete(g.metadata)
@@ -260,6 +290,15 @@ gguf_meta_str :: proc(g: ^GGUF_File, key: string) -> (string, bool) {
 		return m.str, true
 	}
 	return "", false
+}
+
+// First element of an array-typed metadata value (e.g. per-layer expert FF
+// sizes, which are uniform in practice). Returns false when absent/empty.
+gguf_meta_arr_first_u64 :: proc(g: ^GGUF_File, key: string) -> (u64, bool) {
+	if m, ok := g.metadata[key]; ok && len(m.arr_u64) > 0 {
+		return m.arr_u64[0], true
+	}
+	return 0, false
 }
 
 gguf_get_tensor :: proc(g: ^GGUF_File, name: string) -> (^GGUF_Tensor, bool) {

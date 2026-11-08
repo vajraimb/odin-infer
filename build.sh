@@ -22,4 +22,15 @@ echo "== unit tests: packages/tokenizer =="
 ( cd packages/tokenizer && odin test . -define:ODIN_TEST_THREADS=1 )
 
 echo ""
+# MoE (qwen35moe) end-to-end validation: synthetic GGUF + Python reference
+if command -v python3 >/dev/null 2>&1; then
+  python3 tools/make_moe_gguf.py >/dev/null
+  if odin run tools/moe_load_test.odin -file "${COLLECTIONS[@]}" >/dev/null 2>&1; then
+    echo "== moe_load_test: PASSED =="
+  else
+    echo "== moe_load_test: FAILED =="
+    exit 1
+  fi
+fi
+
 echo "== done: bin/odin-serve bin/odin-cli =="

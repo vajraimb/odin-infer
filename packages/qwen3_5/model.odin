@@ -6,8 +6,13 @@ import ggml "ggml:ggml"
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 
 DEFAULT_MAX_CONTEXT :: 4096
+
+// Metadata key prefixes tried in order: llama.cpp's qwen35.*, the qwen3_5.*
+// spelling, and the MoE arch's qwen35moe.*.
+META_PREFIXES :: [3]string{"qwen35.", "qwen3_5.", "qwen35moe."}
 
 // llama.cpp bakes Qwen3.5RMSNorm weights (1+w) into the GGUF directly (verified
 // empirically: output_norm.weight ~2.2, attn_norm ~1.1 — effective multipliers,
@@ -42,6 +47,14 @@ Config :: struct {
 	layer_types:       []Layer_Type,
 	n_full:            int,
 	n_linear:          int,
+	// MoE (qwen35moe)
+	is_moe:           bool,
+	n_expert:         int, // total routed experts
+	n_expert_used:    int, // top-k
+	n_ff_exp:         int, // expert FFN hidden size
+	n_ff_shexp:       int, // shared expert FFN hidden size
+	n_shexp:          int, // shared expert count (0 or 1)
+	expert_w_scale:   f32, // applied to normalized router weights
 }
 
 // A weight handle pointing into the mmap, with its quant kind.
@@ -71,6 +84,18 @@ Linear_Attn_Weights :: struct {
 	out:     Tensor, // [dim, value_dim]
 }
 
+Moe_Weights :: struct {
+	gate_inp:       []f32,  // [n_expert, dim] router weights (dequantized at load)
+	up_exps:        Tensor, // [n_ff_exp, dim, n_expert]
+	gate_exps:      Tensor, // [n_ff_exp, dim, n_expert]
+	down_exps:      Tensor, // [n_ff_exp, dim, n_expert] (same ne order; down mat is [dim, n_ff_exp] per expert)
+	gate_up_fused:  Tensor, // optional fused gate+up [2*n_ff_exp, dim, n_expert]; data == nil when separate
+	shexp_up:       []f32,  // [n_ff_shexp, dim] (dequantized)
+	shexp_gate:     []f32,  // [n_ff_shexp, dim] (dequantized)
+	shexp_down:     []f32,  // [dim, n_ff_shexp] (dequantized)
+	shexp_gate_inp: []f32,  // [dim]
+}
+
 Layer_Weights :: struct {
 	layer_type: Layer_Type,
 	attn_norm:  []f32, // [dim]   input_layernorm
@@ -80,6 +105,7 @@ Layer_Weights :: struct {
 	w1:         Tensor, // [hidden_dim, dim]  ffn gate
 	w2:         Tensor, // [dim, hidden_dim]  ffn down
 	w3:         Tensor, // [hidden_dim, dim]  ffn up
+	moe:        Moe_Weights,
 }
 
 Transformer_Weights :: struct {
@@ -222,74 +248,119 @@ tensor_dequant_to_f32 :: proc(t: ^ggml.GGUF_Tensor) -> []f32 {
 	return out
 }
 
+// Dequantize a 2D tensor [rows, cols] (ne[0] = cols, fastest dim) row by row.
+// Router and shared-expert weights are small enough to materialize as f32.
+tensor_dequant_2d :: proc(t: ^ggml.GGUF_Tensor) -> (out: []f32, rows: int) {
+	cols := int(t.dims[0])
+	ne := 1
+	for d in t.dims {
+		ne *= int(d)
+	}
+	rows = ne / cols
+	out = make([]f32, ne)
+	rb := ggml.row_byte_size(t.kind, cols)
+	for r in 0 ..< rows {
+		ggml.dequant_row(t.kind, t.data[r * rb:], cols, out[r * cols:])
+	}
+	return
+}
+
 load_config :: proc(t: ^Transformer) {
 	g := &t.gguf
 	c := &t.config
 
 	arch, _ := ggml.gguf_meta_str(g, "general.architecture")
-	if arch != "qwen35" && arch != "qwen3_5" && arch != "qwen3.5" && arch != "qwen3_5_text" {
-		fmt.eprintf("warning: architecture is '%s', expected 'qwen35'\n", arch)
+	known := arch == "qwen35" || arch == "qwen3_5" || arch == "qwen3.5" || arch == "qwen3_5_text" || arch == "qwen35moe"
+	if !known {
+		fmt.eprintf("warning: architecture is '%s', expected 'qwen35' or 'qwen35moe'\n", arch)
+	}
+	c.is_moe = arch == "qwen35moe"
+
+	// Metadata keys are tried under three prefixes: the llama.cpp qwen35.*
+	// convention, the qwen3_5.* spelling, and the MoE arch's qwen35moe.*.
+	gu :: proc(g: ^ggml.GGUF_File, suffix: string, fb: int) -> int {
+		for prefix in META_PREFIXES {
+			key := strings.concatenate({prefix, suffix}, context.temp_allocator)
+			if v, ok := ggml.gguf_meta_u64(g, key); ok {
+				return int(v)
+			}
+		}
+		return fb
+	}
+	gf :: proc(g: ^ggml.GGUF_File, suffix: string, fb: f32) -> f32 {
+		for prefix in META_PREFIXES {
+			key := strings.concatenate({prefix, suffix}, context.temp_allocator)
+			if v, ok := ggml.gguf_meta_f32(g, key); ok {
+				return v
+			}
+		}
+		return fb
 	}
 
-	// Read a u64 metadata key; fall back to the Ornith-1.0-9B default if absent.
-	// llama.cpp uses the `qwen35.*` prefix (no underscore); try `qwen3_5.*` too.
-	get_u :: proc(g: ^ggml.GGUF_File, key: string, fallback: int) -> int {
-		if v, ok := ggml.gguf_meta_u64(g, key); ok {
-			return int(v)
-		}
-		return fallback
-	}
-	get_f :: proc(g: ^ggml.GGUF_File, key: string, fallback: f32) -> f32 {
-		if v, ok := ggml.gguf_meta_f32(g, key); ok {
-			return v
-		}
-		return fallback
-	}
-	gu :: proc(g: ^ggml.GGUF_File, k0, k1: string, fb: int) -> int {
-		v, ok := ggml.gguf_meta_u64(g, k0)
-		if !ok do v, ok = ggml.gguf_meta_u64(g, k1)
-		if !ok do return fb
-		return int(v)
-	}
-
-	c.dim        = gu(g, "qwen35.embedding_length", "qwen3_5.embedding_length", 4096)
-	c.hidden_dim = gu(g, "qwen35.feed_forward_length", "qwen3_5.feed_forward_length", 12288)
-	c.n_layers   = gu(g, "qwen35.block_count", "qwen3_5.block_count", 32)
+	c.dim        = gu(g, "embedding_length", 4096)
+	c.hidden_dim = gu(g, "feed_forward_length", 12288)
+	c.n_layers   = gu(g, "block_count", 32)
 
 	// llama.cpp counts MTP/NextN layers inside block_count; this engine runs
 	// only the main trunk (MTP is ignored on inference), so subtract them.
 	// Some conversions (e.g. mradermacher Qwen3.5 GGUFs) write block_count =
 	// num_hidden_layers + nextn_predict_layers but ship only the trunk blocks.
-	mtp_layers := gu(g, "qwen35.nextn_predict_layers", "qwen3_5.nextn_predict_layers", 0)
+	mtp_layers := gu(g, "nextn_predict_layers", 0)
 	if mtp_layers > 0 && mtp_layers < c.n_layers {
 		c.n_layers -= mtp_layers
 	}
-	c.n_heads    = gu(g, "qwen35.attention.head_count", "qwen3_5.attention.head_count", 16)
-	c.n_kv_heads = gu(g, "qwen35.attention.head_count_kv", "qwen3_5.attention.head_count_kv", 4)
-	c.head_dim   = gu(g, "qwen35.attention.key_length", "qwen3_5.attention.key_length", 256)
-	c.max_seq    = gu(g, "qwen35.context_length", "qwen3_5.context_length", 262144)
+	c.n_heads    = gu(g, "attention.head_count", 16)
+	c.n_kv_heads = gu(g, "attention.head_count_kv", 4)
+	c.head_dim   = gu(g, "attention.key_length", 256)
+	c.max_seq    = gu(g, "context_length", 262144)
 
 	// Linear-attention (SSM) dims. llama.cpp names: ssm.group_count (key heads),
 	// ssm.time_step_rank (value heads), ssm.state_size (head_k_dim),
 	// ssm.inner_size (value_dim = num_v_heads * head_v_dim), ssm.conv_kernel.
-	c.lin_n_k_heads   = gu(g, "qwen35.ssm.group_count", "qwen3_5.linear_num_key_heads", 16)
-	c.lin_n_v_heads   = gu(g, "qwen35.ssm.time_step_rank", "qwen3_5.linear_num_value_heads", 32)
-	c.lin_head_k_dim  = gu(g, "qwen35.ssm.state_size", "qwen3_5.linear_key_head_dim", 128)
-	c.lin_conv_kernel = gu(g, "qwen35.ssm.conv_kernel", "qwen3_5.linear_conv_kernel_dim", 4)
-	lin_inner := gu(g, "qwen35.ssm.inner_size", "qwen3_5.linear_inner_size", c.lin_n_v_heads * 128)
+	c.lin_n_k_heads   = gu(g, "ssm.group_count", 16)
+	c.lin_n_v_heads   = gu(g, "ssm.time_step_rank", 32)
+	c.lin_head_k_dim  = gu(g, "ssm.state_size", 128)
+	c.lin_conv_kernel = gu(g, "ssm.conv_kernel", 4)
+	lin_inner := gu(g, "ssm.inner_size", c.lin_n_v_heads * 128)
 	c.lin_head_v_dim = lin_inner / max(c.lin_n_v_heads, 1)
 
-	c.full_attn_interval = gu(g, "qwen35.full_attention_interval", "qwen3_5.full_attention_interval", 4)
-	c.rope_theta = get_f(g, "qwen35.rope.freq_base", 10_000_000.0)
-	c.rms_eps    = get_f(g, "qwen35.attention.layer_norm_rms_epsilon", 1e-6)
+	c.full_attn_interval = gu(g, "full_attention_interval", 4)
+	c.rope_theta = gf(g, "rope.freq_base", 10_000_000.0)
+	c.rms_eps    = gf(g, "attention.layer_norm_rms_epsilon", 1e-6)
 	// rope.dimension_count is the partial-rotary width directly (= head_dim * partial_rotary = 64).
-	rot_dim_meta := gu(g, "qwen35.rope.dimension_count", "qwen3_5.rope.dimension_count", 0)
+	rot_dim_meta := gu(g, "rope.dimension_count", 0)
 	if rot_dim_meta > 0 {
 		c.rotary_dim = rot_dim_meta
 		c.partial_rotary = f32(c.rotary_dim) / f32(max(c.head_dim, 1))
 	} else {
-		c.partial_rotary = get_f(g, "qwen35.partial_rotary_factor", 0.25)
+		c.partial_rotary = gf(g, "partial_rotary_factor", 0.25)
 		c.rotary_dim = int(f32(c.head_dim) * c.partial_rotary)
+	}
+
+	// MoE (qwen35moe): routed + shared experts.
+	if c.is_moe {
+		c.n_expert      = gu(g, "expert_count", 0)
+		c.n_expert_used = gu(g, "expert_used_count", 0)
+		c.n_ff_shexp    = gu(g, "expert_shared_feed_forward_length", 0)
+		c.n_shexp       = gu(g, "expert_shared_count", 0)
+		c.expert_w_scale = gf(g, "expert_weights_scale", 1.0)
+		// expert_feed_forward_length may be a per-layer ARRAY (uniform in the
+		// released models); take its first element, fall back to the scalar.
+		c.n_ff_exp = 0
+		for prefix in META_PREFIXES {
+			key := strings.concatenate({prefix, "expert_feed_forward_length"}, context.temp_allocator)
+			if v, ok := ggml.gguf_meta_arr_first_u64(g, key); ok {
+				c.n_ff_exp = int(v)
+				break
+			}
+		}
+		if c.n_ff_exp <= 0 {
+			c.n_ff_exp = gu(g, "expert_feed_forward_length", c.hidden_dim)
+		}
+		if c.n_expert <= 0 || c.n_expert_used <= 0 || c.n_expert_used > c.n_expert {
+			fmt.eprintfln("qwen35moe: bad expert counts (n_expert=%d used=%d)", c.n_expert, c.n_expert_used)
+			os.exit(1)
+		}
 	}
 
 	// Build layer_types from the interval: full attention at indices
@@ -345,9 +416,29 @@ memory_map_weights :: proc(t: ^Transformer) {
 
 		lw.attn_norm = tensor_as_f32(require_tensor(g, norm_name(buf[:], l, "attn_norm.weight")))
 		lw.ffn_norm = tensor_as_f32(require_tensor(g, norm_name(buf[:], l, "post_attention_norm.weight")))
-		lw.w1 = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_gate.weight")))
-		lw.w2 = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_down.weight")))
-		lw.w3 = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_up.weight")))
+		if c.is_moe {
+			// qwen35moe: routed experts + optionally one gated shared expert.
+			mw := &lw.moe
+			mw.gate_inp, _ = tensor_dequant_2d(require_tensor(g, norm_name(buf[:], l, "ffn_gate_inp.weight")))
+			mw.up_exps = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_up_exps.weight")))
+			mw.gate_exps = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_gate_exps.weight")))
+			mw.down_exps = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_down_exps.weight")))
+			if t, ok := ggml.gguf_get_tensor(g, norm_name(buf[:], l, "ffn_gate_up_exps.weight")); ok {
+				mw.gate_up_fused = tensor_handle(t)
+			}
+			if t, ok := ggml.gguf_get_tensor(g, norm_name(buf[:], l, "ffn_up_shexp.weight")); ok {
+				// shared expert present (probe tensors: some conversions omit
+				// the expert_shared_count metadata key)
+				mw.shexp_up, _ = tensor_dequant_2d(t)
+				mw.shexp_gate, _ = tensor_dequant_2d(require_tensor(g, norm_name(buf[:], l, "ffn_gate_shexp.weight")))
+				mw.shexp_down, _ = tensor_dequant_2d(require_tensor(g, norm_name(buf[:], l, "ffn_down_shexp.weight")))
+				mw.shexp_gate_inp = tensor_as_f32(require_tensor(g, norm_name(buf[:], l, "ffn_gate_inp_shexp.weight")))
+			}
+		} else {
+			lw.w1 = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_gate.weight")))
+			lw.w2 = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_down.weight")))
+			lw.w3 = tensor_handle(require_tensor(g, norm_name(buf[:], l, "ffn_up.weight")))
+		}
 
 		switch lw.layer_type {
 		case .Full_Attention:

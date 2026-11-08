@@ -95,5 +95,8 @@ months of work and does not serve the Air positioning.
 4. ~~memory budget mode~~ ✅ / 内存预算模式
 5. ~~zero-compile release pipeline~~ ✅ — GitHub Actions builds and publishes
    `odin-serve` / `odin-cli` on every `v*` tag. 零编译发布管线（tag 触发 Release）。
-6. (optional) perf round 2: needs full Xcode (`xcrun metal` + Instruments GPU
+6. ~~Qwen3.5-MoE CPU support~~ ✅（35B-A3B 系加载器 + softmax top-k 路由 +
+   共享专家，合成 GGUF 对拍逐位一致；Metal MoE 内核与 24GB 机实测待做）/
+   Qwen3.5-MoE CPU 支持已上线（Metal 内核待做）
+7. (optional) perf round 2: needs full Xcode (`xcrun metal` + Instruments GPU
    counters) to chase the last ~11% decode gap. （可选）性能再攻坚：需完整 Xcode。

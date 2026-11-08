@@ -78,6 +78,9 @@ residency, cooled machine. M3 / 16GB，heretic Q4_K_M，单引擎驻留、冷却
 - **Qwen3.5 hybrid attention**（Ornith / heretic family）：text-only, 248k vocab.
   9B 实测验收；同架构不同尺寸靠 GGUF 元数据自动适配（MTP 感知加载器）。
   文本，248k 词表；9B 实测验收。
+- **Qwen3.5-MoE**（35B-A3B / 122B-A10B / 397B-A17B）：✅ 已支持，CPU 路径
+  （softmax top-k 路由 + 共享专家 sigmoid 门控，逐位对拍验证）；Metal MoE
+  内核待实现（进度见 packages/qwen3_5/README.md）。
 - No MoE / multimodal / Qwen3-or-older / other architectures — a narrow scope,
   on purpose. 不支持 MoE / 多模态 / Qwen3 及更早 / 其他架构——窄定位是特性不是缺陷。
 - The repo still ships the Qwen3-dense engine (`packages/infer`) for the CLI's

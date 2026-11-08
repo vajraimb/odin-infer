@@ -108,6 +108,22 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
    compiled artifacts `tokenizer`/`serve` were committed by mistake once and
    are now gitignored via `/tokenizer`, `/serve`. / 不要提交二进制：构建产物在 `bin/`（已 ignore）。
 
+## MoE (qwen35moe) / MoE 支持
+
+- Supported on the CPU path (Metal MoE kernels are a TODO; engine_load falls
+  back to CPU with a warning). 已支持 CPU 路径（Metal MoE 内核为 TODO，加载时自动回退 CPU 并告警）。
+- Expert tensor layout (verified against the real unsloth 35B-A3B GGUF header):
+  `ffn_gate_inp` [dim, n_expert], `ffn_up_exps`/`ffn_gate_exps`
+  [dim, n_ff_exp, n_expert], `ffn_down_exps` [n_ff_exp, dim, n_expert] —
+  ne0 is the contraction dim; quantization granularity = one ne0 row.
+  专家张量布局（已对真实 35B-A3B 头部验证）：ne0 是收缩维，量化粒度 = 一行 ne0。
+- Routing math mirrors llama.cpp build_moe_ffn (softmax → top-k → renormalize
+  with divisor clamp 6.1035e-5 → expert_weights_scale → silu(gate)×up per
+  expert → shared expert with sigmoid gate). 路由数学与 llama.cpp 一致。
+- Validation: `tools/make_moe_gguf.py` writes a tiny all-F32 MoE GGUF +
+  Python reference; `tools/moe_load_test.odin` compares logits (currently
+  bit-exact). Run via `./build.sh`. 验证：合成 GGUF + Python 参考对拍（当前逐位一致），./build.sh 自动执行。
+
 ## Verified traps (do not re-learn) / 已验证的坑（不要再踩）
 
 - GEMV kernel shape: on this M3 the optimum is 256 threads / 32 rows / 8 lanes;
@@ -119,6 +135,11 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 - Odin syntax gotchas: array literals cannot appear directly in a for loop
   (hoist to a named variable); taking the address of a proc parameter needs a
   local copy first; `os.to_stream(f)` for writing file streams. / Odin 语法小坑：for 循环里数组字面量要先命名变量；proc 参数取地址先拷局部；`os.to_stream(f)` 写文件流。
+- MoE SwiGLU: silu applies to the GATE projection (silu(gate)×up), not up —
+  symmetric test data hides this bug. / MoE SwiGLU：silu 作用于 gate 投影；对称测试数据会掩盖此错。
+- GGUF tensor dims are ggml ne order (ne0 fastest) = REVERSED of numpy shape;
+  hand-written GGUF writers must reverse dims and pad the data section to
+  32 bytes. / GGUF 维度是 ggml ne 序（ne0 最快）= numpy shape 的反转；手写 GGUF 写入器要反转 dims 且数据段 32 字节对齐。
 
 ## Post-change self-check / 验证清单（改动后自检）
 

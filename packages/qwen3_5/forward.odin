@@ -28,7 +28,6 @@ forward :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	}
 
 	get_embedding_row(&w.token_embedding, token, p.dim, s.x)
-
 	for l in 0 ..< p.n_layers {
 		switch p.layer_types[l] {
 		case .Full_Attention:
@@ -130,8 +129,11 @@ forward_full_layer :: proc(t: ^Transformer, l: int, pos: int) {
 	for i in 0 ..< dim {
 		s.x[i] += s.xb2[i]
 	}
-
-	mlp_layer(t, l)
+	if p.is_moe {
+		moe_ffn_layer(t, l)
+	} else {
+		mlp_layer(t, l)
+	}
 }
 
 forward_linear_layer :: proc(t: ^Transformer, l: int, pos: int) {
@@ -221,7 +223,11 @@ forward_linear_layer :: proc(t: ^Transformer, l: int, pos: int) {
 		s.x[i] += s.xb2[i]
 	}
 
-	mlp_layer(t, l)
+	if p.is_moe {
+		moe_ffn_layer(t, l)
+	} else {
+		mlp_layer(t, l)
+	}
 }
 
 mlp_layer :: proc(t: ^Transformer, l: int) {

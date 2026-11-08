@@ -21,9 +21,15 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 	// Skip CPU Run_State allocation when Metal is requested — forward_gpu uses
 	// Metal buffers exclusively, so the CPU KV/conv/recurrent state would be
 	// dead memory (up to GBs at large -c).
-	build_transformer(&e.transformer, path, opts.max_ctx, skip_cpu_state = opts.use_metal)
+	use_metal := opts.use_metal
+	build_transformer(&e.transformer, path, opts.max_ctx, skip_cpu_state = use_metal)
+	if e.transformer.config.is_moe && use_metal {
+		fmt.eprintln("qwen35moe: Metal MoE kernels not implemented yet; falling back to CPU")
+		use_metal = false
+		malloc_run_state(&e.transformer.state, e.transformer.config)
+	}
 
-	if opts.use_metal {
+	if use_metal {
 		when ODIN_OS == .Darwin {
 			e.metal_ready = metal_init(&e.transformer, path)
 			if !e.metal_ready {
