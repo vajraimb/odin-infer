@@ -1,5 +1,11 @@
 # Changelog · 更新日志
 
+## Unreleased
+
+- Full quant dequant coverage: Q2_K/Q3_K/Q5_K/Q8_K + IQ family (IQ1_S/IQ1_M/
+  IQ2_XXS/XS/S/IQ3_XXS/S/IQ4_NL/XS), bit-exact vs llama.cpp. Unsloth Dynamic
+  GGUFs load — Qwen3.8-27B-UD-IQ2_XXS validated end-to-end (CPU).
+
 All notable changes are recorded here. Format: keep it human-readable.
 
 ## v0.2.0 — 2026-11-08

@@ -25,20 +25,31 @@ GGUF_Type :: enum u32 {
 }
 
 GGML_Type :: enum u32 {
-	F32  = 0,
-	F16  = 1,
-	Q4_0 = 2,
-	Q4_1 = 3,
-	Q5_0 = 6,
-	Q5_1 = 7,
-	Q8_0 = 8,
-	Q8_1 = 9,
-	Q2_K = 10,
-	Q3_K = 11,
-	Q4_K = 12,
-	Q5_K = 13,
-	Q6_K = 14,
-	Q8_K = 15,
+	F32      = 0,
+	F16      = 1,
+	Q4_0     = 2,
+	Q4_1     = 3,
+	// 4, 5 removed (Q4_2, Q4_3)
+	Q5_0     = 6,
+	Q5_1     = 7,
+	Q8_0     = 8,
+	Q8_1     = 9,
+	Q2_K     = 10,
+	Q3_K     = 11,
+	Q4_K     = 12,
+	Q5_K     = 13,
+	Q6_K     = 14,
+	Q8_K     = 15,
+	IQ2_XXS  = 16,
+	IQ2_XS   = 17,
+	IQ3_XXS  = 18,
+	IQ1_S    = 19,
+	IQ4_NL   = 20,
+	IQ3_S    = 21,
+	IQ2_S    = 22,
+	IQ4_XS   = 23,
+	// 24..28: I8/I16/I32/I64/F64 (not block-quantized)
+	IQ1_M    = 29,
 }
 
 GGUF_Meta :: struct {

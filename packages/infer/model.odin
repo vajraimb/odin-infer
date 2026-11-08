@@ -262,7 +262,7 @@ weight_type_label :: proc(g: ^ggml.GGUF_File) -> string {
 			return "Q4_K"
 		case .Q6_K:
 			return "Q6_K"
-		case .Q8_1, .Q2_K, .Q3_K, .Q5_K, .Q8_K:
+		case .Q8_1, .Q2_K, .Q3_K, .Q5_K, .Q8_K, .IQ2_XXS, .IQ2_XS, .IQ3_XXS, .IQ1_S, .IQ4_NL, .IQ3_S, .IQ2_S, .IQ4_XS, .IQ1_M:
 			return "mixed"
 		}
 	}
