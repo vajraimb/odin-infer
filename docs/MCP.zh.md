@@ -31,7 +31,7 @@ bin/odin-serve <model.gguf> --mcp --metal [--max-ctx 4096]
 
 ```sh
 claude mcp add odin -- \
-  /path/to/odin-infer/bin/odin-serve \
+  /path/to/odinfer/bin/odin-serve \
   /path/to/model.gguf --mcp --metal
 ```
 
@@ -45,7 +45,7 @@ claude mcp add odin -- \
 {
   "mcpServers": {
     "odin-infer": {
-      "command": "/path/to/odin-infer/bin/odin-serve",
+      "command": "/path/to/odinfer/bin/odin-serve",
       "args": ["/path/to/model.gguf", "--mcp", "--metal"]
     }
   }

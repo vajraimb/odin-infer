@@ -23,7 +23,7 @@
 
 2026-11 实测于 M3：
 
-| 维度 | odin-infer | llama.cpp/ollama |
+| 维度 | Odinfer | llama.cpp/ollama |
 |---|---|---|
 | 解码吞吐（9B Q4） | 13.3 tok/s (0.89×) | 14.9 tok/s |
 | 首 token | **73 ms** | ~90 ms |
@@ -57,7 +57,7 @@
 
 ## 7. 仓库整合（2026-11-08 完成）
 
-- odin-infer 成为唯一仓库：`packages/` + `server/` + `cli/` + `tools/` +
+- Odinfer 成为唯一仓库：`packages/` + `server/` + `cli/` + `tools/` +
   `docs/` + `models/`。
 - **odin-infer-mac（GitHub）已归档**：其 CLI 并入 `cli/`，旧仓库留指针
   README。

@@ -27,7 +27,7 @@ agent-readiness — not peak throughput.
 
 Measured on M3, 2026-11:
 
-| Dimension | odin-infer | llama.cpp/ollama |
+| Dimension | Odinfer | llama.cpp/ollama |
 |---|---|---|
 | Decode throughput (9B Q4) | 13.3 tok/s (0.89×) | 14.9 tok/s |
 | First token | **73 ms** | ~90 ms |
@@ -69,7 +69,7 @@ months of work and does not serve the Air positioning.
 
 ## 7. Repo consolidation (done 2026-11-08)
 
-- odin-infer is now the single repo: `packages/` + `server/` + `cli/` +
+- Odinfer is now the single repo: `packages/` + `server/` + `cli/` +
   `tools/` + `docs/` + `models/`.
 - **odin-infer-mac (GitHub) is retired**: its CLI merged into `cli/`; the old
   repo is archived with a pointer README.

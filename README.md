@@ -1,4 +1,4 @@
-# odin-infer
+# Odinfer
 
 **A high-efficiency local inference engine for Qwen3.5-class models on Apple Silicon (MacBook Air first).**
 
@@ -11,9 +11,9 @@ no llama.cpp dependency, 73 ms first token, native MCP, agent-ready.
 
 ---
 
-## Why odin-infer
+## Why Odinfer
 
-| Your need | odin-infer's answer |
+| Your need | Odinfer's answer |
 |---|---|
 | Run local models on an Air without heat issues | Low-thread kernels tuned for passive cooling; memory budget shown at startup ([thermal protocol](docs/THERMAL.md)) |
 | Serve models to Cursor / Claude Code / pie | `--mcp` turns it into an MCP server; `odin.chat` / `odin.models` out of the box ([docs/MCP.md](docs/MCP.md)) |
@@ -26,8 +26,8 @@ no llama.cpp dependency, 73 ms first token, native MCP, agent-ready.
 Apple Silicon (M1–M4):
 
 ```sh
-curl -L -o odin-serve https://github.com/vajraimb/odin-infer/releases/latest/download/odin-serve
-curl -L -o odin-cli   https://github.com/vajraimb/odin-infer/releases/latest/download/odin-cli
+curl -L -o odin-serve https://github.com/vajraimb/odinfer/releases/latest/download/odin-serve
+curl -L -o odin-cli   https://github.com/vajraimb/odinfer/releases/latest/download/odin-cli
 chmod +x odin-serve odin-cli
 xattr -cr odin-serve odin-cli   # only if macOS blocks the unsigned binaries
 ./odin-serve ./models/<your-model>.gguf --metal --port 9748   # http://127.0.0.1:9748
@@ -42,7 +42,7 @@ claude mcp add odin -- /path/to/odin-serve /path/to/model.gguf --mcp --metal
 Build from source (needs the [Odin](https://odin-lang.org) toolchain):
 
 ```sh
-git clone https://github.com/vajraimb/odin-infer && cd odin-infer
+git clone https://github.com/vajraimb/odinfer && cd odinfer
 ./build.sh                                  # build + unit tests, produces bin/odin-serve bin/odin-cli
 MODEL=./models/<your-model>.gguf ./serve.sh # http://127.0.0.1:9748
 ```
@@ -55,7 +55,7 @@ MODEL=./models/<your-model>.gguf ./serve.sh # http://127.0.0.1:9748
 M3 / 16 GB, DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic (Q4_K_M), solo
 residency, cooled machine:
 
-| Metric | odin-infer | ollama / llama.cpp |
+| Metric | Odinfer | ollama / llama.cpp |
 |---|---|---|
 | Decode throughput (EN) | 13.3 tok/s（0.89×） | 14.9 tok/s |
 | Wall, 128-token reply | 10.3–10.5 s | 7.1–9.1 s |
@@ -123,7 +123,7 @@ docs/       MCP · THERMAL · MEMORY · troubleshooting notes
 - [CONTRIBUTING.md](CONTRIBUTING.md) — ground rules & PR checklist ([中文](CONTRIBUTING.zh.md))
 - [SECURITY.md](SECURITY.md) — reporting vulnerabilities
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-- Issues and PRs: [GitHub](https://github.com/vajraimb/odin-infer)
+- Issues and PRs: [GitHub](https://github.com/vajraimb/odinfer)
 
 ## License
 

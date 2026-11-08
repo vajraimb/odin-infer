@@ -2059,7 +2059,7 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 	sse_write(client, "response.created",
 		concat_json(
 			`{"type":"response.created","response":{`,
-			`"id":"`, resp_id, `","object":"response","status":"in_progress","model":"odin-infer"}}`))
+			`"id":"`, resp_id, `","object":"response","status":"in_progress","model":"odinfer"}}`))
 	sse_write(client, "response.output_item.added",
 		concat_json(
 			`{"type":"response.output_item.added","output_index":0,"item":`,
@@ -2130,7 +2130,7 @@ handle_openai_responses_stream :: proc(client: net.TCP_Socket, body: string) {
 		concat_json(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":`, json_quote(final_text), `,"annotations":[]}]}}`))
 	sse_write(client, "response.completed",
 		concat_json(
-			`{"type":"response.completed","response":{"id":"`, resp_id, `","object":"response","status":"completed","model":"odin-infer","output":[{"id":"msg_0","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":`, json_quote(final_text), `,"annotations":[]}]}],"usage":{"input_tokens":`, fmt.tprintf("%d", len(encoded)), `,"output_tokens":`, fmt.tprintf("%d", gen), `,"total_tokens":`, fmt.tprintf("%d", len(encoded) + gen), `}}}`))
+			`{"type":"response.completed","response":{"id":"`, resp_id, `","object":"response","status":"completed","model":"odinfer","output":[{"id":"msg_0","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":`, json_quote(final_text), `,"annotations":[]}]}],"usage":{"input_tokens":`, fmt.tprintf("%d", len(encoded)), `,"output_tokens":`, fmt.tprintf("%d", gen), `,"total_tokens":`, fmt.tprintf("%d", len(encoded) + gen), `}}}`))
 
 	sse_end(client)
 	fmt.eprintfln("responses: %d in / %d out", len(encoded), gen)
@@ -2573,7 +2573,7 @@ handle_openai_chat :: proc(body: string) -> string {
 	strings.write_string(&out, fmt.tprintf(`"id":"chatcmpl-%d",`, t_start))
 	strings.write_string(&out, `"object":"chat.completion",`)
 	strings.write_string(&out, fmt.tprintf(`"created":%d,`, t_start / 1000))
-	strings.write_string(&out, `"model":"odin-infer",`)
+	strings.write_string(&out, `"model":"odinfer",`)
 	strings.write_string(&out, `"choices":[{`)
 	strings.write_string(&out, `"index":0,`)
 	strings.write_string(&out, `"message":{"role":"assistant","content":`)

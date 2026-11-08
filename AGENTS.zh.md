@@ -148,5 +148,5 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 python3 server/serve_harness/test_mcp.py            # MCP 握手全过
 MODEL=./models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf ./serve.sh &
 curl -s http://127.0.0.1:9748/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"odin-infer","messages":[{"role":"user","content":"What is 2+2? Answer in one word."}],"max_tokens":8}'
+  -d '{"model":"odinfer","messages":[{"role":"user","content":"What is 2+2? Answer in one word."}],"max_tokens":8}'
 # 期望：content 为 "4"，stderr 有 mem: 行与（首次）tune: 行

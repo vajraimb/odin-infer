@@ -1,4 +1,4 @@
-# odin-infer
+# Odinfer
 
 **Apple Silicon（MacBook Air 优先）上 Qwen3.5 级模型的高效本地推理引擎。**
 
@@ -13,7 +13,7 @@ llama.cpp 依赖，首 token 73ms，原生 MCP，agent 就绪。
 
 ## 为什么是它
 
-| 你的需求 | odin-infer 的回答 |
+| 你的需求 | Odinfer 的回答 |
 |---|---|
 | 在 Air 上跑本地模型，不烫不卡 | 低线程内核专为被动散热设计，内存预算启动即显（[热测试协议](docs/THERMAL.zh.md)） |
 | 给 Cursor / Claude Code / pie 供模型 | `--mcp` 一键变 MCP 服务端，`odin.chat` / `odin.models` 开箱即用（[docs/MCP.zh.md](docs/MCP.zh.md)） |
@@ -26,8 +26,8 @@ llama.cpp 依赖，首 token 73ms，原生 MCP，agent 就绪。
 Apple Silicon（M1–M4）：
 
 ```sh
-curl -L -o odin-serve https://github.com/vajraimb/odin-infer/releases/latest/download/odin-serve
-curl -L -o odin-cli   https://github.com/vajraimb/odin-infer/releases/latest/download/odin-cli
+curl -L -o odin-serve https://github.com/vajraimb/odinfer/releases/latest/download/odin-serve
+curl -L -o odin-cli   https://github.com/vajraimb/odinfer/releases/latest/download/odin-cli
 chmod +x odin-serve odin-cli
 xattr -cr odin-serve odin-cli   # 仅当 macOS 拦截未签名二进制时需要
 ./odin-serve ./models/<你的模型>.gguf --metal --port 9748   # http://127.0.0.1:9748
@@ -42,7 +42,7 @@ claude mcp add odin -- /path/to/odin-serve /path/to/model.gguf --mcp --metal
 从源码构建（需要 [Odin](https://odin-lang.org) 工具链）：
 
 ```sh
-git clone https://github.com/vajraimb/odin-infer && cd odin-infer
+git clone https://github.com/vajraimb/odinfer && cd odinfer
 ./build.sh                                  # 构建 + 单测，产出 bin/odin-serve bin/odin-cli
 MODEL=./models/<你的模型>.gguf ./serve.sh   # http://127.0.0.1:9748
 ```
@@ -55,7 +55,7 @@ MODEL=./models/<你的模型>.gguf ./serve.sh   # http://127.0.0.1:9748
 M3 / 16GB，DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic（Q4_K_M），单引擎
 驻留、冷却后：
 
-| 指标 | odin-infer | ollama / llama.cpp |
+| 指标 | Odinfer | ollama / llama.cpp |
 |---|---|---|
 | 解码吞吐（EN） | 13.3 tok/s（0.89×） | 14.9 tok/s |
 | 128-token 回复墙钟 | 10.3–10.5 s | 7.1–9.1 s |
@@ -117,7 +117,7 @@ docs/       MCP · THERMAL · MEMORY · 排障记录
 - [CONTRIBUTING.zh.md](CONTRIBUTING.zh.md) —— 贡献规则与 PR 清单（[英文](CONTRIBUTING.md)）
 - [SECURITY.md](SECURITY.md) —— 漏洞报告
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-- Issues 与 PR：[GitHub](https://github.com/vajraimb/odin-infer)
+- Issues 与 PR：[GitHub](https://github.com/vajraimb/odinfer)
 
 ## License
 

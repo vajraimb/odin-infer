@@ -32,7 +32,7 @@ prefill → sampling); output is MCP `text` content.
 
 ```sh
 claude mcp add odin -- \
-  /path/to/odin-infer/bin/odin-serve \
+  /path/to/odinfer/bin/odin-serve \
   /path/to/model.gguf --mcp --metal
 ```
 
@@ -46,7 +46,7 @@ Then call the `odin.chat` / `odin.models` tools from a session.
 {
   "mcpServers": {
     "odin-infer": {
-      "command": "/path/to/odin-infer/bin/odin-serve",
+      "command": "/path/to/odinfer/bin/odin-serve",
       "args": ["/path/to/model.gguf", "--mcp", "--metal"]
     }
   }
