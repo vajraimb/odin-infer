@@ -21,6 +21,23 @@ Apple Silicon 上的 Qwen3.5 级推理引擎（纯 Odin，无 Python 运行时�
   自动 `gh release create` 发布 bin/odin-serve + bin/odin-cli）。
 - 改发布流程后：push tag 触发；`gh run watch` 观察。
 
+## 安装与运行（零编译——agent 先读这里）
+
+无需工具链：安装脚本下载 release 二进制（可选加模型）并打印可直接运行的命令。
+
+```sh
+bash scripts/install.sh --model moe   # 二进制 + 524MB MoE 测试模型
+export PATH="$PATH:$HOME/.odinfer/bin"
+odin-serve "$HOME/.odinfer/models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf" --mcp --metal
+```
+
+- `--model qwen9b` 改下载 5.6GB 的 heretic 模型。
+- `--prefix` / `MODEL_DIR` 覆盖安装路径。
+- 手动等价做法：curl 下载
+  `https://github.com/vajraimb/odinfer/releases/latest/download/` 下的两个二进制。
+
+下面的源码构建仅供开发用。
+
 ## 构建与测试（必跑顺序）
 
 ```sh

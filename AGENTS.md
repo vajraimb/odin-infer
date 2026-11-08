@@ -23,6 +23,24 @@ CLI only; do NOT extend it in the product docs. Shared: `packages/ggml`
   `gh release create` publishing bin/odin-serve + bin/odin-cli).
 - After changing the release flow: push a tag and watch with `gh run watch`.
 
+## Install & run (zero compile — agents read this first)
+
+No toolchain needed: the installer downloads the release binaries (and
+optionally a model) and prints ready-to-run commands.
+
+```sh
+bash scripts/install.sh --model moe   # binaries + 524 MB MoE test model
+export PATH="$PATH:$HOME/.odinfer/bin"
+odin-serve "$HOME/.odinfer/models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf" --mcp --metal
+```
+
+- `--model qwen9b` downloads the 5.6 GB heretic model instead.
+- `--prefix` / `MODEL_DIR` override install paths.
+- Manual equivalent (no script): curl the two binaries from
+  `https://github.com/vajraimb/odinfer/releases/latest/download/{odin-serve,odin-cli}`.
+
+The source build below is for development only.
+
 ## Build & test (run in this order)
 
 ```sh
