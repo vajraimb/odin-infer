@@ -1,3 +1,9 @@
+<!--
+Internal engineering log, kept in its original language (中文内部工程记录，保留原文).
+The user-facing documentation (README / AGENTS / POSITIONING / docs/MCP·MEMORY·THERMAL) is bilingual.
+面向用户的文档（README/AGENTS/POSITIONING/docs 下三篇）为中英双语；本文件为内部工程日志。
+-->
+
 # Prefix State Snapshot 计划（Step 0–4）
 
 > 来源：NNUE → odin-infer 迁移讨论（稀疏状态检查点 / Finny Tables 思想在 GDN 递归状态上的对应）。

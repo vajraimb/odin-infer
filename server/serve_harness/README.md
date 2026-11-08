@@ -1,11 +1,11 @@
-# serve_harness
+# serve_harness · odin-serve 服务端
 
 HTTP dashboard + JSON chat API for `odin-infer`. Loads a Qwen3.5 engine and
 serves a single-page browser UI plus a minimal REST API for chat.
 
 Inspired by colibri's `coli web` (live token metrics, browser-based chat).
 
-## Run
+## Run / 运行
 
 ```sh
 odin run server/serve_harness/serve.odin -file -- \
@@ -17,7 +17,7 @@ odin run server/serve_harness/serve.odin -file -- \
 
 Then open `http://127.0.0.1:9748` in a browser.
 
-## CLI flags
+## CLI flags / CLI 参数
 
 | Flag           | Default | Notes                                             |
 |----------------|---------|---------------------------------------------------|
@@ -25,7 +25,7 @@ Then open `http://127.0.0.1:9748` in a browser.
 | `--metal`      | off     | Use Metal backend (otherwise CPU)                 |
 | `--max-ctx N`  | 4096    | Caps KV cache memory                              |
 
-## Endpoints
+## Endpoints / 端点
 
 | Method | Path                       | Returns                                                |
 |--------|----------------------------|--------------------------------------------------------|
@@ -36,7 +36,7 @@ Then open `http://127.0.0.1:9748` in a browser.
 | POST   | `/v1/chat/completions`     | **OpenAI-compatible** — for any agent client (pie, Cline, etc.) |
 | GET    | `/v1/models`               | OpenAI-compatible model list                           |
 
-## OpenAI-compatible API
+## OpenAI-compatible API / OpenAI 兼容接口
 
 `/v1/chat/completions` accepts the standard OpenAI Chat Completions request
 format and returns the standard response shape. Use it with any OpenAI client:
@@ -70,7 +70,7 @@ Response:
 }
 ```
 
-### Configuring pie / Cline / other OpenAI clients
+### Configuring pie / Cline / other OpenAI clients / 配置 pie / Cline 等 OpenAI 客户端
 
 Point your client at the local server:
 

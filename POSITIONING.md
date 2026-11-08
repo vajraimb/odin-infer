@@ -1,76 +1,94 @@
-# POSITIONING.md — odin-infer 定位与产品路线
+# POSITIONING.md — 定位与产品路线 / Positioning & product roadmap
 
-> 决策记录：2026-11-08。不做 llama.cpp 式的全架构泛化，只做
-> **Apple Silicon（MacBook Air 优先）上 Qwen3/Qwen3.5 的高效本地推理引擎**。
+> Decision record, 2026-11-08. 决策记录：2026-11-08。
+> We deliberately do NOT chase llama.cpp-style generalization across all
+> architectures. The scope is: **a high-efficiency local inference engine for
+> Qwen3/Qwen3.5 on Apple Silicon (MacBook Air first).**
+> 不做 llama.cpp 式的全架构泛化，只做 Apple Silicon（MacBook Air 优先）上
+> Qwen3/Qwen3.5 的高效本地推理引擎。
 
-## 一、定位一句话
+## 1. One-line positioning / 定位一句话
 
-**个人 Mac 上、给 agent/工具用的、开箱即用的 Qwen 本地推理引擎** ——
-卖点是功耗/内存/交互延迟与 agent 就绪度，不是纸面峰值吞吐。
+**An out-of-the-box local Qwen engine for agents and tools on personal Macs.**
+The selling points are power/memory/interactive latency and agent-readiness —
+not peak throughput.
+**个人 Mac 上、给 agent/工具用的、开箱即用的 Qwen 本地推理引擎**——卖点是功耗/内存/交互延迟与 agent 就绪度，不是纸面峰值吞吐。
 
-## 二、目标硬件与用户
+## 2. Target hardware & users / 目标硬件与用户
 
-- **MacBook Air（M1–M4）**：无风扇（持续负载热降频）、8–24GB 统一内存、
-  用户期望零配置
-- 用户画像：在个人 Mac 上跑 agent 生态（Cursor / Claude Code / pie / 自定义
-  MCP）的人，要隐私、离线、低延迟的本地模型
+- **MacBook Air (M1–M4)** / MacBook Air（M1–M4）：fanless (sustained load
+  throttles), 8–24 GB unified memory, zero-config expectations / 无风扇（持续负载热降频）、8–24GB 统一内存、用户期望零配置
+- Users: people running agent ecosystems (Cursor / Claude Code / pie / custom
+  MCP) on a personal Mac, wanting privacy, offline, low-latency local models.
+  用户画像：在个人 Mac 上跑 agent 生态的人，要隐私、离线、低延迟的本地模型。
 
-## 三、差异化（vs llama.cpp/ollama，2026-11 实测于 M3）
+## 3. Differentiation vs llama.cpp/ollama / 差异化（vs llama.cpp/ollama）
 
-| 维度 | odin-infer | llama.cpp/ollama |
-|------|-----------|------------------|
-| 解码吞吐（9B Q4） | 13.3 tok/s（0.89×） | 14.9 tok/s |
-| 首 token | **73ms** | ~90ms |
-| 二进制 | **7.1MB 单文件** | 大二进制 + 运行时依赖 |
-| agent 就绪 | 原生 tool-call grammar + 前缀缓存 + OpenAI/Ollama 双协议 | 通用但无内置 grammar |
-| 功耗倾向 | 8-lane 低线程内核（Air 被动散热友好，待热测试验证） | 峰值吞吐导向 |
+Measured on M3, 2026-11. 2026-11 实测于 M3：
 
-## 四、产品形态（一仓库三交付物）
+| Dimension / 维度 | odin-infer | llama.cpp/ollama |
+|---|---|---|
+| Decode throughput (9B Q4) / 解码吞吐 | 13.3 tok/s (0.89×) | 14.9 tok/s |
+| First token / 首 token | **73 ms** | ~90 ms |
+| Binary / 二进制 | **7.1 MB single file** / 7.1MB 单文件 | large binary + runtime deps / 大二进制 + 运行时依赖 |
+| Agent readiness / agent 就绪 | native tool-call grammar + prefix cache + OpenAI/Ollama/MCP / 原生 tool-call grammar + 前缀缓存 + 三协议 | generic, no built-in grammar / 通用但无内置 grammar |
+| Power profile / 功耗倾向 | 8-lane low-thread kernels (passive-cooling friendly; pending thermal test) / 8-lane 低线程内核（待热测试验证） | peak-throughput oriented / 峰值吞吐导向 |
 
-1. **odin-serve（主形态）**：HTTP 服务端，OpenAI 兼容 + Ollama 兼容 +
-   dashboard。**MCP 适配层（stdio/SSE）为下一优先项** —— 本机 agent 生态
-   （Cursor worker、pie、memory-mcp）是明确的消费场景，且 serve_harness 已
-   内置 tool-call grammar（`TOOLCALL_GRAMMAR` + `parse_tool_calls`），MCP 只是
-   协议适配。
-2. **odin-cli（辅形态）**：终端聊天，双引擎自动识别。
-3. **库（嵌入形态）**：`-collection` 接入其他 Odin 项目。
+## 4. Product forms (one repo, three artifacts) / 产品形态（一仓库三交付物）
 
-**原生 GUI app 不做**：dashboard 已覆盖轻度使用；原生壳是月级投入且不服务
-Air 定位。
+1. **odin-serve (primary / 主形态)**：HTTP server — OpenAI-compatible +
+   Ollama-compatible + dashboard. **MCP adapter (stdio) shipped; SSE/streamable
+   HTTP is a follow-up.** HTTP 服务端；MCP 适配层（stdio）已上线。
+2. **odin-cli (secondary / 辅形态)**：terminal chat, dual-engine auto-detection.
+   终端聊天，双引擎自动识别。
+3. **library (embed form / 嵌入形态)**：`-collection` for other Odin projects.
+   `-collection` 接入其他 Odin 项目。
 
-## 五、对标口径（必须遵守）
+**No native GUI app**: the dashboard covers casual use; a native shell is
+months of work and does not serve the Air positioning.
+**原生 GUI app 不做**：dashboard 已覆盖轻度使用；原生壳不服务 Air 定位。
 
-- 同模型同量化（默认 heretic Q4_K_M）、同 prompt、**单引擎驻留**
-- 冷却后各 3 轮取均值；报告 tps / 墙钟 / ttft / prefill 四项
-- 16GB 机器双引擎共存会互相拖垮 ~2×，禁止作为对比数据
+## 5. Benchmark protocol / 对标口径（必须遵守）
 
-## 六、Air 专项待办
+- Same model & quantization (default heretic Q4_K_M), same prompt, **solo
+  residency** / 同模型同量化、同 prompt、单引擎驻留
+- Cooled machine, 3 runs each, average; report tps / wall / ttft / prefill.
+  冷却后各 3 轮取均值；报告 tps / 墙钟 / ttft / prefill 四项。
+- Two 9B engines co-resident on 16 GB thrash each other ~2× — such data is
+  invalid for comparison. 16GB 机器双引擎共存互相拖垮 ~2×，禁止作为对比数据。
 
-1. **热测试协议**：连续生成 10 分钟，每 30s 记录 tps 曲线；与 llama.cpp 同机
-   对比。假设：低线程内核曲线更平（被动散热红利）——这是定位的核心卖点，
-   未验证前不对外宣称。
-2. **首启形状调优**：`tools/gemm_harness` 的扫描（26 内核 × 形状）做成首次
-   运行 30s 自动调优 + 缓存（llama.cpp 同款机制；8-lane 最优点是在 M3 上
-   找到的，M1/M2/M4 各代需实测）。
-3. **8GB 配置建议**：4B/8B 模型、`--max-ctx 2048`、KV 预算上限；文档给出
-   矩阵。
+## 6. Air-specific TODOs / Air 专项待办
 
-## 七、仓库整合（2026-11-08 完成）
+1. **Thermal test protocol / 热测试协议**：10-minute sustained generation,
+   tps sampled every 30s; compare the droop curve against llama.cpp on the
+   same machine. The "flatter curve" claim is NOT to be advertised until
+   verified. 连续生成 10 分钟 tps 曲线与 llama.cpp 同机对比；未验证前不对外宣称。
+2. ~~First-run shape autotuning / 首启形状调优~~ ✅（runtime measured pick +
+   cache reuse, verified by test_tune.py / 运行时实测选优 + 缓存复用，test_tune.py 验证）
+3. ~~Thermal protocol tooling / 热测试工具~~ ✅（tools/thermal_test.py +
+   docs/THERMAL.md；实证待跑 / empirical run pending）
+4. ~~Memory budget mode / 内存预算模式~~ ✅（startup `mem:` estimate + 85%
+   warning + docs/MEMORY.md 8 GB table / 启动 mem: 估算 + 85% 告警 + 8GB 配置表）
 
-- odin-infer 成为唯一仓库：`packages/` + `server/` + `cli/` + `tools/` +
-  `docs/` + `models/`
-- **odin-infer-mac（GitHub）已停更，功能并入 `cli/`**；请在 GitHub 上将旧
-  repo 标记 Archive，README 指向本仓库
-- 本地 `/Users/vajra/Claw/odin-infeer`（历史目录）保留模型文件，代码不再
-  更新；`models/` 内的软链已指向其 GGUF
+## 7. Repo consolidation (done 2026-11-08) / 仓库整合（2026-11-08 完成）
 
-## 八、路线图（按序）
+- odin-infer is now the single repo: `packages/` + `server/` + `cli/` +
+  `tools/` + `docs/` + `models/`. odin-infer 成为唯一仓库。
+- **odin-infer-mac (GitHub) is retired**: its CLI merged into `cli/`; the old
+  repo is archived with a pointer README. odin-infer-mac 已归档并入 cli/。
+- The local `/Users/vajra/Claw/odin-infeer` directory keeps model files only;
+  code there is frozen; `models/` symlinks point at its GGUFs.
+  本地 odin-infeer 目录保留模型文件，代码不再更新。
 
-1. ~~repo 整合 + 定位文档~~ ✅
-2. ~~MCP 适配层~~ ✅（stdio 已上线：`odin.chat`/`odin.models` 工具 + Claude Code /
-   Cursor 配置样例 + `test_mcp.py` 全握手测试；SSE/streamable HTTP 后续）
-3. ~~首启形状调优~~ ✅（运行时实测选优 + 缓存复用，`test_tune.py` 验证）/
-   ~~热测试协议~~ ✅（`tools/thermal_test.py` + `docs/THERMAL.md`，实证待跑）
-4. ~~内存预算模式~~ ✅（启动 `mem:` 估算 + 85% 告警 + `docs/MEMORY.md` 8GB 配置表）
-5. （可选）性能再攻坚：需完整 Xcode（`xcrun metal` + Instruments GPU 计数
-   器），目标补齐最后 ~11% 解码差距
+## 8. Roadmap (in order) / 路线图（按序）
+
+1. ~~repo consolidation + positioning docs~~ ✅ / 仓库整合 + 定位文档
+2. ~~MCP adapter (stdio)~~ ✅ — `odin.chat` / `odin.models` tools + Claude
+   Code / Cursor config samples + test_mcp.py full handshake; SSE/streamable
+   HTTP later. MCP 适配层（stdio）已上线；SSE/streamable HTTP 后续。
+3. ~~first-run autotuning + thermal protocol~~ ✅ / 首启调优 + 热测试协议
+4. ~~memory budget mode~~ ✅ / 内存预算模式
+5. ~~zero-compile release pipeline~~ ✅ — GitHub Actions builds and publishes
+   `odin-serve` / `odin-cli` on every `v*` tag. 零编译发布管线（tag 触发 Release）。
+6. (optional) perf round 2: needs full Xcode (`xcrun metal` + Instruments GPU
+   counters) to chase the last ~11% decode gap. （可选）性能再攻坚：需完整 Xcode。

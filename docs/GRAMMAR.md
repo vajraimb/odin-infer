@@ -1,3 +1,9 @@
+<!--
+Internal engineering log, kept in its original language (中文内部工程记录，保留原文).
+The user-facing documentation (README / AGENTS / POSITIONING / docs/MCP·MEMORY·THERMAL) is bilingual.
+面向用户的文档（README/AGENTS/POSITIONING/docs 下三篇）为中英双语；本文件为内部工程日志。
+-->
+
 # JSON grammar-constrained output
 
 `odin-infer` can force the model's output to be valid JSON. Activated via the

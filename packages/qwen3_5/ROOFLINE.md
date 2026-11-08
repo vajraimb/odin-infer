@@ -1,3 +1,9 @@
+<!--
+Internal engineering log, kept in its original language (中文内部工程记录，保留原文).
+The user-facing documentation (README / AGENTS / POSITIONING / docs/MCP·MEMORY·THERMAL) is bilingual.
+面向用户的文档（README/AGENTS/POSITIONING/docs 下三篇）为中英双语；本文件为内部工程日志。
+-->
+
 # Roofline / Profiling Notes (数据驱动的优化空间封顶)
 
 记录对本引擎(Ornith-1.0-9B Q4_K_M,Apple M3 Air)prefill/decode 的 roofline 分析,

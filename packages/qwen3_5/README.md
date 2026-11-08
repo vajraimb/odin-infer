@@ -1,9 +1,12 @@
-# qwen3_5
+# qwen3_5 · Qwen3.5 推理包
 
 Independent Qwen3.5 inference package for the odin-infer library. Targets the
 **Ornith-1.0-9B** family (Qwen3.5 text model, hybrid full + linear attention),
 text-only. Sibling to the Qwen3-only `infer` package; reuses the shared `ggml`
 collection for GGUF parsing and quantized dot products.
+odin-infer 的 Qwen3.5 独立推理包：面向 Ornith-1.0-9B 家族（Qwen3.5 文本模型，
+full + linear 混合注意力），纯文本。与仅支持 Qwen3 的 `infer` 包并列，复用
+共享的 `ggml`（GGUF 解析与量化点积）。
 
 > **Porting a new architecture?** Read [`PITFALLS.md`](./PITFALLS.md) first —
 > it logs every bug hit while building this package (RMSNorm baking, `ssm_a`
@@ -15,12 +18,14 @@ collection for GGUF parsing and quantized dot products.
 > (the agent/tool bottleneck). Stage 1a performance is verified (~50× potential),
 > blocked on simdgroup matrix layout correctness.
 
-## Status
+## Status / 状态
 
 **Validated end-to-end against the real `deepreinforce-ai/Ornith-1.0-9B-GGUF`
 (Q4_K_M)** — loads, runs forward, and produces coherent on-topic English
 (verified: prompt "What is 2+2?" yields reasoning text like "The user asked a
 \"2+\"" / "The user wants" with proper `<think>`/`</think>` structure).
+已对真实 Ornith GGUF 做过端到端验收：加载、前向、输出连贯且切题的英文
+（"What is 2+2?" 产生带 `<think>`/`</think>` 结构的推理文本）。
 
 Also smoke-tested against `mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF`
 (Q4_K_M): loads and produces coherent EN/ZH replies ("2+2 equals 4.", 中文介绍北京).
@@ -28,8 +33,11 @@ That conversion writes `qwen35.block_count = num_hidden_layers + nextn_predict_l
 (33 = 32 trunk + 1 MTP) while shipping only the 32 trunk blocks, so the loader
 subtracts `qwen35.nextn_predict_layers` (llama.cpp's convention) and runs the
 trunk only — MTP is ignored on inference.
+另对 mradermacher 的 heretic GGUF 做过冒烟验证（中英文输出均连贯）。该转换
+把 MTP 层计入 `block_count`（33 = 32 主干 + 1 MTP）但只发布 32 块主干权重，
+加载器按 llama.cpp 约定减去 `nextn_predict_layers`，只跑主干。
 
-## Decode-path performance (Apple M3, heretic Q4_K_M, Metal)
+## Decode-path performance / 解码路径性能 (Apple M3, heretic Q4_K_M, Metal)
 
 Benchmarked solo (one engine resident at a time; with two 9B engines resident
 the 16 GB machine swaps and both slow down ~2×):
@@ -101,7 +109,7 @@ bandwidth; every multi-row-per-lane or dispatch-shape alternative measured so
 far regresses. A/B switches kept for future profiling: `QGEMV3=1` (llama.cpp
 row-split port, ~108 ms) and `QGEMV2R=1` (2 rows/lane, ~105 ms).
 
-### llama.cpp full-family comparison (sweep, wall-clock + CPU-reference verified)
+### llama.cpp full-family comparison / llama.cpp 全家族对照 (sweep, wall-clock + CPU-reference verified)
 
 Systematic port of llama.cpp's parameterized `kernel_mul_mv_ext` GEMV family
 (nxpsg x r1ptg grid: 4-32 lanes/row x 1-4 rows/thread, 26 kernels incl. the
@@ -120,7 +128,7 @@ llama.cpp family on every shape — the remaining gap to llama.cpp end-to-end is
 NOT in GEMV structure. `gemv_q4_k_o` (llama.cpp default 32x4 shape) is kept
 compiled but unselected as a live counter-example.
 
-### Small-kernel fusion attempts (both regressed, reverted)
+### Small-kernel fusion attempts / 小内核融合尝试 (both regressed, reverted)
 
 - **Norm-fused GEMV** (`QGEMVNORM=1`, kernels `gemv_q4_k_norm`/`gemv_q6_k_norm`):
   each GEMV recomputes rms(x) cooperatively (256-thread threadgroup reduce with
@@ -153,7 +161,7 @@ used to make restarts flaky ~50% of the time).
 Pure-math unit tests cover the novel pieces (delta recurrent, conv1d, partial
 MRoPE, rmsnorm, l2norm) and pass: `./build.sh`.
 
-## Architecture notes (from transformers v5.8.1 `Qwen3_5TextModel`)
+## Architecture notes / 架构说明 (from transformers v5.8.1 `Qwen3_5TextModel`)
 
 - **layer_types**: `[linear, linear, linear, full]` repeated. Full attention at
   indices 3, 7, 11, ..., 31 (8 full + 24 linear layers).
@@ -180,7 +188,7 @@ MRoPE, rmsnorm, l2norm) and pass: `./build.sh`.
   so every call site uses the standard form.
 - **MTP** head is ignored on inference (`_keys_to_ignore_on_load = ["^mtp.*"]`).
 
-## Known unknowns (resolve when a GGUF lands)
+## Known unknowns / 已解开的疑点 (resolve when a GGUF lands)
 
 These were all **resolved** by inspecting the real Ornith GGUF + llama.cpp
 source (`src/models/qwen35.cpp`, `src/models/delta-net-base.cpp`,
@@ -203,7 +211,7 @@ source (`src/models/qwen35.cpp`, `src/models/delta-net-base.cpp`,
   oldest tap first) — `conv1d_step` indexes `weight[c*kernel + k]` which
   matches; silu is applied to the conv output before splitting into q/k/v.
 
-## Usage
+## Usage / 用法
 
 ```odin
 import q35 "qwen3_5:qwen3_5"
@@ -226,7 +234,7 @@ odin build . \
   -collection:qwen3_5=$LIB
 ```
 
-## Files
+## Files / 文件
 
 | File | Purpose |
 |------|---------|
