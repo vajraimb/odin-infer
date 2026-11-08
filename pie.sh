@@ -8,7 +8,8 @@
 set -euo pipefail
 
 PORT="${PORT:-9748}"
-PIE_BIN="${PIE_BIN:-/Users/vajra/Claw/firstmate/projects/pie-odin/build/pie}"
+# Point PIE_BIN at your pie binary (default works for the author's machine)
+PIE_BIN="${PIE_BIN:-$HOME/Claw/firstmate/projects/pie-odin/build/pie}"
 
 # Clear other provider keys so pie doesn't accidentally fall back to them
 # for auxiliary tasks (title generation, etc.) and send "odinfer" as a

@@ -117,6 +117,14 @@ docs/       MCP · THERMAL · MEMORY · troubleshooting notes
 - [docs/THERMAL.md](docs/THERMAL.md) — sustained-load comparison protocol
 - [AGENTS.md](AGENTS.md) — quickstart for AI coding agents
 
+## Community / 社区
+
+- [CHANGELOG.md](CHANGELOG.md) — release history
+- [CONTRIBUTING.md](CONTRIBUTING.md) — ground rules & PR checklist ([中文](CONTRIBUTING.zh.md))
+- [SECURITY.md](SECURITY.md) — reporting vulnerabilities
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- Issues and PRs: [GitHub](https://github.com/vajraimb/odin-infer)
+
 ## License
 
 MIT

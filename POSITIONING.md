@@ -73,8 +73,8 @@ months of work and does not serve the Air positioning.
   `tools/` + `docs/` + `models/`.
 - **odin-infer-mac (GitHub) is retired**: its CLI merged into `cli/`; the old
   repo is archived with a pointer README.
-- The local `/Users/vajra/Claw/odin-infeer` directory keeps model files only;
-  code there is frozen; `models/` symlinks point at its GGUFs.
+- Model files live in a local `~/models`-style directory; the repo's `models/`
+  holds gitignored symlinks into it.
 
 ## 8. Roadmap (in order)
 

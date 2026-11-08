@@ -1,0 +1,42 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please keep reports precise: machine, model, commands, observed vs expected.
+  - type: input
+    id: machine
+    attributes:
+      label: Machine (chip / RAM / macOS)
+      placeholder: e.g. M3 / 16 GB / macOS 15
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model (GGUF)
+      placeholder: e.g. DeepSeek-V4-Pro-Qwen3.5-9B...Q4_K_M.gguf
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro steps
+      placeholder: |
+        1. `./odin-serve <model> --mcp --metal`
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Observed vs expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: stderr output (relevant lines)

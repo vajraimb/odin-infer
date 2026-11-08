@@ -68,9 +68,8 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   （→ ollama blob 软链，Qwen3.5，5.6GB）。
 - MoE 测试模型：`models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf`（524MB，
   bayliner1980）——tools/moe_smoke.odin 用它。
-- 快速冒烟用 0.6B：`/Users/vajra/Claw/odin-infeer/Qwen3-0.6B-Q4_K_M.gguf`
-  （Qwen3，历史兼容路径，加载 ~1s）——仅 CLI；serve 只认 Qwen3.5，产品定位
-  即 3.5+。
+- 快速冒烟用 0.6B：任意 `Qwen3-0.6B-Q4_K_M.gguf`（Qwen3，历史兼容路径，
+  加载 ~1s）——仅 CLI；serve 只认 Qwen3.5，产品定位即 3.5+。
 
 ## 关键约定（改代码前必读）
 

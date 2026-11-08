@@ -72,9 +72,9 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   (→ symlink to an ollama blob, Qwen3.5, 5.6 GB).
 - MoE test model: `models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf` (524 MB,
   bayliner1980) — used by tools/moe_smoke.odin.
-- Quick smoke test with 0.6B: `/Users/vajra/Claw/odin-infeer/Qwen3-0.6B-Q4_K_M.gguf`
-  (Qwen3, legacy infer path, loads in ~1s) — CLI only; **serve accepts Qwen3.5
-  only, by design (positioning is 3.5+)**.
+- Quick smoke test with 0.6B: any `Qwen3-0.6B-Q4_K_M.gguf` (Qwen3, legacy
+  infer path, loads in ~1s) — CLI only; **serve accepts Qwen3.5 only, by
+  design (positioning is 3.5+)**.
 
 ## Key conventions (read before editing)
 

@@ -61,8 +61,8 @@
   `docs/` + `models/`。
 - **odin-infer-mac（GitHub）已归档**：其 CLI 并入 `cli/`，旧仓库留指针
   README。
-- 本地 `/Users/vajra/Claw/odin-infeer` 目录只保留模型文件，代码不再更新；
-  `models/` 软链指向其 GGUF。
+- 模型文件放在本地 `~/models` 风格目录；仓库的 `models/` 保存指向它们的
+  gitignored 软链。
 
 ## 8. 路线图（按序）
 

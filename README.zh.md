@@ -111,6 +111,14 @@ docs/       MCP · THERMAL · MEMORY · 排障记录
 - [docs/THERMAL.zh.md](docs/THERMAL.zh.md) —— 持续负载对照协议
 - [AGENTS.zh.md](AGENTS.zh.md) —— 给 AI agent 的构建/测试/使用速查
 
+## 社区
+
+- [CHANGELOG.md](CHANGELOG.md) —— 版本历史
+- [CONTRIBUTING.zh.md](CONTRIBUTING.zh.md) —— 贡献规则与 PR 清单（[英文](CONTRIBUTING.md)）
+- [SECURITY.md](SECURITY.md) —— 漏洞报告
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- Issues 与 PR：[GitHub](https://github.com/vajraimb/odin-infer)
+
 ## License
 
 MIT
