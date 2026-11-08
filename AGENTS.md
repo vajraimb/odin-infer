@@ -123,6 +123,12 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 - Validation: `tools/make_moe_gguf.py` writes a tiny all-F32 MoE GGUF +
   Python reference; `tools/moe_load_test.odin` compares logits (currently
   bit-exact). Run via `./build.sh`. 验证：合成 GGUF + Python 参考对拍（当前逐位一致），./build.sh 自动执行。
+- Real-model smoke: `tools/moe_smoke.odin <model.gguf> [steps]` (CPU). Validated
+  on `bayliner1980/Qwen3.5-0.8B-MoE-A0.6B-GGUF` Q4_K_M (524MB, 24 layers, 28
+  experts, top-14, 248k vocab) — loads, prefills, decodes coherently
+  (~1.8 s/tok CPU). Note: our loader accepts ANY layer count (llama.cpp's
+  qwen35moe type switch only allows 40/48/60). 真实模型冒烟：bayliner1980 的
+  0.8B MoE（24 层/28 专家/top-14）加载+解码连贯；加载器不限层数（llama.cpp 只认 40/48/60 层）。
 
 ## Verified traps (do not re-learn) / 已验证的坑（不要再踩）
 
