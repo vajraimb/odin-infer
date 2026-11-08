@@ -106,6 +106,8 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   moe_softmax_topk, one sync per layer), expert GEMVs reuse the production
   kernels via tensor-base + expert offsets, moe_combine does the weighted sum;
   shared expert runs via moe_gemv_f32 on F32 uploads. MOE_CPU=1 forces CPU.
+  engine_forward_batch falls back to per-token prefill for MoE models (the
+  batched MLP MMQ is dense-only).
 - Expert tensor layout (verified against the real unsloth 35B-A3B GGUF header):
   `ffn_gate_inp` [dim, n_expert], `ffn_up_exps`/`ffn_gate_exps`
   [dim, n_ff_exp, n_expert], `ffn_down_exps` [n_ff_exp, dim, n_expert] —

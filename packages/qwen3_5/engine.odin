@@ -71,6 +71,15 @@ engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
 // LAST token (the one used to predict the next token). CPU path falls back to
 // per-token forward.
 engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
+	if e.transformer.config.is_moe {
+		// Batched MLP MMQ is dense-only (MoE layers have no w1/w2/w3);
+		// fall back to per-token prefill. Batched MoE prefill is future work.
+		logits: []f32 = nil
+		for i in 0 ..< len(tokens) {
+			logits = engine_forward(e, tokens[i], pos_start + i)
+		}
+		return logits
+	}
 	when ODIN_OS == .Darwin {
 		if e.metal_ready {
 			i := 0
