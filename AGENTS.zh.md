@@ -98,8 +98,10 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 - CPU + Metal 双路径已支持。Metal MoE：GPU router（moe_gemv_f32 +
   moe_softmax_topk，每层一次同步）、专家 GEMV 复用生产内核（张量基址+专家
   偏移）、moe_combine 加权求和；共享专家经 F32 上传走 moe_gemv_f32。
-  MOE_CPU=1 强制走 CPU。engine_forward_batch 对 MoE 模型回退逐 token
-  prefill（批量 MLP MMQ 仅支持 dense）。
+  MOE_CPU=1 强制走 CPU。engine_forward_batch 对 MoE 模型走
+  forward_gpu_batch_moe（批量 router + top-k，每层一次同步，与逐 token
+  逐位一致）。0.8B 实测：逐 token 的小 GEMV dispatch 数量是 prefill 主成本
+  ——下一步杠杆是分组 GEMM（mul_mat_id 式），不是同步。
 - 专家张量布局（已对真实 unsloth 35B-A3B 头部验证）：`ffn_gate_inp`
   [dim, n_expert]，`ffn_up_exps`/`ffn_gate_exps` [dim, n_ff_exp, n_expert]，
   `ffn_down_exps` [n_ff_exp, dim, n_expert]——ne0 是收缩维，量化粒度 = 一行

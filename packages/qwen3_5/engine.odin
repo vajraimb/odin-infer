@@ -72,8 +72,18 @@ engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
 // per-token forward.
 engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
 	if e.transformer.config.is_moe {
-		// Batched MLP MMQ is dense-only (MoE layers have no w1/w2/w3);
-		// fall back to per-token prefill. Batched MoE prefill is future work.
+		if e.metal_ready {
+			logits: []f32 = nil
+			i := 0
+			n := len(tokens)
+			for i < n {
+				chunk := min(MOE_BATCH_T, n - i)
+				logits = forward_gpu_batch_moe(&e.transformer, tokens[i : i + chunk], pos_start + i, chunk)
+				i += chunk
+			}
+			return logits
+		}
+		// CPU path: per-token
 		logits: []f32 = nil
 		for i in 0 ..< len(tokens) {
 			logits = engine_forward(e, tokens[i], pos_start + i)

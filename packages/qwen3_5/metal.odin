@@ -23,6 +23,7 @@ PAGE_SIZE :: 16384
 GEMV_ROWS :: 32 // rows per TG; more rows/TG = fewer TG launches (output layer has 248k rows)
 GEMV_TG :: 256
 MAX_BATCH_T :: 512 // max tokens per batched-prefill chunk (Stage 1a)
+MOE_BATCH_T :: 64  // max tokens per batched MoE prefill chunk (per-token expert buffers)
 
 MSL_SRC := `
 #include <metal_stdlib>
@@ -1351,6 +1352,13 @@ m_b_bhb, m_b_bhb2, m_b_bhb2h: ^MTL.Buffer        // [T*hidden] w1-out, w3/swiglu
 	m_moe_hbuf:      [dynamic]^MTL.Buffer // per-expert silu(gate)*up results [n_ff_exp]
 	m_moe_gbuf:      [dynamic]^MTL.Buffer // per-expert gate GEMV outputs [n_ff_exp]
 	m_b_moe_down_all: ^MTL.Buffer // [used * dim] f32 expert down outputs (combine stride)
+	// batched MoE prefill buffers (MOE_BATCH_T tokens)
+	m_b_moe_logits_b:  ^MTL.Buffer // [T * n_expert] f32
+	m_b_moe_sel_b:     ^MTL.Buffer // [T * used] i32
+	m_b_moe_w_b:       ^MTL.Buffer // [T * used] f32
+	m_b_moe_down_b:    ^MTL.Buffer // [T * used * dim] f32 expert down outputs
+	m_b_moe_shexp_out_b: ^MTL.Buffer // [T * dim] f32 shared expert outputs
+	m_b_moe_shexp_gate_b: ^MTL.Buffer // [T] f32 shared expert gates
 // Stage 1b: batched attention projections (per-token stateful ops stay per-token)
 @(private = "file")
 m_b_proj_half: ^MTL.Buffer                         // [dim x T] half transpose scratch (B for MMQ)
@@ -2094,6 +2102,13 @@ moe_metal_init :: proc(t: ^Transformer) {
 		m_moe_gbuf[k] = new_shared(max(c.n_ff_exp, 1) * 4)
 	}
 	m_b_moe_down_all = new_shared(max(c.n_expert_used * c.dim, 1) * 4)
+	bt := MOE_BATCH_T
+	m_b_moe_logits_b = new_shared(bt * max(c.n_expert, 1) * 4)
+	m_b_moe_sel_b = new_shared(bt * max(c.n_expert_used, 1) * 4)
+	m_b_moe_w_b = new_shared(bt * max(c.n_expert_used, 1) * 4)
+	m_b_moe_down_b = new_shared(bt * max(c.n_expert_used, 1) * max(c.dim, 1) * 4)
+	m_b_moe_shexp_out_b = new_shared(bt * max(c.dim, 1) * 4)
+	m_b_moe_shexp_gate_b = new_shared(bt * 4)
 	fmt.eprintfln("moe metal: router=%d KB shexp=%d KB", c.n_layers * router_stride * 4 / 1024, c.n_layers * shexp_stride * 4 / 1024)
 }
 
@@ -2165,15 +2180,18 @@ enc_moe_topk :: proc(enc: ^MTL.ComputeCommandEncoder, n_expert, k: int) {
 }
 
 @(private = "file")
-enc_moe_combine :: proc(enc: ^MTL.ComputeCommandEncoder, k, has_shexp, dim: int, out: ^MTL.Buffer) {
+enc_moe_combine_off :: proc(enc: ^MTL.ComputeCommandEncoder, k, has_shexp, dim: int,
+	down: ^MTL.Buffer, w: ^MTL.Buffer, shexp: ^MTL.Buffer, gate: ^MTL.Buffer,
+	out: ^MTL.Buffer, out_off: NS.UInteger, down_off: NS.UInteger, w_off: NS.UInteger,
+	shexp_off: NS.UInteger, gate_off: NS.UInteger) {
 	enc->setComputePipelineState(m_pso_moe_combine)
-	enc->setBuffer(m_b_moe_down_all, 0, 0)
-	enc->setBuffer(out, 0, 1)
-	enc->setBuffer(m_b_moe_w, 0, 2)
-	enc->setBuffer(m_b_moe_shexp_out, 0, 3)
+	enc->setBuffer(down, down_off, 0)
+	enc->setBuffer(out, out_off, 1)
+	enc->setBuffer(w, w_off, 2)
+	enc->setBuffer(shexp, shexp_off, 3)
 	P := [3]u32{u32(k), u32(has_shexp), u32(dim)}
 	enc->setBytes(bytes_of(&P, size_of(P)), 4)
-	enc->setBuffer(m_b_moe_shexp_gate, 0, 5)
+	enc->setBuffer(gate, gate_off, 5)
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer((dim + 255) / 256), 1, 1}, MTL.Size{256, 1, 1})
 }
 
@@ -2237,7 +2255,7 @@ moe_ffn_gpu :: proc(enc: ^^MTL.ComputeCommandEncoder, cmd: ^^MTL.CommandBuffer, 
 		enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim) * 4), m_moe_gbuf[0], 0, m_b_moe_shexp_out, 0, p.n_ff_shexp, dim)
 		enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp) * 4), m_b_xb, 0, m_b_moe_shexp_gate, 0, dim, 1)
 	}
-	enc_moe_combine(enc2, used, has_shexp, dim, m_b_xb)
+	enc_moe_combine_off(enc2, used, has_shexp, dim, m_b_moe_down_all, m_b_moe_w, m_b_moe_shexp_out, m_b_moe_shexp_gate, m_b_xb, 0, 0, 0, 0, 0)
 	enc_elementwise(enc2, m_pso_residual, m_b_x, m_b_xb, dim)
 	enc2->endEncoding()
 	cmd2->commit()
@@ -2671,6 +2689,240 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 // runs per-token on single-token scratch (its projections are GEMV; batching them
 // is Stage 1b). T must be a multiple of 8 and <= MAX_BATCH_T (caller chunks; the
 // trailing <8 remainder goes through forward_gpu). Returns the LAST token's logits.
+// Batched MoE prefill: attention runs exactly like the dense batch path; the
+// MoE FFN batches the router + top-k across all T tokens with ONE sync per
+// layer (vs 2 per token in the per-token path), then dispatches the selected
+// experts for every token in a second command buffer. Grouped GEMM
+// (mul_mat_id-style) is the follow-up; this already removes the sync storm.
+forward_gpu_batch_moe :: proc(transformer: ^Transformer, tokens: []int, pos_start: int, n_real: int) -> []f32 {
+	NS.scoped_autoreleasepool()
+	p := &transformer.config
+	w := &transformer.weights
+
+	T := len(tokens)
+	if T == 0 { fmt.eprintln("forward_gpu_batch_moe: empty"); os.exit(1) }
+	if T > MOE_BATCH_T {
+		fmt.eprintf("forward_gpu_batch_moe: T=%d must be <= %d\n", T, MOE_BATCH_T)
+		os.exit(1)
+	}
+	if n_real < 1 || n_real > T {
+		fmt.eprintf("forward_gpu_batch_moe: n_real=%d must be in [1,%d]\n", n_real, T)
+		os.exit(1)
+	}
+
+	dim := p.dim; head_dim := p.head_dim
+	n_heads := p.n_heads; n_kv_heads := p.n_kv_heads
+	kv_dim := n_kv_heads * head_dim; kv_mul := n_heads / n_kv_heads
+	att_head_dim := n_heads * head_dim; seq_len := p.seq_len; eps := p.rms_eps
+	rotary_dim := p.rotary_dim
+	key_dim := p.lin_n_k_heads * p.lin_head_k_dim
+	value_dim := p.lin_n_v_heads * p.lin_head_v_dim
+	conv_dim := key_dim * 2 + value_dim
+	kernel := p.lin_conv_kernel
+	head_k_dim := p.lin_head_k_dim; head_v_dim := p.lin_head_v_dim
+	n_vh := p.lin_n_v_heads; n_kh := p.lin_n_k_heads
+	l2_scale := 1.0 / math.sqrt_f32(f32(head_k_dim))
+	n_exp := p.n_expert; used := p.n_expert_used; n_ff := p.n_ff_exp
+	up_rb := ggml.row_byte_size(w.layers[0].moe.up_exps.kind, dim)
+	down_rb := ggml.row_byte_size(w.layers[0].moe.down_exps.kind, n_ff)
+
+	bx := m_b_bx->contentsAsSlice([]f32)
+	for t in 0 ..< T {
+		get_embedding_row(&w.token_embedding, tokens[t], dim, bx[t * dim : (t + 1) * dim])
+	}
+
+	cmd := m_queue->commandBuffer()
+	enc := cmd->computeCommandEncoder()
+	kv_layer_bytes := NS.UInteger(seq_len * kv_dim * 2)
+	conv_state_stride := conv_dim * (kernel - 1)
+	rec_state_stride := n_vh * head_k_dim * head_v_dim
+	dim_bytes := NS.UInteger(dim * 4)
+
+	for l in 0 ..< p.n_layers {
+		lw := &w.layers[l]
+		mw := &lw.moe
+
+		enc_rmsnorm(enc, m_b_bx, m_b_bxb, raw_data(lw.attn_norm), dim, T, eps)
+
+switch lw.layer_type {
+		case .Full_Attention:
+			fa := &lw.full
+			qproj_dim := n_heads * head_dim * 2
+			enc_proj_fwd(enc, fa.wq.kind, raw_data(fa.wq.data), m_b_bxb, qproj_dim, T, dim, m_b_qproj_t)
+			enc_proj_fwd(enc, fa.wk.kind, raw_data(fa.wk.data), m_b_bxb, kv_dim, T, dim, m_b_kt)
+			enc_proj_fwd(enc, fa.wv.kind, raw_data(fa.wv.data), m_b_bxb, kv_dim, T, dim, m_b_vt)
+			// per-token stateful: qnorm / rope / store_kv / attention / gate
+			slot := transformer.full_slot[l]
+			kv_loff := NS.UInteger(slot) * kv_layer_bytes
+			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
+			if !g_prof_nofull { // QPROF_NOFULL ablation
+			for t in 0 ..< n_real {
+				pos := pos_start + t
+				oq := NS.UInteger(t) * qproj_b; okv := NS.UInteger(t) * kv_b; oxb3 := NS.UInteger(t) * xb3_b
+				enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
+				enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
+				enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
+				enc->setComputePipelineState(m_pso_qnorm)
+				enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
+				qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
+				enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
+				enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
+				rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+				half_r := rotary_dim / 2
+				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_q, 0, 0)
+				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
+				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
+				enc->setComputePipelineState(m_pso_store_kv)
+				enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
+				enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
+				store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
+				enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
+				enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
+				enc->setComputePipelineState(m_pso_attn)
+				enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
+				attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
+				enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
+				enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
+				enc->setComputePipelineState(m_pso_attn_gate)
+				enc->setBuffer(m_b_xb3, 0, 0); enc->setBuffer(m_b_qproj, 0, 1)
+				hd_u32 := u32(head_dim)
+				enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
+				enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
+			}
+			} // end QPROF_NOFULL guard
+			// batched wo -> residual
+			enc_proj_fwd(enc, fa.wo.kind, raw_data(fa.wo.data), m_b_xb3t, dim, T, att_head_dim, m_b_xb2t)
+			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
+
+		case .Linear_Attention:
+			la := &lw.linear
+			enc_proj_fwd(enc, la.in_qkv.kind, raw_data(la.in_qkv.data), m_b_bxb, conv_dim, T, dim, m_b_qkv_t)
+			enc_proj_fwd(enc, la.in_z.kind, raw_data(la.in_z.data), m_b_bxb, value_dim, T, dim, m_b_zt)
+			enc_proj_fwd(enc, la.in_b.kind, raw_data(la.in_b.data), m_b_bxb, n_vh, T, dim, m_b_bt)
+			enc_proj_fwd(enc, la.in_a.kind, raw_data(la.in_a.data), m_b_bxb, n_vh, T, dim, m_b_at)
+			// batched conv1d (Stage 2): all T tokens at once, causal left-pad from conv_state
+			slot := transformer.lin_slot[l]
+			conv_off := NS.UInteger(slot * conv_state_stride * 4)
+			rec_off := NS.UInteger(slot * rec_state_stride * 4)
+			enc_conv1d_batch(enc, m_b_qkv_t, m_b_qkv2_t, m_b_conv_states, conv_off, raw_data(la.conv.data), conv_dim, T, kernel)
+			// NOTE: a chunked_delta integration (Stage 2) was validated in isolation
+			// (delta_harness) but the v1 engine wiring neither sped up prefill nor stayed
+			// bit-identical, and C=16 had an unresolved failure. It is reverted to the
+			// per-token delta loop below until the fused (S-in-threadgroup) version lands.
+			qkv_b := NS.UInteger(conv_dim * 4); z_b := NS.UInteger(value_dim * 4); ba_b := NS.UInteger(n_vh * 4); lout_b := NS.UInteger(value_dim * 4)
+			if !g_prof_nolin { // QPROF_NOLIN ablation: skip to measure linear per-token stateful share
+			for t in 0 ..< n_real {
+				oqkv := NS.UInteger(t) * qkv_b; oz := NS.UInteger(t) * z_b; oba := NS.UInteger(t) * ba_b; olout := NS.UInteger(t) * lout_b
+				enc_copy(enc, m_b_qkv2_t, oqkv, m_b_qkv2, 0, conv_dim)
+				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
+				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
+				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
+				enc->setComputePipelineState(m_pso_l2norm)
+				enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
+				enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
+				l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
+				enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
+				enc->setComputePipelineState(m_pso_delta)
+				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
+				enc->setBuffer(m_b_qlin, 0, 2); enc->setBuffer(m_b_klin, 0, 3)
+				enc->setBuffer(m_b_qkv2, NS.UInteger(2 * key_dim * 4), 4)
+				enc->setBuffer(m_b_b, 0, 5); enc->setBuffer(m_b_a, 0, 6)
+				enc->setBuffer(m_weights, woff(raw_data(la.a_decay)), 7)
+				enc->setBuffer(m_weights, woff(raw_data(la.dt_bias)), 8)
+				dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
+				enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
+				enc->setComputePipelineState(m_pso_rmsgated)
+				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_lout, 0, 1)
+				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_z, 0, 3)
+				ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
+				enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
+				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
+			}
+			} // end QPROF_NOLIN guard
+			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
+			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
+			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
+		}
+
+
+
+		// ---- batched MoE FFN: rmsnorm + router + top-k for all T tokens ----
+		enc_rmsnorm(enc, m_b_bx, m_b_bxb, raw_data(lw.ffn_norm), dim, T, eps)
+		enc_gemv_f32_b(enc, m_b_router, NS.UInteger(l * n_exp * dim * 4), m_b_bxb, 0, m_b_moe_logits_b, 0, dim, n_exp, T)
+		enc_moe_topk_b(enc, m_b_moe_logits_b, 0, m_b_moe_sel_b, 0, m_b_moe_w_b, 0, n_exp, used, T)
+		enc->endEncoding()
+		cmd->commit()
+		cmd->waitUntilCompleted()
+
+		sel := m_b_moe_sel_b->contentsAsSlice([]i32)[:T * used]
+
+		cmd2 := m_queue->commandBuffer()
+		enc2 := cmd2->computeCommandEncoder()
+		up_base := woff(raw_data(mw.up_exps.data))
+		gate_base := woff(raw_data(mw.gate_exps.data))
+		down_base := woff(raw_data(mw.down_exps.data))
+		has_shexp := 0
+		if mw.shexp_up != nil { has_shexp = 1 }
+		for t in 0 ..< T {
+			tk := t * used
+			for k in 0 ..< used {
+				e := int(sel[tk + k])
+				enc_gemv(enc2, mw.up_exps.kind, up_base + NS.UInteger(e * n_ff * up_rb), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_hbuf[0], 0, dim, n_ff)
+				enc_gemv(enc2, mw.gate_exps.kind, gate_base + NS.UInteger(e * n_ff * up_rb), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_gbuf[0], 0, dim, n_ff)
+				enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[0], m_moe_hbuf[0], n_ff)
+				#partial switch mw.down_exps.kind {
+				case .Q8_0:
+					enc_gemv_q80(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
+				case .Q5_0:
+					enc_gemv_q50(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
+				case:
+					enc_gemv(enc2, mw.down_exps.kind, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
+				}
+			}
+			if has_shexp == 1 {
+				base := l * (2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp + dim)
+				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger(base * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_hbuf[0], 0, dim, p.n_ff_shexp)
+				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + p.n_ff_shexp * dim) * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_gbuf[0], 0, dim, p.n_ff_shexp)
+				enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[0], m_moe_hbuf[0], p.n_ff_shexp)
+				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim) * 4), m_moe_gbuf[0], 0, m_b_moe_shexp_out_b, NS.UInteger(t * dim * 4), p.n_ff_shexp, dim)
+				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp) * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_b_moe_shexp_gate_b, NS.UInteger(t * 4), dim, 1)
+			}
+			enc_moe_combine_off(enc2, used, has_shexp, dim, m_b_moe_down_b, m_b_moe_w_b, m_b_moe_shexp_out_b, m_b_moe_shexp_gate_b, m_b_bxb, NS.UInteger(t * dim * 4), NS.UInteger(tk * dim * 4), NS.UInteger(tk * 4), NS.UInteger(t * dim * 4), NS.UInteger(t * 4))
+		}
+		enc_elementwise(enc2, m_pso_residual, m_b_bx, m_b_bxb, T * dim)
+		enc2->endEncoding()
+		cmd2->commit()
+		cmd2->waitUntilCompleted()
+
+		cmd = m_queue->commandBuffer()
+		enc = cmd->computeCommandEncoder()
+	}
+
+	// final norm + output projection: LAST REAL token only
+	last_off := NS.UInteger(n_real - 1) * dim_bytes
+	enc_copy(enc, m_b_bx, last_off, m_b_x, 0, dim)
+	enc_rmsnorm(enc, m_b_x, m_b_x, raw_data(w.output_norm), dim, 1, eps)
+	enc_gemv(enc, w.output.kind, woff(raw_data(w.output.data)), m_b_x, 0, m_b_logits, 0, dim, p.vocab_size)
+
+	enc->endEncoding()
+	cmd->commit()
+	cmd->waitUntilCompleted()
+	if g_timing {
+		gpu_ms := f64(cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0
+		fmt.eprintfln("[timing] forward_gpu_batch_moe T={} GPU={:.2f} ms ({:.2f} ms/tok)", T, gpu_ms, gpu_ms / f64(T))
+	}
+	return m_b_logits->contentsAsSlice([]f32)[:p.vocab_size]
+}
+
 forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: int, n_real: int) -> []f32 {
 	NS.scoped_autoreleasepool()
 	p := &transformer.config

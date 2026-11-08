@@ -33,6 +33,7 @@ main :: proc() {
 	prompt := "What is 2+2?"
 	use_metal := false
 	compare := false
+	batch_compare := false
 	rest := args[1:]
 	for len(rest) > 0 {
 		if rest[0] == "--prompt" && len(rest) > 1 {
@@ -43,6 +44,10 @@ main :: proc() {
 			rest = rest[1:]
 		} else if rest[0] == "--compare" {
 			compare = true
+			rest = rest[1:]
+		} else if rest[0] == "--batch-compare" {
+			batch_compare = true
+			use_metal = true
 			rest = rest[1:]
 		} else if v, ok := strconv.parse_int(rest[0]); ok {
 			steps = v
@@ -116,7 +121,38 @@ main :: proc() {
 	}
 	fmt.eprintfln("prompt %q -> %d tokens", prompt, len(ids))
 
-	if compare {
+	if batch_compare {
+		// per-token Metal prefill vs batched MoE prefill: same prompt, compare logits
+		// leg 1: per-token
+		ids1 := make([dynamic]int, 0, len(ids))
+		for v in ids { _, _ = append(&ids1, v) }
+		t0 := time.now()
+		e1, ok1 := q35.engine_load(path, q35.Engine_Opts{max_ctx = 512, num_threads = 8, use_metal = true})
+		if !ok1 { fmt.eprintln("load failed"); os.exit(1) }
+		defer q35.engine_destroy(&e1)
+		for i in 0 ..< len(ids1) { q35.engine_forward(&e1, ids1[i], i) }
+		ms1 := time.duration_milliseconds(time.since(t0))
+		logits1 := q35.engine_forward(&e1, ids1[len(ids1)-1], len(ids1) - 1)
+		// leg 2: batched
+		ids2 := make([dynamic]int, 0, len(ids))
+		for v in ids { _, _ = append(&ids2, v) }
+		t0 = time.now()
+		e2, ok2 := q35.engine_load(path, q35.Engine_Opts{max_ctx = 512, num_threads = 8, use_metal = true})
+		if !ok2 { fmt.eprintln("load failed"); os.exit(1) }
+		defer q35.engine_destroy(&e2)
+		q35.engine_forward_batch(&e2, ids2[:], 0)
+		ms2 := time.duration_milliseconds(time.since(t0))
+		logits2 := q35.engine_forward(&e2, ids2[len(ids2)-1], len(ids2) - 1)
+		max_abs: f32 = 0.0
+		for i in 0 ..< len(logits1) { max_abs = max(max_abs, math.abs(logits1[i] - logits2[i])) }
+		fmt.eprintfln("batch-compare: per-token=%.0f ms batched=%.0f ms max_abs=%.6f %s", ms1, ms2, max_abs, max_abs < 5e-3 ? "OK" : "MISMATCH")
+		if max_abs < 5e-3 {
+			fmt.println("BATCH PREFILL COMPARE: ALL PASSED")
+		} else {
+			fmt.eprintln("BATCH PREFILL COMPARE: FAILED")
+			os.exit(1)
+		}
+	} else if compare {
 		cpu_ids := make([dynamic]int, 0, len(ids) + steps)
 		for v in ids {
 			_, _ = append(&cpu_ids, v)
