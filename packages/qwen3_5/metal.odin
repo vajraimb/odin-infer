@@ -1188,6 +1188,132 @@ kernel void moe_gemv_q50(device const uchar *wb [[buffer(0)]], device const floa
     if (lane % 8 == 0 && row < dim.d) out[row] = sum;
 }
 
+// Grouped GEMM for MoE prefill: one thread per (row f, expert-slot k, token t).
+// Replaces T x used x 4 small GEMV dispatches with one big dispatch.
+// Q4_K up+gate: computes both projections for the (f,k,t) triple.
+kernel void moe_up_mm_id_q4(device const uchar *wup [[buffer(0)]], device const uchar *wgate [[buffer(1)]],
+    device const float *x [[buffer(2)]], device const int *ids [[buffer(3)]],
+    device float *h_out [[buffer(4)]], device float *g_out [[buffer(5)]],
+    constant uint4 &P [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+    uint n = P.x, d = P.y, used = P.z, T = P.w;
+    uint total = d * used * T;
+    if (gid >= total) return;
+    uint f = gid / (used * T);
+    uint kt = gid % (used * T);
+    uint k = kt / T, t = kt % T;
+    int e = ids[t * used + k];
+    uint nsb = n / 256;
+    device const float *xt = x + (ulong)t * n;
+    float su = 0.0, sg = 0.0;
+    for (uint half = 0; half < 2; half++) {
+        device const uchar *wr = (half == 0 ? wup : wgate) + ((ulong)e * d + f) * nsb * 144;
+        for (uint sb = 0; sb < nsb; sb++) {
+            device const uchar *blk = wr + sb * 144;
+            float dall = (float)(*(device const half*)blk);
+            float dmin = (float)(*(device const half*)(blk + 2));
+            device const uchar *scales = blk + 4;
+            device const uchar *qs = blk + 16;
+            uint y = sb * 256; int is = 0; uint qoff = 0;
+            float acc = 0.0;
+            for (uint j = 0; j < 256; j += 64) {
+                uchar sc, m;
+                get_scale_min_k4(is, scales, sc, m); float d1 = dall * sc, m1 = dmin * m;
+                get_scale_min_k4(is + 1, scales, sc, m); float d2 = dall * sc, m2 = dmin * m;
+                for (uint l = 0; l < 32; l += 4) {
+                    float4 wl = float4((float)(qs[qoff+l]&0xF),(float)(qs[qoff+l+1]&0xF),(float)(qs[qoff+l+2]&0xF),(float)(qs[qoff+l+3]&0xF));
+                    float4 wh = float4((float)(qs[qoff+l]>>4),(float)(qs[qoff+l+1]>>4),(float)(qs[qoff+l+2]>>4),(float)(qs[qoff+l+3]>>4));
+                    float4 xl = float4(xt[y+j+l],xt[y+j+l+1],xt[y+j+l+2],xt[y+j+l+3]);
+                    float4 xh = float4(xt[y+j+32+l],xt[y+j+32+l+1],xt[y+j+32+l+2],xt[y+j+32+l+3]);
+                    acc += dot(wl * d1 - m1, xl) + dot(wh * d2 - m2, xh);
+                }
+                qoff += 32; is += 2;
+            }
+            if (half == 0) su += acc; else sg += acc;
+        }
+    }
+    uint oidx = ((ulong)(t * used + k)) * d + f;
+    h_out[oidx] = su; g_out[oidx] = sg;
+}
+
+// Grouped down projection + weighted combine + gated shared expert:
+// one thread per (row r, token t); out[t*dim + r] = sum_k w[t,k] * dot(W_down[ids[t,k]][r], h[t,k])
+//   + has_shexp * sigmoid(gate[t]) * shexp[t*dim + r].
+// Q8_0 variant (34-byte blocks).
+kernel void moe_down_mm_id_q80(device const uchar *wd [[buffer(0)]], device const float *h [[buffer(1)]],
+    device const float *weights [[buffer(2)]], device const int *ids [[buffer(3)]],
+    device float *out [[buffer(4)]], device const float *shexp [[buffer(5)]],
+    device const float *shexp_gate [[buffer(6)]], constant uint4 &P [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint n_ff = P.x, dim = P.y & 0x7FFFFFFFu, used = P.z, T = P.w, has_shexp = P.y >> 31;
+    uint total = dim * T;
+    if (gid >= total) return;
+    uint r = gid / T, t = gid % T;
+    uint nb = n_ff / 32;
+    float acc = 0.0;
+    for (uint k = 0; k < used; k++) {
+        int e = ids[t * used + k];
+        device const uchar *wr = wd + ((ulong)e * dim + r) * nb * 34;
+        device const float *hk = h + ((ulong)t * used + k) * n_ff;
+        float s = 0.0;
+        for (uint b = 0; b < nb; b++) {
+            device const uchar *blk = wr + b * 34;
+            float d = (float)(*(device const half*)blk);
+            device const char *qs = (device const char*)(blk + 2);
+            uint y = b * 32;
+            for (uint j = 0; j < 32; j += 8) {
+                s += d * ((float)qs[j]*hk[y+j] + (float)qs[j+1]*hk[y+j+1] + (float)qs[j+2]*hk[y+j+2] + (float)qs[j+3]*hk[y+j+3] +
+                          (float)qs[j+4]*hk[y+j+4] + (float)qs[j+5]*hk[y+j+5] + (float)qs[j+6]*hk[y+j+6] + (float)qs[j+7]*hk[y+j+7]);
+            }
+        }
+        acc += weights[t * used + k] * s;
+    }
+    if (has_shexp) {
+        float g = 1.0 / (1.0 + exp(-shexp_gate[t]));
+        acc += g * shexp[(ulong)t * dim + r];
+    }
+    out[(ulong)t * dim + r] = acc;
+}
+
+// Q5_0 variant of the grouped down projection (22-byte blocks).
+kernel void moe_down_mm_id_q50(device const uchar *wd [[buffer(0)]], device const float *h [[buffer(1)]],
+    device const float *weights [[buffer(2)]], device const int *ids [[buffer(3)]],
+    device float *out [[buffer(4)]], device const float *shexp [[buffer(5)]],
+    device const float *shexp_gate [[buffer(6)]], constant uint4 &P [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint n_ff = P.x, dim = P.y & 0x7FFFFFFFu, used = P.z, T = P.w, has_shexp = P.y >> 31;
+    uint total = dim * T;
+    if (gid >= total) return;
+    uint r = gid / T, t = gid % T;
+    uint nb = n_ff / 32;
+    float acc = 0.0;
+    for (uint k = 0; k < used; k++) {
+        int e = ids[t * used + k];
+        device const uchar *wr = wd + ((ulong)e * dim + r) * nb * 22;
+        device const float *hk = h + ((ulong)t * used + k) * n_ff;
+        float s = 0.0;
+        for (uint b = 0; b < nb; b++) {
+            device const uchar *blk = wr + b * 22;
+            float d = (float)(*(device const half*)blk);
+            uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
+            device const uchar *qs = blk + 6;
+            uint y = b * 32;
+            for (uint j = 0; j < 16; j += 2) {
+                float x0 = (float)(((int)(qs[j] & 0xF) | (int)((qh >> j) & 1u) * 16) - 16);
+                float x1 = (float)(((int)(qs[j] >> 4) | (int)((qh >> (j + 16)) & 1u) * 16) - 16);
+                float x2 = (float)(((int)(qs[j+1] & 0xF) | (int)((qh >> (j + 1)) & 1u) * 16) - 16);
+                float x3 = (float)(((int)(qs[j+1] >> 4) | (int)((qh >> (j + 17)) & 1u) * 16) - 16);
+                s += d * (x0 * hk[y+j] + x1 * hk[y+j+16] + x2 * hk[y+j+1] + x3 * hk[y+j+17]);
+            }
+        }
+        acc += weights[t * used + k] * s;
+    }
+    if (has_shexp) {
+        float g = 1.0 / (1.0 + exp(-shexp_gate[t]));
+        acc += g * shexp[(ulong)t * dim + r];
+    }
+    out[(ulong)t * dim + r] = acc;
+}
+
 // MoE router tail: softmax over n_expert logits, top-k selection, weight
 // renormalization (divisor clamped to the F16 min, llama.cpp norm_w). Single
 // thread — n_expert <= 256, k <= 8 makes this trivial.
@@ -1308,6 +1434,7 @@ m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
 	m_pso_gemv_f32, m_pso_gemv_q80, m_pso_gemv_q50, m_pso_moe_topk, m_pso_moe_combine: ^MTL.ComputePipelineState
 	m_pso_gemv_f32_b, m_pso_moe_topk_b: ^MTL.ComputePipelineState
+	m_pso_moe_up_id_q4, m_pso_moe_down_id_q80, m_pso_moe_down_id_q50: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 @(private = "file")
@@ -1359,6 +1486,8 @@ m_b_bhb, m_b_bhb2, m_b_bhb2h: ^MTL.Buffer        // [T*hidden] w1-out, w3/swiglu
 	m_b_moe_down_b:    ^MTL.Buffer // [T * used * dim] f32 expert down outputs
 	m_b_moe_shexp_out_b: ^MTL.Buffer // [T * dim] f32 shared expert outputs
 	m_b_moe_shexp_gate_b: ^MTL.Buffer // [T] f32 shared expert gates
+	m_b_moe_h_b: ^MTL.Buffer // [T * used * n_ff_exp] f32 up results (grouped GEMM)
+	m_b_moe_g_b: ^MTL.Buffer // [T * used * n_ff_exp] f32 gate results (grouped GEMM)
 // Stage 1b: batched attention projections (per-token stateful ops stay per-token)
 @(private = "file")
 m_b_proj_half: ^MTL.Buffer                         // [dim x T] half transpose scratch (B for MMQ)
@@ -1704,6 +1833,8 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_gemv_f32 = make_pso(lib, "moe_gemv_f32"); m_pso_gemv_q80 = make_pso(lib, "moe_gemv_q80"); m_pso_gemv_q50 = make_pso(lib, "moe_gemv_q50")
 	m_pso_moe_topk = make_pso(lib, "moe_softmax_topk"); m_pso_moe_combine = make_pso(lib, "moe_combine")
 	m_pso_gemv_f32_b = make_pso(lib, "gemv_f32_b"); m_pso_moe_topk_b = make_pso(lib, "moe_softmax_topk_b")
+	m_pso_moe_up_id_q4 = make_pso(lib, "moe_up_mm_id_q4")
+	m_pso_moe_down_id_q80 = make_pso(lib, "moe_down_mm_id_q80"); m_pso_moe_down_id_q50 = make_pso(lib, "moe_down_mm_id_q50")
 	m_pso_conv = make_pso(lib, "conv1d_step_silu"); m_pso_l2norm = make_pso(lib, "l2norm_scale")
 	m_pso_delta = make_pso(lib, "delta_recurrent"); m_pso_rmsgated = make_pso(lib, "rmsnorm_gated")
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
@@ -2109,6 +2240,8 @@ moe_metal_init :: proc(t: ^Transformer) {
 	m_b_moe_down_b = new_shared(bt * max(c.n_expert_used, 1) * max(c.dim, 1) * 4)
 	m_b_moe_shexp_out_b = new_shared(bt * max(c.dim, 1) * 4)
 	m_b_moe_shexp_gate_b = new_shared(bt * 4)
+	m_b_moe_h_b = new_shared(bt * max(c.n_expert_used, 1) * max(c.n_ff_exp, 1) * 4)
+	m_b_moe_g_b = new_shared(bt * max(c.n_expert_used, 1) * max(c.n_ff_exp, 1) * 4)
 	fmt.eprintfln("moe metal: router=%d KB shexp=%d KB", c.n_layers * router_stride * 4 / 1024, c.n_layers * shexp_stride * 4 / 1024)
 }
 
@@ -2166,6 +2299,33 @@ enc_moe_topk_b :: proc(enc: ^MTL.ComputeCommandEncoder, logits: ^MTL.Buffer, l_o
 	P := [3]u32{u32(n_expert), u32(k), u32(tcount)}
 	enc->setBytes(bytes_of(&P, size_of(P)), 3)
 	enc->dispatchThreadgroups(MTL.Size{1, 1, 1}, MTL.Size{NS.Integer(tcount), 1, 1})
+}
+
+@(private = "file")
+enc_moe_up_id_q4 :: proc(enc: ^MTL.ComputeCommandEncoder, up_base, gate_base: NS.UInteger,
+	xb: ^MTL.Buffer, sel: ^MTL.Buffer, n, d, used, tcount: int) {
+	enc->setComputePipelineState(m_pso_moe_up_id_q4)
+	enc->setBuffer(m_weights, up_base, 0); enc->setBuffer(m_weights, gate_base, 1)
+	enc->setBuffer(xb, 0, 2); enc->setBuffer(sel, 0, 3)
+	enc->setBuffer(m_b_moe_h_b, 0, 4); enc->setBuffer(m_b_moe_g_b, 0, 5)
+	P := [4]u32{u32(n), u32(d), u32(used), u32(tcount)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 6)
+	total := d * used * tcount
+	enc->dispatchThreads(MTL.Size{NS.Integer(total), 1, 1}, MTL.Size{256, 1, 1})
+}
+
+@(private = "file")
+enc_moe_down_id :: proc(enc: ^MTL.ComputeCommandEncoder, pso: ^MTL.ComputePipelineState,
+	down_base: NS.UInteger, hb: ^MTL.Buffer, sel: ^MTL.Buffer, wbuf: ^MTL.Buffer,
+	out: ^MTL.Buffer, shexp: ^MTL.Buffer, gate: ^MTL.Buffer, n_ff, dim, used, tcount, has_shexp: int) {
+	enc->setComputePipelineState(pso)
+	enc->setBuffer(m_weights, down_base, 0)
+	enc->setBuffer(hb, 0, 1); enc->setBuffer(wbuf, 0, 2); enc->setBuffer(sel, 0, 3)
+	enc->setBuffer(out, 0, 4); enc->setBuffer(shexp, 0, 5); enc->setBuffer(gate, 0, 6)
+	P := [4]u32{u32(n_ff), u32(dim) | u32(has_shexp) << 31, u32(used), u32(tcount)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 7)
+	total := dim * tcount
+	enc->dispatchThreads(MTL.Size{NS.Integer(total), 1, 1}, MTL.Size{256, 1, 1})
 }
 
 @(private = "file")
@@ -2855,10 +3015,20 @@ switch lw.layer_type {
 
 
 
-		// ---- batched MoE FFN: rmsnorm + router + top-k for all T tokens ----
+		// ---- batched MoE FFN: rmsnorm + router + top-k (+ batched shexp) ----
 		enc_rmsnorm(enc, m_b_bx, m_b_bxb, raw_data(lw.ffn_norm), dim, T, eps)
 		enc_gemv_f32_b(enc, m_b_router, NS.UInteger(l * n_exp * dim * 4), m_b_bxb, 0, m_b_moe_logits_b, 0, dim, n_exp, T)
 		enc_moe_topk_b(enc, m_b_moe_logits_b, 0, m_b_moe_sel_b, 0, m_b_moe_w_b, 0, n_exp, used, T)
+		has_shexp := 0
+		if mw.shexp_up != nil { has_shexp = 1 }
+		if has_shexp == 1 {
+			base := l * (2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp + dim)
+			enc_gemv_f32_b(enc, m_b_shexp, NS.UInteger(base * 4), m_b_bxb, 0, m_b_moe_h_b, 0, dim, p.n_ff_shexp, T)
+			enc_gemv_f32_b(enc, m_b_shexp, NS.UInteger((base + p.n_ff_shexp * dim) * 4), m_b_bxb, 0, m_b_moe_g_b, 0, dim, p.n_ff_shexp, T)
+			enc_elementwise(enc, m_pso_swiglu, m_b_moe_g_b, m_b_moe_h_b, T * p.n_ff_shexp)
+			enc_gemv_f32_b(enc, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim) * 4), m_b_moe_g_b, 0, m_b_moe_shexp_out_b, 0, p.n_ff_shexp, dim, T)
+			enc_gemv_f32_b(enc, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp) * 4), m_b_bxb, 0, m_b_moe_shexp_gate_b, 0, dim, 1, T)
+		}
 		enc->endEncoding()
 		cmd->commit()
 		cmd->waitUntilCompleted()
@@ -2870,33 +3040,48 @@ switch lw.layer_type {
 		up_base := woff(raw_data(mw.up_exps.data))
 		gate_base := woff(raw_data(mw.gate_exps.data))
 		down_base := woff(raw_data(mw.down_exps.data))
-		has_shexp := 0
-		if mw.shexp_up != nil { has_shexp = 1 }
-		for t in 0 ..< T {
-			tk := t * used
-			for k in 0 ..< used {
-				e := int(sel[tk + k])
-				enc_gemv(enc2, mw.up_exps.kind, up_base + NS.UInteger(e * n_ff * up_rb), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_hbuf[0], 0, dim, n_ff)
-				enc_gemv(enc2, mw.gate_exps.kind, gate_base + NS.UInteger(e * n_ff * up_rb), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_gbuf[0], 0, dim, n_ff)
-				enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[0], m_moe_hbuf[0], n_ff)
-				#partial switch mw.down_exps.kind {
-				case .Q8_0:
-					enc_gemv_q80(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
-				case .Q5_0:
-					enc_gemv_q50(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
-				case:
-					enc_gemv(enc2, mw.down_exps.kind, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
+		grouped_ok := mw.up_exps.kind == .Q4_K && mw.gate_exps.kind == .Q4_K &&
+			(mw.down_exps.kind == .Q8_0 || mw.down_exps.kind == .Q5_0)
+		if grouped_ok {
+			// grouped GEMM: 2-3 dispatches instead of T*used*4
+			enc_moe_up_id_q4(enc2, up_base, gate_base, m_b_bxb, m_b_moe_sel_b, dim, n_ff, used, T)
+			enc_elementwise(enc2, m_pso_swiglu, m_b_moe_g_b, m_b_moe_h_b, T * used * n_ff)
+			#partial switch mw.down_exps.kind {
+			case .Q8_0:
+				enc_moe_down_id(enc2, m_pso_moe_down_id_q80, down_base, m_b_moe_g_b, m_b_moe_sel_b, m_b_moe_w_b, m_b_bxb, m_b_moe_shexp_out_b, m_b_moe_shexp_gate_b, n_ff, dim, used, T, has_shexp)
+			case .Q5_0:
+				enc_moe_down_id(enc2, m_pso_moe_down_id_q50, down_base, m_b_moe_g_b, m_b_moe_sel_b, m_b_moe_w_b, m_b_bxb, m_b_moe_shexp_out_b, m_b_moe_shexp_gate_b, n_ff, dim, used, T, has_shexp)
+			case:
+				unreachable()
+			}
+		} else {
+			// fallback: per-token expert dispatch (arbitrary kinds)
+			for t in 0 ..< T {
+				tk := t * used
+				for k in 0 ..< used {
+					e := int(sel[tk + k])
+					enc_gemv(enc2, mw.up_exps.kind, up_base + NS.UInteger(e * n_ff * up_rb), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_hbuf[0], 0, dim, n_ff)
+					enc_gemv(enc2, mw.gate_exps.kind, gate_base + NS.UInteger(e * n_ff * up_rb), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_gbuf[0], 0, dim, n_ff)
+					enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[0], m_moe_hbuf[0], n_ff)
+					#partial switch mw.down_exps.kind {
+					case .Q8_0:
+						enc_gemv_q80(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
+					case .Q5_0:
+						enc_gemv_q50(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
+					case:
+						enc_gemv(enc2, mw.down_exps.kind, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[0], 0, m_b_moe_down_b, NS.UInteger(tk * dim * 4), n_ff, dim)
+					}
 				}
+				if has_shexp == 1 {
+					base := l * (2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp + dim)
+					enc_gemv_f32(enc2, m_b_shexp, NS.UInteger(base * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_hbuf[0], 0, dim, p.n_ff_shexp)
+					enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + p.n_ff_shexp * dim) * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_gbuf[0], 0, dim, p.n_ff_shexp)
+					enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[0], m_moe_hbuf[0], p.n_ff_shexp)
+					enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim) * 4), m_moe_gbuf[0], 0, m_b_moe_shexp_out_b, NS.UInteger(t * dim * 4), p.n_ff_shexp, dim)
+					enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp) * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_b_moe_shexp_gate_b, NS.UInteger(t * 4), dim, 1)
+				}
+				enc_moe_combine_off(enc2, used, has_shexp, dim, m_b_moe_down_b, m_b_moe_w_b, m_b_moe_shexp_out_b, m_b_moe_shexp_gate_b, m_b_bxb, NS.UInteger(t * dim * 4), NS.UInteger(tk * dim * 4), NS.UInteger(tk * 4), NS.UInteger(t * dim * 4), NS.UInteger(t * 4))
 			}
-			if has_shexp == 1 {
-				base := l * (2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp + dim)
-				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger(base * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_hbuf[0], 0, dim, p.n_ff_shexp)
-				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + p.n_ff_shexp * dim) * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_moe_gbuf[0], 0, dim, p.n_ff_shexp)
-				enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[0], m_moe_hbuf[0], p.n_ff_shexp)
-				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim) * 4), m_moe_gbuf[0], 0, m_b_moe_shexp_out_b, NS.UInteger(t * dim * 4), p.n_ff_shexp, dim)
-				enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp) * 4), m_b_bxb, NS.UInteger(t * dim * 4), m_b_moe_shexp_gate_b, NS.UInteger(t * 4), dim, 1)
-			}
-			enc_moe_combine_off(enc2, used, has_shexp, dim, m_b_moe_down_b, m_b_moe_w_b, m_b_moe_shexp_out_b, m_b_moe_shexp_gate_b, m_b_bxb, NS.UInteger(t * dim * 4), NS.UInteger(tk * dim * 4), NS.UInteger(tk * 4), NS.UInteger(t * dim * 4), NS.UInteger(t * 4))
 		}
 		enc_elementwise(enc2, m_pso_residual, m_b_bx, m_b_bxb, T * dim)
 		enc2->endEncoding()
