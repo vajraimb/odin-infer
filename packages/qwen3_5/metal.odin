@@ -1226,6 +1226,46 @@ kernel void moe_combine(device const float *down [[buffer(0)]],
     if (P.y) { float g = 1.0 / (1.0 + exp(-shexp_gate)); acc += g * shexp[gid]; }
     out[gid] = acc;
 }
+
+// Batched F32 GEMV for the MoE router: x is [T x dim] token-major, w is
+// [d x dim] row-major, out is [T x d] token-major. One thread per (row, token).
+kernel void gemv_f32_b(device const float *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant uint3 &dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint r = gid / dim.z; uint t = gid % dim.z;   // dim.z = T
+    if (r >= dim.d) return;
+    device const float *wr = wb + (ulong)r * dim.n;
+    device const float *xt = x + (ulong)t * dim.n;
+    float sum = 0.0;
+    for (uint j = 0; j < dim.n; j++) sum += wr[j] * xt[j];
+    out[(ulong)t * dim.d + r] = sum;
+}
+
+// Batched MoE router tail: one thread per token column. Same math as
+// moe_softmax_topk (softmax -> top-k -> renormalize with F16-min clamp).
+kernel void moe_softmax_topk_b(device const float *logits [[buffer(0)]],
+    device int *sel [[buffer(1)]], device float *weights [[buffer(2)]],
+    constant uint3 &P [[buffer(3)]], uint t [[thread_position_in_grid]]) {
+    uint n = P.x, k = P.y, T = P.z;
+    if (t >= T) return;
+    threadgroup float probs[256];
+    threadgroup bool picked[256];
+    device const float *lg = logits + (ulong)t * n;
+    float m = -1e30;
+    for (uint j = 0; j < n; j++) m = max(m, lg[j]);
+    float sum = 0.0;
+    for (uint j = 0; j < n; j++) { probs[j] = exp(lg[j] - m); sum += probs[j]; }
+    for (uint j = 0; j < n; j++) { probs[j] /= sum; picked[j] = false; }
+    for (uint i = 0; i < k; i++) {
+        int best = -1; float bv = -1e30;
+        for (uint j = 0; j < n; j++) { if (!picked[j] && probs[j] > bv) { bv = probs[j]; best = (int)j; } }
+        sel[(ulong)t * k + i] = best; weights[(ulong)t * k + i] = probs[best]; picked[best] = true;
+    }
+    float wsum = 0.0;
+    for (uint i = 0; i < k; i++) wsum += weights[(ulong)t * k + i];
+    if (wsum < 6.103515625e-5) wsum = 6.103515625e-5;
+    for (uint i = 0; i < k; i++) weights[(ulong)t * k + i] /= wsum;
+}
 `
 
 // ---------- metal state ----------
@@ -1266,6 +1306,7 @@ m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1
 @(private = "file")
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
 	m_pso_gemv_f32, m_pso_gemv_q80, m_pso_gemv_q50, m_pso_moe_topk, m_pso_moe_combine: ^MTL.ComputePipelineState
+	m_pso_gemv_f32_b, m_pso_moe_topk_b: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 @(private = "file")
@@ -1654,6 +1695,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_swiglu = make_pso(lib, "swiglu"); m_pso_residual = make_pso(lib, "residual")
 	m_pso_gemv_f32 = make_pso(lib, "moe_gemv_f32"); m_pso_gemv_q80 = make_pso(lib, "moe_gemv_q80"); m_pso_gemv_q50 = make_pso(lib, "moe_gemv_q50")
 	m_pso_moe_topk = make_pso(lib, "moe_softmax_topk"); m_pso_moe_combine = make_pso(lib, "moe_combine")
+	m_pso_gemv_f32_b = make_pso(lib, "gemv_f32_b"); m_pso_moe_topk_b = make_pso(lib, "moe_softmax_topk_b")
 	m_pso_conv = make_pso(lib, "conv1d_step_silu"); m_pso_l2norm = make_pso(lib, "l2norm_scale")
 	m_pso_delta = make_pso(lib, "delta_recurrent"); m_pso_rmsgated = make_pso(lib, "rmsnorm_gated")
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
@@ -2086,6 +2128,29 @@ enc_gemv_q50 :: proc(enc: ^MTL.ComputeCommandEncoder, w_off: NS.UInteger,
 	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
 	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
+}
+
+// Batched router: one GEMV over T tokens; logits are [T x n_expert].
+@(private = "file")
+enc_gemv_f32_b :: proc(enc: ^MTL.ComputeCommandEncoder, wb: ^MTL.Buffer, w_off: NS.UInteger,
+	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d, tcount: int) {
+	enc->setComputePipelineState(m_pso_gemv_f32_b)
+	enc->setBuffer(wb, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+	P := [3]u32{u32(n), u32(d), u32(tcount)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer((d * tcount + 255) / 256), 1, 1}, MTL.Size{256, 1, 1})
+}
+
+@(private = "file")
+enc_moe_topk_b :: proc(enc: ^MTL.ComputeCommandEncoder, logits: ^MTL.Buffer, l_off: NS.UInteger,
+	sel: ^MTL.Buffer, s_off: NS.UInteger, w: ^MTL.Buffer, w_off: NS.UInteger, n_expert, k, tcount: int) {
+	enc->setComputePipelineState(m_pso_moe_topk_b)
+	enc->setBuffer(logits, l_off, 0)
+	enc->setBuffer(sel, s_off, 1)
+	enc->setBuffer(w, w_off, 2)
+	P := [3]u32{u32(n_expert), u32(k), u32(tcount)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 3)
+	enc->dispatchThreadgroups(MTL.Size{1, 1, 1}, MTL.Size{NS.Integer(tcount), 1, 1})
 }
 
 @(private = "file")
