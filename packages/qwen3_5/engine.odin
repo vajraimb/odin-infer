@@ -25,7 +25,7 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 
 	if opts.use_metal {
 		when ODIN_OS == .Darwin {
-			e.metal_ready = metal_init(&e.transformer)
+			e.metal_ready = metal_init(&e.transformer, path)
 			if !e.metal_ready {
 				fmt.eprintln("metal: init failed, falling back to CPU")
 				// Metal failed → allocate CPU Run_State for the CPU forward path

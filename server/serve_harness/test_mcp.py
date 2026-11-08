@@ -22,13 +22,23 @@ MODEL = os.environ.get(
 )
 
 
+
+def newest_src_mtime():
+    newest = os.path.getmtime(SERVE_SRC)
+    for root, _, files in os.walk(os.path.join(ROOT, "packages")):
+        for f in files:
+            if f.endswith(".odin"):
+                newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+    return newest
+
+
 def fail(msg):
     print(f"FAIL: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
 def build_binary():
-    if os.path.exists(TEST_BIN) and os.path.getmtime(TEST_BIN) > os.path.getmtime(SERVE_SRC):
+    if os.path.exists(TEST_BIN) and os.path.getmtime(TEST_BIN) > newest_src_mtime():
         print("build: cached test binary is fresh")
         return
     print("build: compiling serve.odin (first run may take a minute)...")

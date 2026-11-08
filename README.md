@@ -74,6 +74,14 @@ models/     模型软链（gitignored）
 消融开关：写 `/tmp/qprof_flags`（noout/nomlp/nosmall/nonorm/noattn/nodelta），
 无需重启。
 
+**首启形状调优**：首次以 Metal 启动时，引擎用真实权重在真实矩阵形状上实测
+各 GEMV 内核变体（prod/r2/v3/o），按 (量化类型, 行数, 列数) 选最优并缓存到
+`~/.odin-infer/<model>.tune`（`ODIN_TUNE_DIR` 覆盖，`ODIN_TUNE=0` 关闭），
+之后启动直接复用——这是 M1/M2/M3/M4 各代 GPU 的自动适配机制。
+启动同时打印内存预算估算（`mem: ... total=.. / physical=.. (%)`），超 85%
+告警，见 [docs/MEMORY.md](docs/MEMORY.md)。持续负载热降频对照协议见
+[docs/THERMAL.md](docs/THERMAL.md)（`tools/thermal_test.py`）。
+
 ## 库 API（嵌入）
 
 ```odin

@@ -15,6 +15,8 @@ import "core:math"
 import "core:mem"
 import "core:strings"
 import "core:os"
+import "core:strconv"
+import "core:time"
 import MTL "vendor:darwin/Metal"
 
 PAGE_SIZE :: 16384
@@ -1128,6 +1130,12 @@ g_prof_nofull: bool  // ablation: skip full-attention per-token block (env QPROF
 g_gemv3: bool       // use row-split v3 GEMV kernels (env QGEMV3=1)
 g_gemv2r: bool      // use 2-rows-per-lane GEMV kernels (env QGEMV2R=1)
 g_normfuse: bool    // fuse rmsnorm into GEMV dispatches (env QGEMVNORM=1)
+
+// ---- first-run GEMV kernel autotuning (ODIN_TUNE=0 disables) ----
+Tune_Cand :: enum { Prod, R2, V3, O }
+Tune_Entry :: struct { kind: ggml.GGML_Type, d, n: int, cand: Tune_Cand }
+g_tune: [dynamic]Tune_Entry
+g_tune_enabled: bool
 @(private = "file")
 m_weights: ^MTL.Buffer
 @(private = "file")
@@ -1470,7 +1478,7 @@ new_shared_bytes :: proc(n_bytes: int) -> ^MTL.Buffer {
 	return m_device->newBufferWithLength(NS.UInteger(n_bytes), MTL.ResourceStorageModeShared)
 }
 
-metal_init :: proc(t: ^Transformer) -> bool {
+metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g := &t.gguf
 	c := t.config
 
@@ -1489,6 +1497,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
+	g_tune_enabled = os.get_env("ODIN_TUNE", context.temp_allocator) != "0"
 	fmt.eprintfln("metal: shader fastMath={} (QFASTMATH=0 to disable)", g_fast_math)
 	fmt.eprintfln("metal: maxThreadgroupMemoryLength={} bytes", m_device->maxThreadgroupMemoryLength())
 
@@ -1594,6 +1603,30 @@ metal_init :: proc(t: ^Transformer) -> bool {
 
 	print_quant_summary(t)
 
+	if g_tune_enabled {
+		autotune(t, model_path)
+	}
+
+	// Memory budget: report model + KV + linear-state footprint against the
+	// machine's physical RAM; warn when the engine would eat >85% of it
+	// (the 8 GB MacBook Air case — see docs/MEMORY.md).
+	if pi := NS.ProcessInfo_processInfo(); pi != nil {
+		phys := u64(NS.ProcessInfo_physicalMemory(pi))
+		if fi, ferr := os.stat(model_path, context.allocator); ferr == os.ERROR_NONE {
+			kv_bytes := 2 * u64(c.n_full) * u64(c.seq_len) * u64(c.n_kv_heads) * u64(c.head_dim) * 4
+			conv_dim := c.lin_n_k_heads * c.lin_head_k_dim * 2 + c.lin_n_v_heads * c.lin_head_v_dim
+			lin_bytes :=
+				u64(c.n_linear) * u64(conv_dim) * u64(c.lin_conv_kernel - 1) * 4 +
+				u64(c.n_linear) * u64(c.lin_n_v_heads) * u64(c.lin_head_k_dim) * u64(c.lin_head_v_dim) * 4
+			total := u64(fi.size) + kv_bytes + lin_bytes
+			frac := f64(total) / f64(phys) * 100.0
+			level := "OK"
+			if frac > 85.0 { level = "WARNING: tight for this machine" }
+			fmt.eprintfln("mem: model=%.2f GB kv=%.2f GB lin=%.2f GB total=%.2f GB / physical=%.2f GB (%.0f%%) %s",
+				f64(fi.size) / 1e9, f64(kv_bytes) / 1e9, f64(lin_bytes) / 1e9, f64(total) / 1e9, f64(phys) / 1e9, frac, level)
+		}
+	}
+
 	metal_enabled = true
 	return true
 }
@@ -1652,25 +1685,224 @@ bytes_of :: proc(p: rawptr, n: int) -> []u8 { return ([^]u8)(p)[:n] }
 woff :: proc(p: rawptr) -> NS.UInteger { return NS.UInteger(uintptr(p) - m_mmap_base) }
 
 @(private = "file")
+tune_pso :: proc(kind: ggml.GGML_Type, cand: Tune_Cand) -> (pso: ^MTL.ComputePipelineState, rows_tg: int) {
+	rows_tg = GEMV_ROWS
+	switch cand {
+	case .Prod:
+		pso = pso_for(kind)
+	case .R2:
+		pso = kind == .Q4_K ? m_pso_q4_k2r : m_pso_q6_k2r
+		rows_tg = 64
+	case .V3:
+		pso = kind == .Q4_K ? m_pso_q4_k3 : m_pso_q6_k3
+		rows_tg = 64
+	case .O:
+		pso = m_pso_q4_k_o
+		rows_tg = 32
+	}
+	return
+}
+
+Tune_Shape :: struct { kind: ggml.GGML_Type, d, n: int, w_off: NS.UInteger }
+
+@(private = "file")
+tune_add_shape :: proc(shapes: ^[dynamic]Tune_Shape, kind: ggml.GGML_Type, w: rawptr, d, n: int) {
+	if d < 512 { return }
+	for s in shapes {
+		if s.kind == kind && s.d == d && s.n == n { return }
+	}
+	append(shapes, Tune_Shape{kind, d, n, woff(w)})
+}
+
+@(private = "file")
+collect_tune_shapes :: proc(t: ^Transformer) -> [dynamic]Tune_Shape {
+	c := t.config
+	w := &t.weights
+	shapes := make([dynamic]Tune_Shape, 0, 8)
+	att_head_dim := c.n_heads * c.head_dim
+	conv_dim := c.lin_n_k_heads * c.lin_head_k_dim * 2 + c.lin_n_v_heads * c.lin_head_v_dim
+	for l in 0 ..< c.n_layers {
+		lw := &w.layers[l]
+		tune_add_shape(&shapes, lw.w1.kind, raw_data(lw.w1.data), c.hidden_dim, c.dim)
+		tune_add_shape(&shapes, lw.w2.kind, raw_data(lw.w2.data), c.dim, c.hidden_dim)
+		switch lw.layer_type {
+		case .Full_Attention:
+			tune_add_shape(&shapes, lw.full.wq.kind, raw_data(lw.full.wq.data), att_head_dim, c.dim)
+		case .Linear_Attention:
+			tune_add_shape(&shapes, lw.linear.in_qkv.kind, raw_data(lw.linear.in_qkv.data), conv_dim, c.dim)
+		}
+	}
+	tune_add_shape(&shapes, w.output.kind, raw_data(w.output.data), c.vocab_size, c.dim)
+	return shapes
+}
+
+tune_time_ms :: proc() -> i64 { return time.to_unix_nanoseconds(time.now()) / 1_000_000 }
+
+// Wall-clock timing, 10 dispatches per command buffer, min of 3 buffers.
+// (GPU timer counters proved unreliable for single short dispatches.)
+@(private = "file")
+time_candidate :: proc(kind: ggml.GGML_Type, cand: Tune_Cand, w_off: NS.UInteger, n, d: int, xb, ob: ^MTL.Buffer) -> f64 {
+	pso, rows_tg := tune_pso(kind, cand)
+	best := math.INF_F64
+	dims := [2]u32{u32(n), u32(d)}
+	tg_x := (d + rows_tg - 1) / rows_tg
+	for iter in 0 ..< 3 {
+		t0 := tune_time_ms()
+		cmd := m_queue->commandBuffer()
+		enc := cmd->computeCommandEncoder()
+		enc->setComputePipelineState(pso)
+		enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, 0, 1); enc->setBuffer(ob, 0, 2)
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		for rep in 0 ..< 10 {
+			enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
+		}
+		enc->endEncoding(); cmd->commit(); cmd->waitUntilCompleted()
+		ms := f64(tune_time_ms() - t0) / 10.0
+		if ms < best { best = ms }
+	}
+	return best
+}
+
+tune_cache_dir :: proc() -> string {
+	dir := os.get_env("ODIN_TUNE_DIR", context.allocator)
+	if dir == "" {
+		home := os.get_env("HOME", context.allocator)
+		dir = strings.concatenate({home, "/.odin-infer"}, context.allocator)
+	}
+	return dir
+}
+
+tune_cache_path :: proc(model_path: string) -> string {
+	base := model_path
+	if idx := strings.last_index(model_path, "/"); idx >= 0 {
+		base = model_path[idx + 1:]
+	}
+	return strings.concatenate({tune_cache_dir(), "/", base, ".tune"}, context.allocator)
+}
+
+tune_kind_str :: proc(kind: ggml.GGML_Type) -> string {
+	#partial switch kind {
+	case .Q4_K: return "Q4_K"
+	case .Q6_K: return "Q6_K"
+	case:       return "?"
+	}
+}
+
+tune_cand_str :: proc(cand: Tune_Cand) -> string {
+	switch cand {
+	case .Prod: return "prod"
+	case .R2:   return "r2"
+	case .V3:   return "v3"
+	case .O:    return "o"
+	case:       return "?"
+	}
+}
+
+tune_load :: proc(path: string) -> bool {
+	data, err := os.read_entire_file(path, context.allocator)
+	if err != os.ERROR_NONE { return false }
+	for line in strings.split_lines(string(data)) {
+		fields := strings.fields(line)
+		if len(fields) < 4 { continue }
+		kind: ggml.GGML_Type
+		if fields[0] == "Q4_K" { kind = .Q4_K }
+		else if fields[0] == "Q6_K" { kind = .Q6_K } else { continue }
+		d, ok1 := strconv.parse_int(fields[1])
+		n, ok2 := strconv.parse_int(fields[2])
+		if !ok1 || !ok2 { continue }
+		cand: Tune_Cand
+		switch fields[3] {
+		case "prod": cand = .Prod
+		case "r2":   cand = .R2
+		case "v3":   cand = .V3
+		case "o":    cand = .O
+		case:        continue
+		}
+		append(&g_tune, Tune_Entry{kind, d, n, cand})
+	}
+	return len(g_tune) > 0
+}
+
+tune_save :: proc(path: string) {
+	_ = os.make_directory(tune_cache_dir())
+	f, err := os.open(path, os.O_CREATE | os.O_WRONLY | os.O_TRUNC)
+	if err != os.ERROR_NONE {
+		fmt.eprintfln("tune: cannot write {} ({})", path, err)
+		return
+	}
+	defer os.close(f)
+	st := os.to_stream(f)
+	for e in g_tune {
+		fmt.wprintfln(st, "{} {} {} {}", tune_kind_str(e.kind), e.d, e.n, tune_cand_str(e.cand))
+	}
+	fmt.eprintfln("tune: saved {} kernel picks to {}", len(g_tune), path)
+}
+
+// First-run autotune: time each compiled GEMV variant on the real weight
+// shapes and pick the fastest per (kind, rows, cols). Results are cached in
+// ~/.odin-infer/<model>.tune (ODIN_TUNE_DIR overrides) and reused on later
+// starts — this is what adapts the engine to M1/M2/M3/M4 GPU generations.
+autotune :: proc(t: ^Transformer, model_path: string) {
+	path := tune_cache_path(model_path)
+	if tune_load(path) {
+		fmt.eprintfln("tune: loaded {} kernel picks from {} (set ODIN_TUNE_DIR to retune)", len(g_tune), path)
+		return
+	}
+	shapes := collect_tune_shapes(t)
+	max_n, max_d := 0, 0
+	for s in shapes {
+		max_n = max(max_n, s.n)
+		max_d = max(max_d, s.d)
+	}
+	xb := new_shared(max_n)
+	ob := new_shared(max_d)
+	xs := xb->contentsAsSlice([]f32)
+	for i in 0 ..< max_n { xs[i] = f32(i % 7) * 0.01 }
+
+	for s in shapes {
+		best := Tune_Cand.Prod
+		best_ms := math.INF_F64
+		cands := []Tune_Cand{.Prod, .R2, .V3}
+		if s.kind == .Q4_K { cands = []Tune_Cand{.Prod, .R2, .V3, .O} }
+		row: strings.Builder
+		strings.builder_init(&row, context.allocator)
+		for cand in cands {
+			ms := time_candidate(s.kind, cand, s.w_off, s.n, s.d, xb, ob)
+			strings.write_string(&row, fmt.tprintf(" {}={:.2f}ms", tune_cand_str(cand), ms))
+			if ms < best_ms {
+				best_ms = ms
+				best = cand
+			}
+		}
+		append(&g_tune, Tune_Entry{s.kind, s.d, s.n, best})
+		fmt.eprintfln("tune: {} {}x{} -> {}{}", tune_kind_str(s.kind), s.d, s.n, tune_cand_str(best), strings.to_string(row))
+	}
+	tune_save(path)
+}
+
 enc_gemv :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off: NS.UInteger,
 	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int) {
 	pso := pso_for(kind)
-	// NOTE: gemv_q4_k_o (llama.cpp default shape, 32 lanes/row x 4 rows/thread)
-	// is compiled but NOT selected: the harness sweep with wall-clock timing +
-	// CPU-reference verification shows the production 8-lane kernel is faster
-	// on every shape (output 248k rows: 6.4 ms vs 8.2 ms for the o-variant).
+	rows_tg := GEMV_ROWS
+	// Kernel selection order: env overrides (QGEMV3/QGEMV2R, handled inside
+	// pso_for) > first-run autotune table > production default. The autotune
+	// table is per (kind, rows, cols) and adapts to the GPU generation.
+	if (kind == .Q4_K || kind == .Q6_K) && !g_gemv3 && !g_gemv2r && len(g_tune) > 0 {
+		for e in g_tune {
+			if e.kind == kind && e.d == d && e.n == n {
+				pso, rows_tg = tune_pso(kind, e.cand)
+				break
+			}
+		}
+	} else if (kind == .Q4_K || kind == .Q6_K) && (g_gemv3 || g_gemv2r) {
+		rows_tg = 64
+	}
 	enc->setComputePipelineState(pso)
 	enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
 	dims := [2]u32{u32(n), u32(d)}
 	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
-	if (kind == .Q4_K || kind == .Q6_K) && (g_gemv3 || g_gemv2r) {
-		// v3 / 2r kernels: 256 threads/TG, 64 rows/TG
-		tg_x := (d + 63) / 64
-		enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
-		return
-	}
-	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
-	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{GEMV_TG, 1, 1})
+	tg_x := (d + rows_tg - 1) / rows_tg
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
 }
 
 // Norm-fused GEMV: the kernel recomputes rms(x) cooperatively and folds the

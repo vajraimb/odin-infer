@@ -69,7 +69,8 @@ Air 定位。
 1. ~~repo 整合 + 定位文档~~ ✅
 2. ~~MCP 适配层~~ ✅（stdio 已上线：`odin.chat`/`odin.models` 工具 + Claude Code /
    Cursor 配置样例 + `test_mcp.py` 全握手测试；SSE/streamable HTTP 后续）
-3. 首启形状调优 + 热测试协议（Air 实证）
-4. 内存预算模式（8GB 机型默认配置）
+3. ~~首启形状调优~~ ✅（运行时实测选优 + 缓存复用，`test_tune.py` 验证）/
+   ~~热测试协议~~ ✅（`tools/thermal_test.py` + `docs/THERMAL.md`，实证待跑）
+4. ~~内存预算模式~~ ✅（启动 `mem:` 估算 + 85% 告警 + `docs/MEMORY.md` 8GB 配置表）
 5. （可选）性能再攻坚：需完整 Xcode（`xcrun metal` + Instruments GPU 计数
    器），目标补齐最后 ~11% 解码差距
