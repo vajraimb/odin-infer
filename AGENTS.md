@@ -102,8 +102,10 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 
 ## MoE (qwen35moe)
 
-- Supported on the CPU path (Metal MoE kernels are a TODO; engine_load falls
-  back to CPU with a warning).
+- CPU + Metal paths supported. Metal MoE: GPU router (moe_gemv_f32 +
+  moe_softmax_topk, one sync per layer), expert GEMVs reuse the production
+  kernels via tensor-base + expert offsets, moe_combine does the weighted sum;
+  shared expert runs via moe_gemv_f32 on F32 uploads. MOE_CPU=1 forces CPU.
 - Expert tensor layout (verified against the real unsloth 35B-A3B GGUF header):
   `ffn_gate_inp` [dim, n_expert], `ffn_up_exps`/`ffn_gate_exps`
   [dim, n_ff_exp, n_expert], `ffn_down_exps` [n_ff_exp, dim, n_expert] —
@@ -136,6 +138,15 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 - GGUF tensor dims are ggml ne order (ne0 fastest) = REVERSED of numpy shape;
   hand-written GGUF writers must reverse dims and pad the data section to
   32 bytes.
+- MTL setBuffer signature is `(buffer, offset, index)` — passing the index as
+  the second arg silently rebinds index 0 (debugged: router weights landed in
+  the logits buffer). / MTL setBuffer 签名是 (buffer, offset, index)，第二个参数当 index 写会静默重绑 index 0。
+- Expert GEMV offsets are relative to EACH tensor; m_weights is the whole-model
+  mmap — add woff(tensor.data) as the base. / 专家偏移是张量内相对偏移，需加 woff(张量) 基址。
+- Q5_0 high bits: element j<16 uses qh bit j; element j+16 uses qh bit j+16
+  (CPU dequant masks 0x10 after >>(j+12)). / Q5_0 高比特：元素 j+16 用的是 qh 的第 j+16 位。
+- Community MoE GGUFs mix per-layer quant kinds (0.8B-MoE: down_exps alternates
+  Q8_0/Q5_0) — dispatch by tensor kind, never assume. / 社区 MoE GGUF 逐层混合量化种类，按张量 kind 分派。
 
 ## Post-change self-check
 

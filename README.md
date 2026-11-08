@@ -73,11 +73,12 @@ residency, cooled machine:
 - **Qwen3.5 hybrid attention** (Ornith / heretic family): text-only, 248k vocab.
   The 9B is validated end-to-end; other sizes of the same architecture load
   automatically from GGUF metadata (MTP-aware loader).
-- **Qwen3.5-MoE** (35B-A3B / 122B-A10B / 397B-A17B): supported on the CPU path
-  (softmax top-k routing + sigmoid-gated shared expert, bit-exact validated);
-  Metal MoE kernels are a TODO (see packages/qwen3_5/README.md). Small
-  community qwen35moe variants (e.g. 0.8B-MoE) work today, including layer
-  counts that llama.cpp itself rejects.
+- **Qwen3.5-MoE** (35B-A3B / 122B-A10B / 397B-A17B): CPU + Metal paths
+  supported — softmax top-k routing, per-expert GEMV dispatch (Q4_K/Q5_0/Q8_0/
+  Q6_K), sigmoid-gated shared expert; Metal output matches CPU to ~3e-3
+  (fastMath) at ~45× CPU speed on the 0.8B-MoE (37 ms/tok). Small community
+  qwen35moe variants work today, including layer counts that llama.cpp itself
+  rejects.
 - No MoE-free fallback to older architectures, no multimodal, no other model
   families — a narrow scope, on purpose.
 

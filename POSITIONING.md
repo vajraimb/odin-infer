@@ -90,8 +90,11 @@ months of work and does not serve the Air positioning.
    routing + gated shared expert; bit-exact vs a Python reference; validated
    on a real 0.8B-MoE GGUF. Metal MoE kernels + a 24 GB-machine real-model run
    remain.
-7. **Metal MoE kernels** (next) — route top-k experts to the existing GEMV
-   kernels via weight offsets; validated against the CPU path on the 0.8B-MoE
-   model. This is what makes 35B-A3B usable in practice.
+7. ~~Metal MoE kernels~~ ✅ — top-k experts dispatched to the GEMV kernels
+   (Q4_K/Q5_0/Q8_0) via tensor-base + expert offsets; GPU router (gemv_f32 +
+   softmax-topk) with one sync per layer; validated against the CPU path on
+   the 0.8B-MoE (max_abs ~3e-3, 37 ms/tok vs 1.7 s/tok CPU). The 35B-A3B
+   real-model run still needs a 24 GB machine; indirect-dispatch (no per-layer
+   sync) is the next optimization.
 8. (optional) perf round 2: needs full Xcode (`xcrun metal` + Instruments GPU
    counters) to chase the last ~11% decode gap.

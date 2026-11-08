@@ -86,7 +86,6 @@ moe_ffn :: proc(x, out: []f32, mw: ^Moe_Weights, p: Config) {
 		sel[k] = best
 		picked[best] = true
 	}
-
 	// normalized weights (clamped divisor) + expert_weights_scale
 	sum: f32 = 0.0
 	for k in 0 ..< used {

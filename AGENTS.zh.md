@@ -95,7 +95,10 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 
 ## MoE（qwen35moe）
 
-- CPU 路径已支持（Metal MoE 内核为 TODO；加载时自动回退 CPU 并告警）。
+- CPU + Metal 双路径已支持。Metal MoE：GPU router（moe_gemv_f32 +
+  moe_softmax_topk，每层一次同步）、专家 GEMV 复用生产内核（张量基址+专家
+  偏移）、moe_combine 加权求和；共享专家经 F32 上传走 moe_gemv_f32。
+  MOE_CPU=1 强制走 CPU。
 - 专家张量布局（已对真实 unsloth 35B-A3B 头部验证）：`ffn_gate_inp`
   [dim, n_expert]，`ffn_up_exps`/`ffn_gate_exps` [dim, n_ff_exp, n_expert]，
   `ffn_down_exps` [n_ff_exp, dim, n_expert]——ne0 是收缩维，量化粒度 = 一行
@@ -124,6 +127,14 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   数据会掩盖此错。
 - GGUF 张量维度是 ggml ne 序（ne0 最快）= numpy shape 的反转；手写 GGUF
   写入器要反转 dims 且数据段 32 字节对齐。
+- MTL setBuffer 签名是 (buffer, offset, index)——第二个参数当 index 写会静默
+  重绑 index 0（曾导致 router 权重写进 logits 缓冲区）。
+- 专家 GEMV 偏移是张量内相对偏移；m_weights 是整模型 mmap，必须加
+  woff(张量) 基址。
+- Q5_0 高比特：元素 j+16 用的是 qh 第 j+16 位（CPU 解量化是 >>(j+12) 后掩
+  0x10）。
+- 社区 MoE GGUF 逐层混合量化种类（0.8B-MoE 的 down_exps 在 Q8_0/Q5_0 间
+  交替）——按张量 kind 分派，不要假设。
 
 ## 验证清单（改动后自检）
 

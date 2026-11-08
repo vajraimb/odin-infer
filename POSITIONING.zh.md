@@ -75,8 +75,9 @@
 6. ~~Qwen3.5-MoE CPU 支持~~ ✅ —— 35B-A3B 系加载器 + softmax top-k 路由 +
    门控共享专家；与 Python 参考逐位一致；真实 0.8B-MoE GGUF 已验证。Metal
    MoE 内核与 24GB 机实测待做。
-7. **Metal MoE 内核**（下一步）——把 top-k 专家的 GEMV 路由到现有内核
-   （权重偏移量复用），在 0.8B-MoE 上对拍 CPU 路径；这是 35B-A3B 实用化的
-   关键。
+7. ~~Metal MoE 内核~~ ✅ —— top-k 专家经张量基址+专家偏移分派到 GEMV 内核
+   （Q4_K/Q5_0/Q8_0）；GPU router（gemv_f32 + softmax-topk）每层一次同步；
+   0.8B-MoE 上与 CPU 对拍通过（max_abs ~3e-3，37ms/token vs CPU 1.7s）。
+   35B-A3B 真机实测仍需 24GB 机器；间接分派（去掉每层同步）是下一步优化。
 8. （可选）性能再攻坚：需完整 Xcode（`xcrun metal` + Instruments GPU 计数
    器）追最后 ~11% 解码差距。

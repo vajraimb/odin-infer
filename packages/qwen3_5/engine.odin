@@ -3,6 +3,7 @@
 package qwen3_5
 
 import "core:fmt"
+import "core:os"
 
 Engine_Opts :: struct {
 	max_ctx:     int,
@@ -23,8 +24,8 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 	// dead memory (up to GBs at large -c).
 	use_metal := opts.use_metal
 	build_transformer(&e.transformer, path, opts.max_ctx, skip_cpu_state = use_metal)
-	if e.transformer.config.is_moe && use_metal {
-		fmt.eprintln("qwen35moe: Metal MoE kernels not implemented yet; falling back to CPU")
+	if e.transformer.config.is_moe && os.get_env("MOE_CPU", context.temp_allocator) == "1" {
+		fmt.eprintln("qwen35moe: MOE_CPU=1 forced CPU path")
 		use_metal = false
 		malloc_run_state(&e.transformer.state, e.transformer.config)
 	}

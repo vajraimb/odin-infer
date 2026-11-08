@@ -1112,6 +1112,120 @@ kernel void transpose_f32(device const float * src [[buffer(0)]], device float *
     uint i = gid / T, t = gid % T;
     dst[t * dim + i] = src[gid];
 }
+
+// ============ MoE (qwen35moe) kernels ============
+// F32 GEMV: router gate_inp and the shared-expert projections (uploaded F32).
+// Same 8-lane production shape as gemv_q4_k.
+kernel void moe_gemv_f32(device const float *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    if (row < dim.d) {
+        device const float *wr = wb + (ulong)row * dim.n;
+        for (uint j = lane; j < dim.n; j += GEMV_SG) sum += wr[j] * x[j];
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+// Q8_0 GEMV: 34-byte blocks (f16 scale d + 32 int8), used by ffn_down_exps.
+kernel void moe_gemv_q80(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    if (row < dim.d) { uint nb = dim.n / 32; device const uchar *wr = wb + (ulong)row * nb * 34;
+        for (uint b = lane; b < nb; b += GEMV_SG) { device const uchar *blk = wr + b * 34;
+            float d = (float)(*(device const half*)blk);
+            device const char *qs = (device const char*)(blk + 2);
+            uint y = b * 32;
+            for (uint j = 0; j < 32; j += 8) {
+                sum += d * ((float)qs[j]   * x[y+j]   + (float)qs[j+1] * x[y+j+1] +
+                            (float)qs[j+2] * x[y+j+2] + (float)qs[j+3] * x[y+j+3] +
+                            (float)qs[j+4] * x[y+j+4] + (float)qs[j+5] * x[y+j+5] +
+                            (float)qs[j+6] * x[y+j+6] + (float)qs[j+7] * x[y+j+7]);
+            }
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+// Q5_0 GEMV: 22-byte blocks (f16 d, 4B high bits, 16B nibbles), 32 elems.
+kernel void moe_gemv_q50(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    if (row < dim.d) { uint nb = dim.n / 32; device const uchar *wr = wb + (ulong)row * nb * 22;
+        for (uint b = lane; b < nb; b += GEMV_SG) { device const uchar *blk = wr + b * 22;
+            float d = (float)(*(device const half*)blk);
+            uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
+            device const uchar *qs = blk + 6;
+            uint y = b * 32;
+            for (uint j = 0; j < 16; j += 4) {
+                // high bits: element j (j<16) uses qh bit j; element j+16 uses
+                // qh bit j+16 (the CPU dequant masks 0x10 after shifting by j+12)
+                float x0 = (float)(((int)(qs[j] & 0xF) | (int)((qh >> j) & 1u) * 16) - 16);
+                float x1 = (float)(((int)(qs[j] >> 4) | (int)((qh >> (j + 16)) & 1u) * 16) - 16);
+                float x2 = (float)(((int)(qs[j+1] & 0xF) | (int)((qh >> (j + 1)) & 1u) * 16) - 16);
+                float x3 = (float)(((int)(qs[j+1] >> 4) | (int)((qh >> (j + 17)) & 1u) * 16) - 16);
+                float x4 = (float)(((int)(qs[j+2] & 0xF) | (int)((qh >> (j + 2)) & 1u) * 16) - 16);
+                float x5 = (float)(((int)(qs[j+2] >> 4) | (int)((qh >> (j + 18)) & 1u) * 16) - 16);
+                float x6 = (float)(((int)(qs[j+3] & 0xF) | (int)((qh >> (j + 3)) & 1u) * 16) - 16);
+                float x7 = (float)(((int)(qs[j+3] >> 4) | (int)((qh >> (j + 19)) & 1u) * 16) - 16);
+                sum += d * (x0 * x[y+j] + x1 * x[y+j+16] + x2 * x[y+j+1] + x3 * x[y+j+17] +
+                            x4 * x[y+j+2] + x5 * x[y+j+18] + x6 * x[y+j+3] + x7 * x[y+j+19]);
+            }
+        }
+    }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+// MoE router tail: softmax over n_expert logits, top-k selection, weight
+// renormalization (divisor clamped to the F16 min, llama.cpp norm_w). Single
+// thread — n_expert <= 256, k <= 8 makes this trivial.
+kernel void moe_softmax_topk(device const float *logits [[buffer(0)]],
+    device int *sel [[buffer(1)]], device float *weights [[buffer(2)]],
+    constant uint2 &P [[buffer(3)]]) {
+    uint n = P.x, k = P.y;
+    threadgroup float probs[256];
+    threadgroup bool picked[256];
+    float m = -1e30;
+    for (uint j = 0; j < n; j++) m = max(m, logits[j]);
+    float sum = 0.0;
+    for (uint j = 0; j < n; j++) { probs[j] = exp(logits[j] - m); sum += probs[j]; }
+    for (uint j = 0; j < n; j++) { probs[j] /= sum; picked[j] = false; }
+    for (uint i = 0; i < k; i++) {
+        int best = -1; float bv = -1e30;
+        for (uint j = 0; j < n; j++) { if (!picked[j] && probs[j] > bv) { bv = probs[j]; best = (int)j; } }
+        sel[i] = best; weights[i] = probs[best]; picked[best] = true;
+    }
+    float wsum = 0.0;
+    for (uint i = 0; i < k; i++) wsum += weights[i];
+    if (wsum < 6.103515625e-5) wsum = 6.103515625e-5;
+    for (uint i = 0; i < k; i++) weights[i] /= wsum;
+}
+
+// Weighted sum of the selected experts' down outputs plus the gated shared
+// expert: out[i] = sum_k weights[k] * down[k*dim + i] + has_shexp * gate * shexp[i].
+// The shared-expert gate is sigmoided here (llama.cpp applies sigmoid to the
+// shared expert gate before multiplying the output).
+kernel void moe_combine(device const float *down [[buffer(0)]],
+    device float *out [[buffer(1)]], device const float *weights [[buffer(2)]],
+    device const float *shexp [[buffer(3)]],
+    constant uint3 &P [[buffer(4)]], constant float &shexp_gate [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    float acc = 0.0;
+    for (uint k = 0; k < P.x; k++) acc += weights[k] * down[k * P.z + gid];
+    if (P.y) { float g = 1.0 / (1.0 + exp(-shexp_gate)); acc += g * shexp[gid]; }
+    out[gid] = acc;
+}
 `
 
 // ---------- metal state ----------
@@ -1151,6 +1265,7 @@ m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1
 	m_pso_q4_k_o: ^MTL.ComputePipelineState           // output-layer GEMV (32 lanes/row x 4 rows/thread, llama.cpp default shape)
 @(private = "file")
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
+	m_pso_gemv_f32, m_pso_gemv_q80, m_pso_gemv_q50, m_pso_moe_topk, m_pso_moe_combine: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 @(private = "file")
@@ -1184,6 +1299,17 @@ m_batch_dim, m_batch_hidden, m_batch_max_t: int
 m_b_bx, m_b_bxb, m_b_bxbh, m_b_bxout: ^MTL.Buffer // [T*dim] x(resid), rmsnorm(x), half(x), w2-out
 @(private = "file")
 m_b_bhb, m_b_bhb2, m_b_bhb2h: ^MTL.Buffer        // [T*hidden] w1-out, w3/swiglu-out, half(swiglu-out)
+	// MoE (qwen35moe) buffers
+	m_b_router:      ^MTL.Buffer // [n_layers * n_expert * dim] f32 router weights
+	m_b_shexp:       ^MTL.Buffer // per layer: up|gate|down|gate_inp f32 (shared expert)
+	m_b_moe_logits:  ^MTL.Buffer // [n_expert] f32 router logits
+	m_b_moe_sel:     ^MTL.Buffer // [n_expert_used] i32 selected experts
+	m_b_moe_w:       ^MTL.Buffer // [n_expert_used] f32 normalized weights
+	m_b_moe_shexp_out: ^MTL.Buffer // [dim] f32 shared expert output
+	m_b_moe_shexp_gate: ^MTL.Buffer // [1] f32 shared expert gate
+	m_moe_hbuf:      [dynamic]^MTL.Buffer // per-expert silu(gate)*up results [n_ff_exp]
+	m_moe_gbuf:      [dynamic]^MTL.Buffer // per-expert gate GEMV outputs [n_ff_exp]
+	m_b_moe_down_all: ^MTL.Buffer // [used * dim] f32 expert down outputs (combine stride)
 // Stage 1b: batched attention projections (per-token stateful ops stay per-token)
 @(private = "file")
 m_b_proj_half: ^MTL.Buffer                         // [dim x T] half transpose scratch (B for MMQ)
@@ -1526,6 +1652,8 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_qnorm = make_pso(lib, "qnorm_extract"); m_pso_store_kv = make_pso(lib, "store_kv")
 	m_pso_attn = make_pso(lib, "attention"); m_pso_attn_gate = make_pso(lib, "attn_gate")
 	m_pso_swiglu = make_pso(lib, "swiglu"); m_pso_residual = make_pso(lib, "residual")
+	m_pso_gemv_f32 = make_pso(lib, "moe_gemv_f32"); m_pso_gemv_q80 = make_pso(lib, "moe_gemv_q80"); m_pso_gemv_q50 = make_pso(lib, "moe_gemv_q50")
+	m_pso_moe_topk = make_pso(lib, "moe_softmax_topk"); m_pso_moe_combine = make_pso(lib, "moe_combine")
 	m_pso_conv = make_pso(lib, "conv1d_step_silu"); m_pso_l2norm = make_pso(lib, "l2norm_scale")
 	m_pso_delta = make_pso(lib, "delta_recurrent"); m_pso_rmsgated = make_pso(lib, "rmsnorm_gated")
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
@@ -1603,7 +1731,9 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 
 	print_quant_summary(t)
 
-	if g_tune_enabled {
+	if c.is_moe {
+		moe_metal_init(t)
+	} else if g_tune_enabled {
 		autotune(t, model_path)
 	}
 
@@ -1716,6 +1846,9 @@ tune_add_shape :: proc(shapes: ^[dynamic]Tune_Shape, kind: ggml.GGML_Type, w: ra
 
 @(private = "file")
 collect_tune_shapes :: proc(t: ^Transformer) -> [dynamic]Tune_Shape {
+	if t.config.is_moe {
+		return make([dynamic]Tune_Shape)
+	}
 	c := t.config
 	w := &t.weights
 	shapes := make([dynamic]Tune_Shape, 0, 8)
@@ -1878,6 +2011,177 @@ autotune :: proc(t: ^Transformer, model_path: string) {
 		fmt.eprintfln("tune: {} {}x{} -> {}{}", tune_kind_str(s.kind), s.d, s.n, tune_cand_str(best), strings.to_string(row))
 	}
 	tune_save(path)
+}
+
+// ============ MoE (qwen35moe) Metal path ============
+// Router weights and the shared expert are dequantized at load (F32) and
+// uploaded once; expert tensors stay in m_weights and are dispatched with
+// per-expert offsets. Router + top-k run on the GPU; the selected expert ids
+// are read back once per layer (a single sync) to drive the expert dispatches.
+
+moe_metal_init :: proc(t: ^Transformer) {
+	c := t.config
+	w := &t.weights
+	router_stride := c.n_expert * c.dim
+	m_b_router = new_shared(c.n_layers * router_stride * 4)
+	rs := m_b_router->contentsAsSlice([]f32)
+	shexp_up_len := c.n_ff_shexp * c.dim
+	shexp_down_len := c.dim * c.n_ff_shexp
+	shexp_stride := shexp_up_len * 2 + shexp_down_len + c.dim
+	m_b_shexp = new_shared(c.n_layers * shexp_stride * 4)
+	ss := m_b_shexp->contentsAsSlice([]f32)
+	for l in 0 ..< c.n_layers {
+		mw := &w.layers[l].moe
+		copy(rs[l * router_stride:], mw.gate_inp)
+		if mw.shexp_up != nil {
+			copy(ss[l * shexp_stride:], mw.shexp_up)
+			copy(ss[l * shexp_stride + shexp_up_len:], mw.shexp_gate)
+			copy(ss[l * shexp_stride + 2 * shexp_up_len:], mw.shexp_down)
+			copy(ss[l * shexp_stride + 2 * shexp_up_len + shexp_down_len:], mw.shexp_gate_inp)
+		}
+	}
+	m_b_moe_logits = new_shared(max(c.n_expert, 1) * 4)
+	m_b_moe_sel = new_shared(max(c.n_expert_used, 1) * 4)
+	m_b_moe_w = new_shared(max(c.n_expert_used, 1) * 4)
+	m_b_moe_shexp_out = new_shared(max(c.dim, 1) * 4)
+	m_b_moe_shexp_gate = new_shared(4)
+	m_moe_hbuf = make([dynamic]^MTL.Buffer, c.n_expert_used)
+	m_moe_gbuf = make([dynamic]^MTL.Buffer, c.n_expert_used)
+	for k in 0 ..< c.n_expert_used {
+		m_moe_hbuf[k] = new_shared(max(c.n_ff_exp, 1) * 4)
+		m_moe_gbuf[k] = new_shared(max(c.n_ff_exp, 1) * 4)
+	}
+	m_b_moe_down_all = new_shared(max(c.n_expert_used * c.dim, 1) * 4)
+	fmt.eprintfln("moe metal: router=%d KB shexp=%d KB", c.n_layers * router_stride * 4 / 1024, c.n_layers * shexp_stride * 4 / 1024)
+}
+
+@(private = "file")
+enc_gemv_f32 :: proc(enc: ^MTL.ComputeCommandEncoder, wb: ^MTL.Buffer, w_off: NS.UInteger,
+	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int) {
+	enc->setComputePipelineState(m_pso_gemv_f32)
+	enc->setBuffer(wb, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+	dims := [2]u32{u32(n), u32(d)}
+	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
+}
+
+@(private = "file")
+enc_gemv_q80 :: proc(enc: ^MTL.ComputeCommandEncoder, w_off: NS.UInteger,
+	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int) {
+	enc->setComputePipelineState(m_pso_gemv_q80)
+	enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+	dims := [2]u32{u32(n), u32(d)}
+	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
+}
+
+@(private = "file")
+enc_gemv_q50 :: proc(enc: ^MTL.ComputeCommandEncoder, w_off: NS.UInteger,
+	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int) {
+	enc->setComputePipelineState(m_pso_gemv_q50)
+	enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+	dims := [2]u32{u32(n), u32(d)}
+	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{256, 1, 1})
+}
+
+@(private = "file")
+enc_moe_topk :: proc(enc: ^MTL.ComputeCommandEncoder, n_expert, k: int) {
+	enc->setComputePipelineState(m_pso_moe_topk)
+	enc->setBuffer(m_b_moe_logits, 0, 0)
+	enc->setBuffer(m_b_moe_sel, 0, 1)
+	enc->setBuffer(m_b_moe_w, 0, 2)
+	P := [2]u32{u32(n_expert), u32(k)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 3)
+	enc->dispatchThreadgroups(MTL.Size{1, 1, 1}, MTL.Size{1, 1, 1})
+}
+
+@(private = "file")
+enc_moe_combine :: proc(enc: ^MTL.ComputeCommandEncoder, k, has_shexp, dim: int, out: ^MTL.Buffer) {
+	enc->setComputePipelineState(m_pso_moe_combine)
+	enc->setBuffer(m_b_moe_down_all, 0, 0)
+	enc->setBuffer(out, 0, 1)
+	enc->setBuffer(m_b_moe_w, 0, 2)
+	enc->setBuffer(m_b_moe_shexp_out, 0, 3)
+	P := [3]u32{u32(k), u32(has_shexp), u32(dim)}
+	enc->setBytes(bytes_of(&P, size_of(P)), 4)
+	enc->setBuffer(m_b_moe_shexp_gate, 0, 5)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer((dim + 255) / 256), 1, 1}, MTL.Size{256, 1, 1})
+}
+
+// MoE FFN for one layer. Encodes rmsnorm + router + top-k into the caller's
+// command buffer, syncs once to read the selected experts, runs the expert
+// GEMVs + shared expert + weighted combine in a second command buffer, then
+// hands back a fresh encoder for the remaining layers.
+moe_ffn_gpu :: proc(enc: ^^MTL.ComputeCommandEncoder, cmd: ^^MTL.CommandBuffer, t: ^Transformer, l: int, nonorm: bool) {
+	p := &t.config
+	w := &t.weights
+	lw := &w.layers[l]
+	mw := &lw.moe
+	dim := p.dim
+	n_exp := p.n_expert
+	used := p.n_expert_used
+	n_ff := p.n_ff_exp
+
+	if !nonorm {
+		enc_rmsnorm(enc^, m_b_x, m_b_xb, raw_data(lw.ffn_norm), dim, 1, p.rms_eps)
+	}
+	enc_gemv_f32(enc^, m_b_router, NS.UInteger(l * n_exp * dim * 4), m_b_xb, 0, m_b_moe_logits, 0, dim, n_exp)
+	enc_moe_topk(enc^, n_exp, used)
+	enc^->endEncoding()
+	cmd^->commit()
+	cmd^->waitUntilCompleted()
+
+	sel := m_b_moe_sel->contentsAsSlice([]i32)[:used]
+
+	cmd2 := m_queue->commandBuffer()
+	enc2 := cmd2->computeCommandEncoder()
+	up_rb := ggml.row_byte_size(mw.up_exps.kind, dim)
+	down_rb := ggml.row_byte_size(mw.down_exps.kind, n_ff)
+	up_base := woff(raw_data(mw.up_exps.data))
+	gate_base := woff(raw_data(mw.gate_exps.data))
+	down_base := woff(raw_data(mw.down_exps.data))
+	for k in 0 ..< used {
+		e := int(sel[k])
+		// NOTE: expert offsets are relative to each tensor; m_weights is the
+		// whole-model mmap, so add the tensor's own base offset.
+		enc_gemv(enc2, mw.up_exps.kind, up_base + NS.UInteger(e * n_ff * up_rb), m_b_xb, 0, m_moe_hbuf[k], 0, dim, n_ff)
+		enc_gemv(enc2, mw.gate_exps.kind, gate_base + NS.UInteger(e * n_ff * up_rb), m_b_xb, 0, m_moe_gbuf[k], 0, dim, n_ff)
+		// swiglu kernel: buf0 = silu(buf0) * buf1 -> pass (gate, up) so the
+		// result is silu(gate) * up (llama convention; same trap as CPU MoE)
+		enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[k], m_moe_hbuf[k], n_ff)
+		#partial switch mw.down_exps.kind {
+		case .Q8_0:
+			enc_gemv_q80(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[k], 0, m_b_moe_down_all, NS.UInteger(k * dim * 4), n_ff, dim)
+		case .Q5_0:
+			enc_gemv_q50(enc2, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[k], 0, m_b_moe_down_all, NS.UInteger(k * dim * 4), n_ff, dim)
+		case:
+			enc_gemv(enc2, mw.down_exps.kind, down_base + NS.UInteger(e * dim * down_rb), m_moe_gbuf[k], 0, m_b_moe_down_all, NS.UInteger(k * dim * 4), n_ff, dim)
+		}
+	}
+	has_shexp := 0
+	if mw.shexp_up != nil {
+		has_shexp = 1
+		base := l * (2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp + dim)
+		enc_gemv_f32(enc2, m_b_shexp, NS.UInteger(base * 4), m_b_xb, 0, m_moe_hbuf[0], 0, dim, p.n_ff_shexp)
+		enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + p.n_ff_shexp * dim) * 4), m_b_xb, 0, m_moe_gbuf[0], 0, dim, p.n_ff_shexp)
+		enc_elementwise(enc2, m_pso_swiglu, m_moe_gbuf[0], m_moe_hbuf[0], p.n_ff_shexp)
+		enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim) * 4), m_moe_gbuf[0], 0, m_b_moe_shexp_out, 0, p.n_ff_shexp, dim)
+		enc_gemv_f32(enc2, m_b_shexp, NS.UInteger((base + 2 * p.n_ff_shexp * dim + dim * p.n_ff_shexp) * 4), m_b_xb, 0, m_b_moe_shexp_gate, 0, dim, 1)
+	}
+	enc_moe_combine(enc2, used, has_shexp, dim, m_b_xb)
+	enc_elementwise(enc2, m_pso_residual, m_b_x, m_b_xb, dim)
+	enc2->endEncoding()
+	cmd2->commit()
+	cmd2->waitUntilCompleted()
+
+	cmd3 := m_queue->commandBuffer()
+	enc3 := cmd3->computeCommandEncoder()
+	cmd^ = cmd3
+	enc^ = enc3
 }
 
 enc_gemv :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off: NS.UInteger,
@@ -2253,23 +2557,27 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 		}
 
 		// shared MLP (post_attention_norm)
-		if !nonorm && !g_normfuse {
+		if !nonorm && !g_normfuse && !p.is_moe {
 			enc_rmsnorm(enc, m_b_x, m_b_xb, raw_data(lw.ffn_norm), dim, 1, eps)
 		}
 		if !nomlp {
-			if g_normfuse {
+			if p.is_moe {
+				moe_ffn_gpu(&enc, &cmd, transformer, l, nonorm)
+			} else if g_normfuse {
 				enc_gemv_norm(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb, 0, dim, hidden_dim, eps)
 				enc_gemv_norm(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), woff(raw_data(lw.ffn_norm)), m_b_x, 0, m_b_hb2, 0, dim, hidden_dim, eps)
 			} else {
 				enc_gemv(enc, lw.w1.kind, woff(raw_data(lw.w1.data)), m_b_xb, 0, m_b_hb, 0, dim, hidden_dim)
 				enc_gemv(enc, lw.w3.kind, woff(raw_data(lw.w3.data)), m_b_xb, 0, m_b_hb2, 0, dim, hidden_dim)
 			}
-			if !nosmall {
-			enc_elementwise(enc, m_pso_swiglu, m_b_hb, m_b_hb2, hidden_dim)
+			if !p.is_moe {
+				if !nosmall {
+					enc_elementwise(enc, m_pso_swiglu, m_b_hb, m_b_hb2, hidden_dim)
+				}
+				enc_gemv(enc, lw.w2.kind, woff(raw_data(lw.w2.data)), m_b_hb, 0, m_b_xb, 0, hidden_dim, dim)
+				enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb, dim)
+			}
 		}
-			enc_gemv(enc, lw.w2.kind, woff(raw_data(lw.w2.data)), m_b_hb, 0, m_b_xb, 0, hidden_dim, dim)
-		}
-		enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb, dim)
 	}
 
 	if !nonorm && !g_normfuse {

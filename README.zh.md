@@ -71,10 +71,11 @@ M3 / 16GB，DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic（Q4_K_M），单引�
 
 - **Qwen3.5 混合注意力**（Ornith / heretic 家族）：文本，248k 词表。9B 已
   端到端验收；同架构其他尺寸靠 GGUF 元数据自动加载（MTP 感知加载器）。
-- **Qwen3.5-MoE**（35B-A3B / 122B-A10B / 397B-A17B）：CPU 路径已支持
-  （softmax top-k 路由 + sigmoid 门控共享专家，逐位对拍验证）；Metal MoE
-  内核待实现。HF 上的社区小变体（如 0.8B-MoE）今天就能跑——包括 llama.cpp
-  本身会拒绝的层数配置。
+- **Qwen3.5-MoE**（35B-A3B / 122B-A10B / 397B-A17B）：CPU + Metal 双路径
+  已支持——softmax top-k 路由、逐专家 GEMV 分派（Q4_K/Q5_0/Q8_0/Q6_K）、
+  sigmoid 门控共享专家；Metal 输出与 CPU 一致（~3e-3，fastMath），0.8B-MoE
+  上 ~45× CPU 速度（37ms/token）。HF 上的社区小变体今天就能跑——包括
+  llama.cpp 本身会拒绝的层数配置。
 - 不支持 MoE / 多模态 / 其他模型家族——窄定位是特性不是缺陷。
 
 ## 产品形态
