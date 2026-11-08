@@ -1,0 +1,1096 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct Dims { uint n; uint d; };
+
+inline void get_scale_min_k4(int j, device const uchar *q, thread uchar &d, thread uchar &m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j + 0] >> 6) << 4); }
+}
+
+
+inline void deq_q4_k_chunk16(device const uchar *blk, uint il, thread float4 reg[4]) {
+    device const uchar *qs = blk + 16;
+    device const uchar *scales = blk + 4;
+    float dall = (float)(*(device const half*)blk);
+    float dmin = (float)(*(device const half*)(blk + 2));
+    uchar sc, m; get_scale_min_k4((int)(il >> 1), scales, sc, m);
+    float d = dall * sc, mn = dmin * m;
+    uint qo = (il >> 2) * 32 + (il & 1) * 16;
+    if ((il & 3) < 2) {
+        for (uint j = 0; j < 16; j += 4) {
+            reg[j/4] = float4((float)(qs[qo+j]&0xF)*d - mn, (float)(qs[qo+j+1]&0xF)*d - mn,
+                              (float)(qs[qo+j+2]&0xF)*d - mn, (float)(qs[qo+j+3]&0xF)*d - mn);
+        }
+    } else {
+        for (uint j = 0; j < 16; j += 4) {
+            reg[j/4] = float4((float)(qs[qo+j]>>4)*d - mn, (float)(qs[qo+j+1]>>4)*d - mn,
+                              (float)(qs[qo+j+2]>>4)*d - mn, (float)(qs[qo+j+3]>>4)*d - mn);
+        }
+    }
+}
+
+
+inline void deq_q6_k_chunk16(device const uchar *blk, uint il, thread float4 reg[4]) {
+    // 16-element chunk c of half hf (il = 8*hf + c). Element r = 16c+j of the half:
+    //   ql byte = (r < 64) ? r : r-64, nibble = low (r<64) / high (r>=64)
+    //   qh byte = 32*hf + 16*(c&1) + j, 2-bit field shift = (c & 6)
+    //   value = ((nibble | (qh_bits << 4)) - 32) * dall * scales[8*hf + c]
+    device const uchar *ql = blk;
+    device const uchar *qh = blk + 128;
+    device const char *scales = (device const char *)(blk + 192);
+    float dall = (float)(*(device const half*)(blk + 208));
+    uint hf = il >> 3, c = il & 7;
+    float dsc = dall * (float)scales[8*hf + c];
+    uint qhshift = (c & 6);
+    int qloff = 64 * (int)hf + 16 * (int)c - ((c >= 4) ? 64 : 0);
+    uint qhoff = 32 * hf + 16 * (c & 1);
+    bool hi = c >= 4;
+    for (uint j = 0; j < 16; j += 4) {
+        float4 hb = float4((float)((qh[qhoff+j] >> qhshift) & 3), (float)((qh[qhoff+j+1] >> qhshift) & 3),
+                           (float)((qh[qhoff+j+2] >> qhshift) & 3), (float)((qh[qhoff+j+3] >> qhshift) & 3));
+        float4 lb;
+        if (!hi) {
+            lb = float4((float)(ql[qloff+j]&0xF), (float)(ql[qloff+j+1]&0xF), (float)(ql[qloff+j+2]&0xF), (float)(ql[qloff+j+3]&0xF));
+        } else {
+            lb = float4((float)(ql[qloff+j]>>4), (float)(ql[qloff+j+1]>>4), (float)(ql[qloff+j+2]>>4), (float)(ql[qloff+j+3]>>4));
+        }
+        reg[j/4] = (lb + hb * 16.0f - 32.0f) * dsc;
+    }
+}
+
+
+inline float2 dot_q6_superblock2(device const uchar *blk, device const float *x, uint ybase) {
+    device const uchar *ql = blk; device const uchar *qh = blk + 128; device const char *sc = (device const char*)(blk + 192);
+    float dall = (float)(*(device const half*)(blk + 208)); float s0 = 0.0, s1 = 0.0;
+    for (int hf = 0; hf < 2; ++hf) { uint qlo = hf * 64, qho = hf * 32, sco = hf * 8, yo = ybase + hf * 128;
+        float ds0=dall*(float)sc[sco+0],ds1=dall*(float)sc[sco+1],ds2=dall*(float)sc[sco+2],ds3=dall*(float)sc[sco+3];
+        float ds4=dall*(float)sc[sco+4],ds5=dall*(float)sc[sco+5],ds6=dall*(float)sc[sco+6],ds7=dall*(float)sc[sco+7];
+        for (int l = 0; l < 16; l += 4) {
+            float4 w1=float4((float)((int)((ql[qlo+l+0]&0xF)|(((qh[qho+l+0]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+1]&0xF)|(((qh[qho+l+1]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+2]&0xF)|(((qh[qho+l+2]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+3]&0xF)|(((qh[qho+l+3]>>0)&3)<<4))-32));
+            float4 w2=float4((float)((int)((ql[qlo+l+32]&0xF)|(((qh[qho+l+0]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+33]&0xF)|(((qh[qho+l+1]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+34]&0xF)|(((qh[qho+l+2]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+35]&0xF)|(((qh[qho+l+3]>>2)&3)<<4))-32));
+            float4 w3=float4((float)((int)((ql[qlo+l+0]>>4)|(((qh[qho+l+0]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+1]>>4)|(((qh[qho+l+1]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+2]>>4)|(((qh[qho+l+2]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+3]>>4)|(((qh[qho+l+3]>>4)&3)<<4))-32));
+            float4 w4=float4((float)((int)((ql[qlo+l+32]>>4)|(((qh[qho+l+0]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+33]>>4)|(((qh[qho+l+1]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+34]>>4)|(((qh[qho+l+2]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+35]>>4)|(((qh[qho+l+3]>>6)&3)<<4))-32));
+            float4 xv1=float4(x[yo+l],x[yo+l+1],x[yo+l+2],x[yo+l+3]); float4 xv2=float4(x[yo+l+32],x[yo+l+33],x[yo+l+34],x[yo+l+35]);
+            float4 xv3=float4(x[yo+l+64],x[yo+l+65],x[yo+l+66],x[yo+l+67]); float4 xv4=float4(x[yo+l+96],x[yo+l+97],x[yo+l+98],x[yo+l+99]);
+            s0 += ds0*dot(w1,xv1)+ds2*dot(w2,xv2)+ds4*dot(w3,xv3)+ds6*dot(w4,xv4);
+        }
+        for (int l = 16; l < 32; l += 4) {
+            float4 w1=float4((float)((int)((ql[qlo+l+0]&0xF)|(((qh[qho+l+0]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+1]&0xF)|(((qh[qho+l+1]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+2]&0xF)|(((qh[qho+l+2]>>0)&3)<<4))-32),(float)((int)((ql[qlo+l+3]&0xF)|(((qh[qho+l+3]>>0)&3)<<4))-32));
+            float4 w2=float4((float)((int)((ql[qlo+l+32]&0xF)|(((qh[qho+l+0]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+33]&0xF)|(((qh[qho+l+1]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+34]&0xF)|(((qh[qho+l+2]>>2)&3)<<4))-32),(float)((int)((ql[qlo+l+35]&0xF)|(((qh[qho+l+3]>>2)&3)<<4))-32));
+            float4 w3=float4((float)((int)((ql[qlo+l+0]>>4)|(((qh[qho+l+0]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+1]>>4)|(((qh[qho+l+1]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+2]>>4)|(((qh[qho+l+2]>>4)&3)<<4))-32),(float)((int)((ql[qlo+l+3]>>4)|(((qh[qho+l+3]>>4)&3)<<4))-32));
+            float4 w4=float4((float)((int)((ql[qlo+l+32]>>4)|(((qh[qho+l+0]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+33]>>4)|(((qh[qho+l+1]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+34]>>4)|(((qh[qho+l+2]>>6)&3)<<4))-32),(float)((int)((ql[qlo+l+35]>>4)|(((qh[qho+l+3]>>6)&3)<<4))-32));
+            float4 xv1=float4(x[yo+l],x[yo+l+1],x[yo+l+2],x[yo+l+3]); float4 xv2=float4(x[yo+l+32],x[yo+l+33],x[yo+l+34],x[yo+l+35]);
+            float4 xv3=float4(x[yo+l+64],x[yo+l+65],x[yo+l+66],x[yo+l+67]); float4 xv4=float4(x[yo+l+96],x[yo+l+97],x[yo+l+98],x[yo+l+99]);
+            s1 += ds1*dot(w1,xv1)+ds3*dot(w2,xv2)+ds5*dot(w3,xv3)+ds7*dot(w4,xv4);
+        }
+    }
+    return float2(s0, s1);
+}
+
+
+kernel void gemv_q4_k(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    // v2: float4 dot() accumulation with two chains (lo/hi nibble groups) per row.
+    // Same products as v1; only the addition grouping changed -> 8x shorter
+    // dependency chains. Row mapping unchanged (1 simdgroup per row).
+    uint row = tg * 32 + tid / 8; uint lane = tid % 8; float sum = 0.0;
+    if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 144;
+        float slo = 0.0, shi = 0.0;
+        for (uint sb = lane; sb < nsb; sb += 8) { device const uchar *blk = wr + sb * 144;
+            float dall = (float)(*(device const half*)blk); float dmin = (float)(*(device const half*)(blk + 2));
+            device const uchar *scales = blk + 4; device const uchar *qs = blk + 16; uint ybase = sb * 256; int is = 0; uint qoff = 0;
+            for (uint j = 0; j < 256; j += 64) { uchar sc, m; get_scale_min_k4(is + 0, scales, sc, m); float d1 = dall * sc, m1 = dmin * m;
+                get_scale_min_k4(is + 1, scales, sc, m); float d2 = dall * sc, m2 = dmin * m;
+                for (uint l = 0; l < 32; l += 4) {
+                    float4 wl = float4((float)(qs[qoff+l]&0xF),(float)(qs[qoff+l+1]&0xF),(float)(qs[qoff+l+2]&0xF),(float)(qs[qoff+l+3]&0xF));
+                    float4 wh = float4((float)(qs[qoff+l]>>4),(float)(qs[qoff+l+1]>>4),(float)(qs[qoff+l+2]>>4),(float)(qs[qoff+l+3]>>4));
+                    float4 xl = float4(x[ybase+j+l],x[ybase+j+l+1],x[ybase+j+l+2],x[ybase+j+l+3]);
+                    float4 xh = float4(x[ybase+j+32+l],x[ybase+j+32+l+1],x[ybase+j+32+l+2],x[ybase+j+32+l+3]);
+                    slo += dot(wl * d1 - m1, xl);
+                    shi += dot(wh * d2 - m2, xh);
+                }
+                qoff += 32; is += 2; } }
+        sum = slo + shi; }
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+
+kernel void gemv_q6_k(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint row = tg * 32 + tid / 8; uint lane = tid % 8; float sum = 0.0;
+    if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 210;
+        for (uint sb = lane; sb < nsb; sb += 8) {
+            float2 acc = dot_q6_superblock2(wr + sb * 210, x, sb * 256);
+            sum += acc.x + acc.y; } }
+    // 16-lane rows share a simdgroup, so reduce within each 16-lane half only
+    // (simd_sum would mix the two rows sharing this simdgroup).
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+
+kernel void gemv_q4_k_n4r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 4; const uint R1 = 1; const uint ROWS_TG = 64;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (8 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q4_k_n4r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 4; const uint R1 = 2; const uint ROWS_TG = 128;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (8 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q4_k_n4r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 4; const uint R1 = 4; const uint ROWS_TG = 256;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (8 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 144 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        deq_q4_k_chunk16(wr2 + b * 144, il, r2);
+        deq_q4_k_chunk16(wr3 + b * 144, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+kernel void gemv_q4_k_n8r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 8; const uint R1 = 1; const uint ROWS_TG = 32;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (4 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q4_k_n8r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 8; const uint R1 = 2; const uint ROWS_TG = 64;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (4 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q4_k_n8r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 8; const uint R1 = 4; const uint ROWS_TG = 128;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (4 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 144 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        deq_q4_k_chunk16(wr2 + b * 144, il, r2);
+        deq_q4_k_chunk16(wr3 + b * 144, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+kernel void gemv_q4_k_n16r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 16; const uint R1 = 1; const uint ROWS_TG = 16;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (2 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q4_k_n16r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 16; const uint R1 = 2; const uint ROWS_TG = 32;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (2 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q4_k_n16r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 16; const uint R1 = 4; const uint ROWS_TG = 64;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (2 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 144 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        deq_q4_k_chunk16(wr2 + b * 144, il, r2);
+        deq_q4_k_chunk16(wr3 + b * 144, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 8);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 8);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+kernel void gemv_q4_k_n32r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 32; const uint R1 = 1; const uint ROWS_TG = 8;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (1 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 16);
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q4_k_n32r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 32; const uint R1 = 2; const uint ROWS_TG = 16;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (1 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 16);
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 16);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q4_k_n32r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 32; const uint R1 = 4; const uint ROWS_TG = 32;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (1 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 144 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        deq_q4_k_chunk16(wr2 + b * 144, il, r2);
+        deq_q4_k_chunk16(wr3 + b * 144, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 16);
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 16);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 16);
+    sum2 += simd_shuffle_xor(sum2, 8);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 16);
+    sum3 += simd_shuffle_xor(sum3, 8);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+kernel void gemv_q6_k_n4r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 4; const uint R1 = 1; const uint ROWS_TG = 64;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (8 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q6_k_n4r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 4; const uint R1 = 2; const uint ROWS_TG = 128;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (8 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q6_k_n4r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 4; const uint R1 = 4; const uint ROWS_TG = 256;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (8 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 210 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        deq_q6_k_chunk16(wr2 + b * 210, il, r2);
+        deq_q6_k_chunk16(wr3 + b * 210, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+kernel void gemv_q6_k_n8r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 8; const uint R1 = 1; const uint ROWS_TG = 32;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (4 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q6_k_n8r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 8; const uint R1 = 2; const uint ROWS_TG = 64;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (4 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q6_k_n8r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 8; const uint R1 = 4; const uint ROWS_TG = 128;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (4 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 210 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        deq_q6_k_chunk16(wr2 + b * 210, il, r2);
+        deq_q6_k_chunk16(wr3 + b * 210, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+kernel void gemv_q6_k_n16r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 16; const uint R1 = 1; const uint ROWS_TG = 16;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (2 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q6_k_n16r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 16; const uint R1 = 2; const uint ROWS_TG = 32;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (2 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q6_k_n16r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 16; const uint R1 = 4; const uint ROWS_TG = 64;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (2 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 210 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        deq_q6_k_chunk16(wr2 + b * 210, il, r2);
+        deq_q6_k_chunk16(wr3 + b * 210, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 8);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 8);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+kernel void gemv_q6_k_n32r1(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 32; const uint R1 = 1; const uint ROWS_TG = 8;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (1 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 16);
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+    }
+}
+
+kernel void gemv_q6_k_n32r2(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 32; const uint R1 = 2; const uint ROWS_TG = 16;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (1 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 16);
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 16);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+    }
+}
+
+kernel void gemv_q6_k_n32r4(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 32; const uint R1 = 4; const uint ROWS_TG = 32;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (1 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 210;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 210 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 210 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 210 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q6_k_chunk16(wr0 + b * 210, il, r0);
+        deq_q6_k_chunk16(wr1 + b * 210, il, r1);
+        deq_q6_k_chunk16(wr2 + b * 210, il, r2);
+        deq_q6_k_chunk16(wr3 + b * 210, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 16);
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 16);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 16);
+    sum2 += simd_shuffle_xor(sum2, 8);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 16);
+    sum3 += simd_shuffle_xor(sum3, 8);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}

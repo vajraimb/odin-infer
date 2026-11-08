@@ -422,6 +422,67 @@ kernel void gemv_q6_k_v3(device const uchar *wb [[buffer(0)]], device const floa
     }
 }
 
+kernel void gemv_q4_k_o(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint NXPSG = 32; const uint R1 = 4; const uint ROWS_TG = 32;
+    uint tx = lane % NXPSG, ty = lane / NXPSG;
+    uint row0 = tg * ROWS_TG + sg * (1 * R1) + ty * R1;
+    if (row0 >= dim.d) return;
+    uint nb = dim.n / 256;
+    device const uchar *wr0 = wb + (ulong)row0 * nb * 144;
+    device const uchar *wr1 = (row0 + 1 < dim.d) ? wr0 + (ulong)1 * nb * 144 : wr0;
+    device const uchar *wr2 = (row0 + 2 < dim.d) ? wr0 + (ulong)2 * nb * 144 : wr0;
+    device const uchar *wr3 = (row0 + 3 < dim.d) ? wr0 + (ulong)3 * nb * 144 : wr0;
+    device const float4 *y4 = (device const float4 *)x + tx * 4;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    float sum2 = 0.0;
+    float sum3 = 0.0;
+    for (uint ich = tx; 16*ich < dim.n; ich += NXPSG) {
+        uint b = ich >> 4, il = ich & 15;
+        float4 r0[4], r1[4], r2[4], r3[4];
+        deq_q4_k_chunk16(wr0 + b * 144, il, r0);
+        deq_q4_k_chunk16(wr1 + b * 144, il, r1);
+        deq_q4_k_chunk16(wr2 + b * 144, il, r2);
+        deq_q4_k_chunk16(wr3 + b * 144, il, r3);
+        float4 y0 = y4[0], y1 = y4[1], y2 = y4[2], y3 = y4[3];
+        sum0 += dot(r0[0],y0) + dot(r0[1],y1) + dot(r0[2],y2) + dot(r0[3],y3);
+        sum1 += dot(r1[0],y0) + dot(r1[1],y1) + dot(r1[2],y2) + dot(r1[3],y3);
+        sum2 += dot(r2[0],y0) + dot(r2[1],y1) + dot(r2[2],y2) + dot(r2[3],y3);
+        sum3 += dot(r3[0],y0) + dot(r3[1],y1) + dot(r3[2],y2) + dot(r3[3],y3);
+        y4 += NXPSG * 4;
+    }
+    sum0 += simd_shuffle_xor(sum0, 16);
+    sum0 += simd_shuffle_xor(sum0, 8);
+    sum0 += simd_shuffle_xor(sum0, 4);
+    sum0 += simd_shuffle_xor(sum0, 2);
+    sum0 += simd_shuffle_xor(sum0, 1);
+    sum1 += simd_shuffle_xor(sum1, 16);
+    sum1 += simd_shuffle_xor(sum1, 8);
+    sum1 += simd_shuffle_xor(sum1, 4);
+    sum1 += simd_shuffle_xor(sum1, 2);
+    sum1 += simd_shuffle_xor(sum1, 1);
+    sum2 += simd_shuffle_xor(sum2, 16);
+    sum2 += simd_shuffle_xor(sum2, 8);
+    sum2 += simd_shuffle_xor(sum2, 4);
+    sum2 += simd_shuffle_xor(sum2, 2);
+    sum2 += simd_shuffle_xor(sum2, 1);
+    sum3 += simd_shuffle_xor(sum3, 16);
+    sum3 += simd_shuffle_xor(sum3, 8);
+    sum3 += simd_shuffle_xor(sum3, 4);
+    sum3 += simd_shuffle_xor(sum3, 2);
+    sum3 += simd_shuffle_xor(sum3, 1);
+    if (tx == 0) {
+        if (row0 + 0 < dim.d) out[row0 + 0] = sum0;
+        if (row0 + 1 < dim.d) out[row0 + 1] = sum1;
+        if (row0 + 2 < dim.d) out[row0 + 2] = sum2;
+        if (row0 + 3 < dim.d) out[row0 + 3] = sum3;
+    }
+}
+
+
 // ---------- elementwise / attention ----------
 struct NormP { uint size; float eps; };
 struct RopeP { uint head_dim; uint pos; float rope_freq; uint rotary_dim; };
@@ -976,6 +1037,7 @@ metal_enabled: bool
 m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1, m_pso_q4_k, m_pso_q6_k: ^MTL.ComputePipelineState
 	m_pso_q4_k3, m_pso_q6_k3: ^MTL.ComputePipelineState // row-split v3 GEMV kernels (QGEMV3=1)
 	m_pso_q4_k2r, m_pso_q6_k2r: ^MTL.ComputePipelineState // 2 rows/lane GEMV kernels (QGEMV2R=1)
+	m_pso_q4_k_o: ^MTL.ComputePipelineState           // output-layer GEMV (32 lanes/row x 4 rows/thread, llama.cpp default shape)
 @(private = "file")
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
 @(private = "file")
@@ -1345,6 +1407,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	m_pso_q6_k = make_pso(lib, "gemv_q6_k")
 	m_pso_q4_k3 = make_pso(lib, "gemv_q4_k_v3"); m_pso_q6_k3 = make_pso(lib, "gemv_q6_k_v3")
 	m_pso_q4_k2r = make_pso(lib, "gemv_q4_k_2r"); m_pso_q6_k2r = make_pso(lib, "gemv_q6_k_2r")
+	m_pso_q4_k_o = make_pso(lib, "gemv_q4_k_o")
 	m_pso_rmsnorm = make_pso(lib, "rmsnorm"); m_pso_rope = make_pso(lib, "rope_partial")
 	m_pso_qnorm = make_pso(lib, "qnorm_extract"); m_pso_store_kv = make_pso(lib, "store_kv")
 	m_pso_attn = make_pso(lib, "attention"); m_pso_attn_gate = make_pso(lib, "attn_gate")
@@ -1486,7 +1549,12 @@ woff :: proc(p: rawptr) -> NS.UInteger { return NS.UInteger(uintptr(p) - m_mmap_
 @(private = "file")
 enc_gemv :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off: NS.UInteger,
 	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int) {
-	enc->setComputePipelineState(pso_for(kind))
+	pso := pso_for(kind)
+	// NOTE: gemv_q4_k_o (llama.cpp default shape, 32 lanes/row x 4 rows/thread)
+	// is compiled but NOT selected: the harness sweep with wall-clock timing +
+	// CPU-reference verification shows the production 8-lane kernel is faster
+	// on every shape (output 248k rows: 6.4 ms vs 8.2 ms for the o-variant).
+	enc->setComputePipelineState(pso)
 	enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
 	dims := [2]u32{u32(n), u32(d)}
 	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)

@@ -97,11 +97,28 @@ Decode composition at the 8-lane sweet spot (per-token GPU, flag-file ablation
 | small kernels (norms/attn/conv/delta, ~330 dispatches) | ~3 | — |
 
 The 8-lane sweet spot already puts the big GEMVs near the M3's practical
-bandwidth; the output layer's 7760 tiny TGs and the small-kernel dispatch
-overhead are the remaining ~12 ms, and every multi-row-per-lane or
-dispatch-shape alternative measured so far regresses. A/B switches kept for
-future profiling: `QGEMV3=1` (llama.cpp row-split port, ~108 ms) and
-`QGEMV2R=1` (2 rows/lane, ~105 ms).
+bandwidth; every multi-row-per-lane or dispatch-shape alternative measured so
+far regresses. A/B switches kept for future profiling: `QGEMV3=1` (llama.cpp
+row-split port, ~108 ms) and `QGEMV2R=1` (2 rows/lane, ~105 ms).
+
+### llama.cpp full-family comparison (sweep, wall-clock + CPU-reference verified)
+
+Systematic port of llama.cpp's parameterized `kernel_mul_mv_ext` GEMV family
+(nxpsg x r1ptg grid: 4-32 lanes/row x 1-4 rows/thread, 26 kernels incl. the
+production 8-lane baseline), timed in isolation per matrix shape in
+`gemm_harness/gemv_sweep.odin` (correctness rel_err ~2e-6 on every kernel):
+
+| shape (Q4_K) | production | best llama-variant |
+|---|---|---|
+| 248320 x 4096 (output) | **6.4 ms / 90 GB/s** | 7.4 ms (n4r2) |
+| 12288 x 4096 (w1/w3) | **0.70 ms** | 0.67 ms (n8r1, within noise) |
+| 8192 x 4096 (wq) | **0.25 ms / 76 GB/s** | 0.32 ms (n4r1) |
+| Q6_K shapes (w2, in_qkv) | **at parity with best variant** | — |
+
+Verdict: on this M3 the production 8-lane kernels already match or beat the
+llama.cpp family on every shape — the remaining gap to llama.cpp end-to-end is
+NOT in GEMV structure. `gemv_q4_k_o` (llama.cpp default 32x4 shape) is kept
+compiled but unselected as a live counter-example.
 
 Also: the server now retries `listen_tcp` with backoff (TIME_WAIT after a kill
 used to make restarts flaky ~50% of the time).
