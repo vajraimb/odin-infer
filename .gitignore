@@ -11,3 +11,4 @@ server/serve_harness/.test-serve-old.bin
 # stray compiled test binaries
 /tokenizer
 /serve
+.tmp-cache/
