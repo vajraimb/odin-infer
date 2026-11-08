@@ -2,22 +2,27 @@
 
 > Decision record, 2026-11-08. 决策记录：2026-11-08。
 > We deliberately do NOT chase llama.cpp-style generalization across all
-> architectures. The scope is: **a high-efficiency local inference engine for
-> Qwen3/Qwen3.5 on Apple Silicon (MacBook Air first).**
-> 不做 llama.cpp 式的全架构泛化，只做 Apple Silicon（MacBook Air 优先）上
-> Qwen3/Qwen3.5 的高效本地推理引擎。
+> architectures, and we do NOT chase downwards compatibility either. The scope
+> is: **a high-efficiency local inference engine for Qwen3.5-class models
+> (3.5 and above, the hybrid-attention family) on Apple Silicon (MacBook Air
+> first).**
+> 不做 llama.cpp 式的全架构泛化，也不做向下兼容。定位：Apple Silicon
+> （MacBook Air 优先）上 Qwen3.5 及以上（混合注意力家族）的高效本地推理引擎。
 
 ## 1. One-line positioning / 定位一句话
 
-**An out-of-the-box local Qwen engine for agents and tools on personal Macs.**
-The selling points are power/memory/interactive latency and agent-readiness —
-not peak throughput.
-**个人 Mac 上、给 agent/工具用的、开箱即用的 Qwen 本地推理引擎**——卖点是功耗/内存/交互延迟与 agent 就绪度，不是纸面峰值吞吐。
+**An out-of-the-box local Qwen3.5-class engine for agents and tools on
+personal Macs.** The selling points are power/memory/interactive latency and
+agent-readiness — not peak throughput.
+**个人 Mac 上、给 agent/工具用的、开箱即用的 Qwen3.5 级本地推理引擎**——卖点是功耗/内存/交互延迟与 agent 就绪度，不是纸面峰值吞吐。
 
 ## 2. Target hardware & users / 目标硬件与用户
 
-- **MacBook Air (M1–M4)** / MacBook Air（M1–M4）：fanless (sustained load
-  throttles), 8–24 GB unified memory, zero-config expectations / 无风扇（持续负载热降频）、8–24GB 统一内存、用户期望零配置
+- **MacBook Air (M1–M4), 16 GB and up** / MacBook Air（M1–M4），16GB 及以上：
+  fanless (sustained load throttles), zero-config expectations. Qwen3.5 starts
+  at 9B (~5.6 GB weights + KV), so the product floor is 16 GB; 8 GB machines
+  are out of scope by design (see docs/MEMORY.md). / 无风扇、零配置期望。
+  Qwen3.5 从 9B 起步（权重 ~5.6GB + KV），产品下限 16GB；8GB 机型有意不在范围内（见 docs/MEMORY.md）。
 - Users: people running agent ecosystems (Cursor / Claude Code / pie / custom
   MCP) on a personal Mac, wanting privacy, offline, low-latency local models.
   用户画像：在个人 Mac 上跑 agent 生态的人，要隐私、离线、低延迟的本地模型。

@@ -1,11 +1,11 @@
 # odin-infer
 
-**A high-efficiency local inference engine for Qwen3 / Qwen3.5 on Apple Silicon (MacBook Air first).**
-**Apple Silicon（MacBook Air 优先）上 Qwen3 / Qwen3.5 的高效本地推理引擎。**
+**A high-efficiency local inference engine for Qwen3.5-class models on Apple Silicon (MacBook Air first).**
+**Apple Silicon（MacBook Air 优先）上 Qwen3.5 级模型的高效本地推理引擎。**
 
-A single 7 MB binary that runs 9B-class Qwen models on your Mac — no Python,
+A single 7 MB binary that runs Qwen3.5-class models on your Mac — no Python,
 no llama.cpp dependency, 73 ms first token, native MCP, agent-ready.
-一个 7MB 的单文件二进制，把 9B 级 Qwen 模型跑在你的 Mac 上——无 Python、无
+一个 7MB 的单文件二进制，把 Qwen3.5 级模型跑在你的 Mac 上——无 Python、无
 llama.cpp 依赖，首 token 73ms，原生 MCP，agent 就绪。
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -73,16 +73,23 @@ residency, cooled machine. M3 / 16GB，heretic Q4_K_M，单引擎驻留、冷却
 
 ## Supported models / 支持什么
 
-- **Qwen3 dense**（0.6B–32B）：CPU / Metal
-- **Qwen3.5 hybrid attention**（Ornith family）：text-only, 248k vocab / 文本，248k 词表
-- No MoE / multimodal / other architectures — a narrow scope, on purpose / 不支持 MoE / 多模态 / 其他架构——窄定位是特性不是缺陷
+**Positioned at Qwen3.5 and above / 定位在 Qwen3.5 及以上：**
+
+- **Qwen3.5 hybrid attention**（Ornith / heretic family）：text-only, 248k vocab.
+  9B 实测验收；同架构不同尺寸靠 GGUF 元数据自动适配（MTP 感知加载器）。
+  文本，248k 词表；9B 实测验收。
+- No MoE / multimodal / Qwen3-or-older / other architectures — a narrow scope,
+  on purpose. 不支持 MoE / 多模态 / Qwen3 及更早 / 其他架构——窄定位是特性不是缺陷。
+- The repo still ships the Qwen3-dense engine (`packages/infer`) for the CLI's
+  historical compatibility path; it is **not part of the product story**.
+  仓库仍保留 Qwen3 密集引擎（infer 包）供 CLI 历史兼容，但不属于产品定位。
 
 ## Product forms / 产品形态
 
 | Form / 形态 | Artifact / 产物 | Use case / 场景 |
 |---|---|---|
 | **odin-serve**（primary / 主） | `bin/odin-serve` | HTTP (OpenAI/Ollama-compatible + dashboard) or `--mcp` / HTTP 或 `--mcp` |
-| **odin-cli**（secondary / 辅） | `bin/odin-cli` | Terminal chat, auto-detects Qwen3/Qwen3.5 / 终端聊天，自动识别 Qwen3/Qwen3.5 |
+| **odin-cli**（secondary / 辅） | `bin/odin-cli` | Terminal chat / 终端聊天 |
 | **library / 库** | `packages/*` | Embed in any Odin project via `-collection` / `-collection` 嵌入任意 Odin 项目 |
 
 ## Platform adaptation / 平台适配

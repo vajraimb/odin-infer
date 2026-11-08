@@ -6,14 +6,17 @@ you can build, test, run and modify this project independently.
 
 ## Architecture in one line / 一句话架构
 
-A Qwen3/Qwen3.5 inference engine for Apple Silicon in pure Odin (no Python
-runtime dependency). Two engines: `packages/infer` (Qwen3 dense) and
-`packages/qwen3_5` (Qwen3.5 hybrid attention, gated delta), sharing
-`packages/ggml` (GGUF parsing / quant dequant). Server is the single-file
-package `server/serve_harness/serve.odin`; CLI is `cli/main.odin`.
-Apple Silicon 上的 Qwen3/Qwen3.5 推理引擎（纯 Odin，无 Python 运行时依赖）。
-两个引擎：`packages/infer`（Qwen3 密集）、`packages/qwen3_5`（Qwen3.5 混合注意力，gated delta）；
-共享 `packages/ggml`（GGUF 解析/量化）。服务端在 `server/serve_harness/serve.odin`（单文件包），CLI 在 `cli/main.odin`。
+A Qwen3.5-class inference engine for Apple Silicon in pure Odin (no Python
+runtime dependency). **Product positioning: Qwen3.5 and above** — the server
+(`server/serve_harness/serve.odin`, the primary product form) runs the
+`packages/qwen3_5` engine (hybrid attention, gated delta) only, by design.
+`packages/infer` (Qwen3 dense) exists as a legacy compatibility path for the
+CLI only; do NOT extend it in the product docs. Shared: `packages/ggml`
+(GGUF parsing / quant dequant). CLI is `cli/main.odin`.
+Apple Silicon 上的 Qwen3.5 级推理引擎（纯 Odin）。**产品定位：Qwen3.5 及以上**——
+服务端（主形态）只跑 `packages/qwen3_5` 引擎（混合注意力 + gated delta），这是有意为之。
+`packages/infer`（Qwen3 密集）仅作 CLI 的历史兼容路径，不要在产品文档中扩展。
+共享 `packages/ggml`。服务端在 `server/serve_harness/serve.odin`，CLI 在 `cli/main.odin`。
 
 ## Releases / 发布
 
@@ -77,8 +80,8 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 - Default benchmark model: `models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf`
   (→ symlink to an ollama blob, Qwen3.5, 5.6 GB) / 默认基准模型（ollama blob 软链，Qwen3.5，5.6GB）
 - Quick smoke test with 0.6B: `/Users/vajra/Claw/odin-infeer/Qwen3-0.6B-Q4_K_M.gguf`
-  (Qwen3, goes through the infer engine, loads in ~1s) — CLI only; **serve only
-  accepts Qwen3.5** / 快速冒烟用 0.6B（Qwen3，走 infer 引擎，加载 ~1s）——仅 CLI 支持，serve 只认 Qwen3.5
+  (Qwen3, legacy infer path, loads in ~1s) — CLI only; **serve accepts Qwen3.5
+  only, by design (positioning is 3.5+)** / 快速冒烟用 0.6B（Qwen3，历史兼容路径，加载 ~1s）——仅 CLI；serve 只认 Qwen3.5，产品定位即 3.5+
 
 ## Key conventions (read before editing) / 关键约定（改代码前必读）
 

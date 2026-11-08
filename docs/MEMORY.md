@@ -12,20 +12,23 @@ physical RAM. `kv` grows linearly with `--max-ctx` (9B: ~0.54 GB @ 8k,
 ~0.27 GB @ 4k). total 超过物理内存 85% 时会输出 `WARNING: tight for this
 machine`。`kv` 随 `--max-ctx` 线性增长。
 
-## Recommended configs for 8 GB / 8GB 机型推荐配置
+## Product floor: 16 GB / 产品下限：16GB
 
-After macOS + browser/editor, an 8 GB Air leaves ~3 GB for the engine:
-8GB Air 扣除 macOS + 浏览器/编辑器后，引擎可用预算 ≈ 3GB：
+The product is positioned at Qwen3.5 and above; the Qwen3.5 hybrid family
+starts at 9B (~5.6 GB weights at Q4_K_M). An 8 GB Air leaves ~3 GB for the
+engine after macOS + apps, so **8 GB machines are out of product scope by
+design** — no Qwen3 fallback story.
+产品定位为 Qwen3.5 及以上；Qwen3.5 家族从 9B 起步（Q4_K_M 权重 ~5.6GB）。
+8GB Air 扣除系统后引擎预算仅 ~3GB，**8GB 机型有意不在产品范围内**。
 
 | Model / 模型 | Quant / 量化 | Weights / 权重 | Suggested max-ctx / 推荐 max-ctx | Verdict / 结论 |
 |---|---|---|---|---|
-| Qwen3-4B | Q4_K_M | ~2.5 GB | 2048 | default choice / 默认选择 |
-| Qwen3-8B | Q4_K_M | ~5.2 GB | — | ❌ over budget (needs ≥16 GB) / 超出预算（≥16GB 才用） |
-| Qwen3.5-9B (Ornith/heretic family) | Q4_K_M | ~5.6 GB | — | ❌ over budget (needs ≥16 GB) / 超出预算（≥16GB 才用） |
+| Qwen3.5-9B (Ornith/heretic family) | Q4_K_M | ~5.6 GB | 4096–8192 | ✅ 16 GB floor / 16GB 下限 |
+| 同架构更大尺寸（若发布） | Q4_K_M | 按元数据适配 | 按 `mem:` 行调 | 32GB+ / 24GB+ |
 
-> The Qwen3 line (infer engine + odin-cli / HTTP) covers 4B; the Qwen3.5
-> hybrid architecture currently starts at 9B — on 8 GB machines stay on
-> Qwen3. Qwen3 系列覆盖 4B；Qwen3.5 目前只有 9B 档，8GB 机型请留在 Qwen3。
+> The engine is config-driven: any same-architecture Qwen3.5 size loads via
+> GGUF metadata (MTP-aware loader) — the table grows as the family does.
+> 引擎由 GGUF 元数据驱动：同架构任意尺寸直接加载（MTP 感知加载器）。
 
 ## Manual budgeting / 手动预算方法
 
