@@ -7,3 +7,7 @@ bin/
 server/serve_harness/.test-serve.bin
 server/serve_harness/.test-kv-cache/
 server/serve_harness/.test-serve-old.bin
+
+# stray compiled test binaries
+/tokenizer
+/serve
