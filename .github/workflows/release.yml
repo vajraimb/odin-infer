@@ -17,7 +17,7 @@ jobs:
             https://github.com/odin-lang/Odin/releases/download/dev-2026-07/odin-macos-arm64-dev-2026-07.tar.gz
           tar -xzf /tmp/odin.tar.gz -C /tmp
           ODIN_DIR=$(echo /tmp/odin-macos-arm64-*/)
-          echo "$ODIN_DIR/bin" >> "$GITHUB_PATH"
+          echo "${ODIN_DIR%/}" >> "$GITHUB_PATH"
           odin version
 
       - name: Build + unit tests
