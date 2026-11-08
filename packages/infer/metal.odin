@@ -566,7 +566,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 		fmt.eprintln("metal: no Metal device available")
 		return false
 	}
-	fmt.printf("metal: %s\n", m_device->name()->odinString())
+	fmt.eprintf("metal: %s\n", m_device->name()->odinString())
 
 	m_queue = m_device->newCommandQueue()
 

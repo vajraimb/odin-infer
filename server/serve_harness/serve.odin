@@ -83,7 +83,7 @@ start_server :: proc(port: u16, handler: Server_Handler) -> bool {
 		return false
 	}
 	defer net.close(sock)
-	fmt.printfln("serve: listening on http://127.0.0.1:%d", port)
+	fmt.eprintfln("serve: listening on http://127.0.0.1:%d", port)
 
 	for {
 		client, _, aerr := net.accept_tcp(sock)
@@ -1329,7 +1329,7 @@ run_parse_self_test :: proc() -> bool {
 	ok = feed_bytes(&g, "<tool_call>\n<function=search>\n</function>\n</tool_call>\n\n<tool_call>\n<function=memory>\n<parameter=script>\nx\n</parameter>\n</function>\n</tool_call>")
 	total += 1; if expect_true("grammar: multiple calls in one generation", ok) do pass += 1
 
-	fmt.printfln("self-test: %d/%d cases passed", pass, total)
+	fmt.eprintfln("self-test: %d/%d cases passed", pass, total)
 	return pass == total
 }
 
@@ -2625,6 +2625,143 @@ parse_f32_field :: proc(json, field: string, def: f32) -> f32 {
 	return f32(v)
 }
 
+// ====================== MCP (Model Context Protocol, stdio transport) ======================
+// JSON-RPC 2.0 over newline-delimited stdio. Exposes the local engine to MCP
+// clients (Claude Code, Cursor, pie): tools odin.chat + odin.models.
+// Protocol details: https://modelcontextprotocol.io — stdout is reserved for
+// protocol messages; all diagnostics go to stderr.
+
+mcp_read_line :: proc(scratch: ^[dynamic]u8) -> (string, bool) {
+	clear(scratch)
+	b: [1]u8
+	for {
+		n, err := os.read(os.stdin, b[:])
+		if n > 0 {
+			if b[0] == '\n' {
+				return string(scratch[:]), true
+			}
+			append(scratch, b[0])
+			continue
+		}
+		if len(scratch) > 0 {
+			return string(scratch[:]), true
+		}
+		_ = err
+		return "", false
+	}
+}
+
+// Raw text of the top-level "id" JSON value (number or string), or "" when the
+// message is a notification. Skips any "id" occurrence that is not followed by ':'.
+mcp_id_raw :: proc(line: string) -> string {
+	i := 0
+	for i < len(line) {
+		idx := index_from(line, `"id"`, i)
+		if idx < 0 { return "" }
+		j := idx + 4
+		for j < len(line) && (line[j] == ' ' || line[j] == '	') { j += 1 }
+		if j < len(line) && line[j] == ':' {
+			j += 1
+			for j < len(line) && (line[j] == ' ' || line[j] == '	') { j += 1 }
+			start := j
+			in_str := false
+			for j < len(line) {
+				c := line[j]
+				if c == '"' { in_str = !in_str; j += 1; continue }
+				if !in_str && (c == ',' || c == '}') { break }
+				j += 1
+			}
+			return strings.trim_space(line[start:j])
+		}
+		i = idx + 1
+	}
+	return ""
+}
+
+mcp_envelope_result :: proc(id, result_json: string) -> string {
+	return fmt.tprintf(`{{"jsonrpc":"2.0","id":%s,"result":%s}}`, id, result_json)
+}
+
+mcp_envelope_error :: proc(id: string, code: int, msg: string) -> string {
+	b: strings.Builder
+	strings.builder_init(&b, context.allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, fmt.tprintf(`{{"jsonrpc":"2.0","id":%s,"error":{{"code":%d,"message":`, id, code))
+	json_escape(msg, &b)
+	strings.write_string(&b, `}}`)
+	return strings.clone(strings.to_string(b))
+}
+
+mcp_tool_text_result :: proc(id, text: string) -> string {
+	b: strings.Builder
+	strings.builder_init(&b, context.allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, fmt.tprintf(`{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":`, id))
+	json_escape(text, &b)
+	strings.write_string(&b, `}]}}`)
+	return strings.clone(strings.to_string(b))
+}
+
+mcp_handle :: proc(line: string) -> (string, bool) {
+	method := extract_json_field(line, "method")
+	id := mcp_id_raw(line)
+	respond := len(id) > 0
+	if len(method) == 0 {
+		return mcp_envelope_error(id, -32700, "Parse error"), respond
+	}
+	switch method {
+	case "initialize":
+		return fmt.tprintf(`{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"odin-infer","version":"0.2.0","title":"odin-infer local Qwen engine"}}}}}}`, id), respond
+	case "ping":
+		return mcp_envelope_result(id, `{}`), respond
+	case "notifications/initialized", "notifications/cancelled":
+		return "", false
+	case "tools/list":
+		return fmt.tprintf(`{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"odin.chat","description":"Run the local Qwen3/Qwen3.5 model (odin-infer) on a chat request and return the generated reply.","inputSchema":{{"type":"object","properties":{{"messages":{{"type":"array","description":"Chat messages in OpenAI format (role/content)."}},"max_tokens":{{"type":"integer","description":"Maximum tokens to generate.","default":256}},"temperature":{{"type":"number","description":"Sampling temperature (0 = greedy).","default":0.6}}}},"required":["messages"]}}}},{{"name":"odin.models","description":"List the loaded model and engine status.","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}`, id), respond
+	case "tools/call":
+		name := extract_json_field(line, "name")
+		switch name {
+		case "odin.models":
+			cfg := q35.engine_config(&g_state.engine)
+			info := fmt.tprintf(
+				"model: %s\narchitecture: qwen3_5\nvocab: %d\nseq_len: %d\ndim: %d\nmetal: %v",
+				g_state.model_path, cfg.vocab_size, cfg.seq_len, cfg.dim, g_state.engine.metal_ready,
+			)
+			return mcp_tool_text_result(id, info), respond
+		case "odin.chat":
+			// Reuse the OpenAI handler: it scans the whole JSON for
+			// messages/max_tokens/temperature, which live in params.arguments.
+			resp_json := handle_openai_chat(line)
+			if strings.contains(resp_json, "invalid_request_error") {
+				return mcp_tool_text_result(id, strings.concatenate({"error: ", extract_json_field(resp_json, "message")}, context.temp_allocator)), respond
+			}
+			text := extract_json_field(resp_json, "content")
+			return mcp_tool_text_result(id, text), respond
+		case:
+			return mcp_tool_text_result(id, fmt.tprintf("error: unknown tool '%s'", name)), respond
+		}
+	case:
+		return mcp_envelope_error(id, -32601, "Method not found"), respond
+	}
+	return "", false
+}
+
+mcp_loop :: proc() {
+	fmt.eprintln("mcp: stdio loop ready (stdout is reserved for protocol)")
+	scratch := make([dynamic]u8, 0, 65536, g_heap)
+	for {
+		line, ok := mcp_read_line(&scratch)
+		if !ok { break }
+		line = strings.trim_space(line)
+		if len(line) == 0 { continue }
+		resp, respond := mcp_handle(line)
+		if respond && len(resp) > 0 {
+			fmt.println(resp)
+		}
+	}
+	fmt.eprintln("mcp: stdin closed, exiting")
+}
+
 // ====================== entry ======================
 
 main :: proc() {
@@ -2656,6 +2793,7 @@ main :: proc() {
 	model_path := args[1]
 	port: u16 = 9748
 	use_metal := false
+	use_mcp := false
 	max_ctx := 4096
 
 	i := 2
@@ -2671,6 +2809,9 @@ main :: proc() {
 		} else if a == "--max-ctx" && i + 1 < len(args) {
 			max_ctx, _ = strconv_parse_int(args[i+1])
 			i += 2
+		} else if a == "--mcp" {
+			use_mcp = true
+			i += 1
 		} else {
 			i += 1
 		}
@@ -2683,7 +2824,7 @@ main :: proc() {
 	// by its initial make, and clear() preserves it).
 	g_state.last_tokens = make([dynamic]int, 0, 4096, g_heap)
 	g_state.prefix_tokens = make([dynamic]int, 0, 4096, g_heap)
-	fmt.println("serve: loading engine…")
+	fmt.eprintln("serve: loading engine…")
 	e, ok := q35.engine_load(model_path, q35.Engine_Opts{
 		max_ctx = max_ctx,
 		use_metal = use_metal,
@@ -2722,8 +2863,13 @@ main :: proc() {
 	// QDUMP_DIVERGE=1: dump divergence windows on cache-miss full prefills.
 	g_dump_diverge = os.get_env("QDUMP_DIVERGE", context.temp_allocator) == "1"
 
-	fmt.printfln("serve: ready (vocab=%d, seq_len=%d, metal=%v)",
+	fmt.eprintfln("serve: ready (vocab=%d, seq_len=%d, metal=%v)",
 		cfg.vocab_size, cfg.seq_len, g_state.engine.metal_ready)
+
+	if use_mcp {
+		mcp_loop()
+		return
+	}
 
 	if !start_server(port, handle_request) {
 		os.exit(1)

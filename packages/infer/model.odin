@@ -226,7 +226,7 @@ build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int
 	malloc_run_state(&t.state, t.config)
 
 	kv_bytes := 2 * t.config.n_layers * t.config.seq_len * t.config.n_kv_heads * t.config.head_dim * 4
-	fmt.printf(
+	fmt.eprintf(
 		"model: dim=%d layers=%d heads=%d/%d hidden=%d vocab=%d ctx=%d/%d  weights=%s  KV cache=%.0f MB\n",
 		t.config.dim,
 		t.config.n_layers,

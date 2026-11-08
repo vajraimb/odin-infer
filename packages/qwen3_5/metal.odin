@@ -1223,7 +1223,7 @@ print_quant_summary :: proc(t: ^Transformer) {
 		lw := &w.layers[l]
 		if lw.layer_type == .Linear_Attention && t.config.n_linear > 0 {
 			la := &lw.linear
-			fmt.printf("metal: quant (linear)  w1=%s w3=%s w2=%s  qkv=%s z=%s b=%s a=%s out=%s\n",
+			fmt.eprintf("metal: quant (linear)  w1=%s w3=%s w2=%s  qkv=%s z=%s b=%s a=%s out=%s\n",
 				kstr(lw.w1.kind), kstr(lw.w3.kind), kstr(lw.w2.kind),
 				kstr(la.in_qkv.kind), kstr(la.in_z.kind), kstr(la.in_b.kind),
 				kstr(la.in_a.kind), kstr(la.out.kind))
@@ -1234,7 +1234,7 @@ print_quant_summary :: proc(t: ^Transformer) {
 		lw := &w.layers[l]
 		if lw.layer_type == .Full_Attention {
 			fa := &lw.full
-			fmt.printf("metal: quant (full)    w1=%s w3=%s w2=%s  wq=%s wk=%s wv=%s wo=%s\n",
+			fmt.eprintf("metal: quant (full)    w1=%s w3=%s w2=%s  wq=%s wk=%s wv=%s wo=%s\n",
 				kstr(lw.w1.kind), kstr(lw.w3.kind), kstr(lw.w2.kind),
 				kstr(fa.wq.kind), kstr(fa.wk.kind), kstr(fa.wv.kind), kstr(fa.wo.kind))
 			break
@@ -1341,7 +1341,7 @@ metal_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 	if !append_crc32(path) {
 		fmt.eprintln("kv: crc append failed"); return false
 	}
-	fmt.printfln("kv: saved (Metal) %s (%d valid pos, %d full L, kv_dim=%d)",
+	fmt.eprintfln("kv: saved (Metal) %s (%d valid pos, %d full L, kv_dim=%d)",
 		path, n_valid_pos, c.n_full, kv_dim)
 	return true
 }
@@ -1444,7 +1444,7 @@ metal_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 		fmt.eprintln("kv: recurrent_states read failed"); return 0, false
 	}
 
-	fmt.printfln("kv: loaded (Metal) %s (%d valid pos)", path, h.n_valid_pos)
+	fmt.eprintfln("kv: loaded (Metal) %s (%d valid pos)", path, h.n_valid_pos)
 	return int(h.n_valid_pos), true
 }
 
@@ -1476,7 +1476,7 @@ metal_init :: proc(t: ^Transformer) -> bool {
 
 	m_device = MTL.CreateSystemDefaultDevice()
 	if m_device == nil { fmt.eprintln("metal: no Metal device available"); return false }
-	fmt.printf("metal: %s\n", m_device->name()->odinString())
+	fmt.eprintf("metal: %s\n", m_device->name()->odinString())
 	m_queue = m_device->newCommandQueue()
 
 	// profiling/debug toggles (env). QFASTMATH=0 -> precise shaders (for f32 drift
@@ -1489,8 +1489,8 @@ metal_init :: proc(t: ^Transformer) -> bool {
 	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
-	fmt.printfln("metal: shader fastMath={} (QFASTMATH=0 to disable)", g_fast_math)
-	fmt.printfln("metal: maxThreadgroupMemoryLength={} bytes", m_device->maxThreadgroupMemoryLength())
+	fmt.eprintfln("metal: shader fastMath={} (QFASTMATH=0 to disable)", g_fast_math)
+	fmt.eprintfln("metal: maxThreadgroupMemoryLength={} bytes", m_device->maxThreadgroupMemoryLength())
 
 	src := NS.String.alloc()->initWithOdinString(MSL_SRC)
 	defer src->release()

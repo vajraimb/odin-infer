@@ -259,7 +259,7 @@ cpu_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 	if !append_crc32(path) {
 		fmt.eprintln("kv: crc append failed"); return false
 	}
-	fmt.printfln("kv: saved %s (%d valid pos, %d full L, kv_dim=%d)",
+	fmt.eprintfln("kv: saved %s (%d valid pos, %d full L, kv_dim=%d)",
 		path, n_valid_pos, c.n_full, kv_dim)
 	return true
 }
@@ -331,7 +331,7 @@ cpu_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 		fmt.eprintln("kv: recurrent_states read failed"); return 0, false
 	}
 
-	fmt.printfln("kv: loaded %s (%d valid pos)", path, h.n_valid_pos)
+	fmt.eprintfln("kv: loaded %s (%d valid pos)", path, h.n_valid_pos)
 	return int(h.n_valid_pos), true
 }
 

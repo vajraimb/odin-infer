@@ -10,7 +10,7 @@
 
 | 形态 | 构建产物 | 用途 |
 |------|----------|------|
-| **odin-serve**（主） | `bin/odin-serve`，`./serve.sh` 启动 | OpenAI 兼容 `/v1` + Ollama 兼容 `/api/chat` + Web dashboard；MCP 适配层在路线图上 |
+| **odin-serve**（主） | `bin/odin-serve`，`./serve.sh` 启动 | HTTP 模式：OpenAI 兼容 `/v1` + Ollama 兼容 `/api/chat` + Web dashboard；`--mcp` 模式：MCP stdio 服务端（`odin.chat` / `odin.models` 工具，见 [docs/MCP.md](docs/MCP.md)） |
 | **odin-cli**（辅） | `bin/odin-cli` | 终端交互聊天，自动识别 Qwen3 / Qwen3.5 |
 | **库** | `packages/*`（`-collection` 可嵌入） | ggml 解析、Qwen3/Qwen3.5 引擎、分词、采样 |
 
@@ -23,6 +23,7 @@
 MODEL=./models/<your>.gguf ./serve.sh       # 启动服务 http://127.0.0.1:9748
 ./codex.sh "your prompt"                    # Codex CLI 接入（responses wire API）
 ./pie.sh                                    # pie agent 接入
+bin/odin-serve <model.gguf> --mcp --metal   # MCP 模式（Claude Code / Cursor 接入）
 ```
 
 模型文件放 `models/`（gitignored，放软链或下载脚本即可；见 `models/README.md`）。

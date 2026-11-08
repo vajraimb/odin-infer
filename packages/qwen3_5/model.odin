@@ -469,7 +469,7 @@ build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int
 	lin_bytes :=
 		t.config.n_linear * conv_dim * (t.config.lin_conv_kernel - 1) * 4 +
 		t.config.n_linear * t.config.lin_n_v_heads * t.config.lin_head_k_dim * t.config.lin_head_v_dim * 4
-	fmt.printf(
+	fmt.eprintf(
 		"qwen3_5: dim=%d layers=%d (full=%d linear=%d) heads=%d/%d head_dim=%d hidden=%d vocab=%d ctx=%d/%d  rotary=%d  conv_dim=%d value_dim=%d  KV=%.0f MB  lin=%.0f MB\n",
 		t.config.dim,
 		t.config.n_layers,

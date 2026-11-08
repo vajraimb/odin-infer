@@ -67,8 +67,8 @@ Air 定位。
 ## 八、路线图（按序）
 
 1. ~~repo 整合 + 定位文档~~ ✅
-2. **MCP 适配层**（stdio + SSE，复用 tool-call grammar；配 Claude Code /
-   Cursor / pie 三个接入样例与测试）
+2. ~~MCP 适配层~~ ✅（stdio 已上线：`odin.chat`/`odin.models` 工具 + Claude Code /
+   Cursor 配置样例 + `test_mcp.py` 全握手测试；SSE/streamable HTTP 后续）
 3. 首启形状调优 + 热测试协议（Air 实证）
 4. 内存预算模式（8GB 机型默认配置）
 5. （可选）性能再攻坚：需完整 Xcode（`xcrun metal` + Instruments GPU 计数
