@@ -64,7 +64,7 @@ models/     模型软链（gitignored）
 ```sh
 ./build.sh                         # 全量构建 + 单测
 ( cd packages/qwen3_5 && ./build.sh )   # qwen3_5 纯数学单测
-( cd packages/tokenizer && odin test . ) # 分词器单测（内存紧张时可能 OOM 失败）
+( cd packages/tokenizer && odin test . -define:ODIN_TEST_THREADS=1 ) # 分词器单测（内存紧张时并行会 OOM，已默认单线程）
 ./serve.sh [port] [max_ctx]       # 开发模式（odin run）
 ```
 

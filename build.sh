@@ -19,7 +19,7 @@ echo "== unit tests: packages/qwen3_5 =="
 ( cd packages/qwen3_5 && ./build.sh )
 
 echo "== unit tests: packages/tokenizer =="
-( cd packages/tokenizer && odin test . )
+( cd packages/tokenizer && odin test . -define:ODIN_TEST_THREADS=1 )
 
 echo ""
 echo "== done: bin/odin-serve bin/odin-cli =="
