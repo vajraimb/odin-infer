@@ -10,6 +10,13 @@ Apple Silicon 上的 Qwen3/Qwen3.5 推理引擎（纯 Odin，无 Python 运行�
 注意力，gated delta）；共享 `packages/ggml`（GGUF 解析/量化）。服务端在
 `server/serve_harness/serve.odin`（单文件包），CLI 在 `cli/main.odin`。
 
+## 发布
+
+- 零编译二进制由 GitHub Actions 构建：`.github/workflows/release.yml`
+  （macos-14 arm64 runner，brew 装 Odin → ./build.sh → 推 tag `v*` 时
+  `gh release create` 发布 bin/odin-serve + bin/odin-cli）
+- 改发布流程后：push tag 触发；`gh run watch` 观察
+
 ## 构建与测试（必跑顺序）
 
 ```sh

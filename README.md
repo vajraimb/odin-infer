@@ -20,15 +20,34 @@ llama.cpp 依赖，首 token 73ms，原生 MCP，agent 就绪。
 | 要 OpenAI / Ollama 兼容 | `/v1/chat/completions` + `/api/chat` + Web dashboard |
 | 首 token 要快（交互体感） | 73ms（M3 实测，快过 ollama 的 ~90ms） |
 
-## 30 秒上手
+## 30 秒上手（零编译）
+
+Apple Silicon（M1–M4）直接下载预构建二进制：
 
 ```sh
-git clone https://github.com/vajraimb/odin-infer
-cd odin-infer
+curl -L -o odin-serve https://github.com/vajraimb/odin-infer/releases/latest/download/odin-serve
+curl -L -o odin-cli   https://github.com/vajraimb/odin-infer/releases/latest/download/odin-cli
+chmod +x odin-serve odin-cli
+xattr -cr odin-serve odin-cli   # 仅当 macOS 拦截未签名二进制时需要
+./odin-serve ./models/<你的模型>.gguf --metal --port 9748   # http://127.0.0.1:9748
+```
+
+MCP（给 agent 用）：
+
+```sh
+claude mcp add odin -- /path/to/odin-serve /path/to/model.gguf --mcp --metal
+```
+
+从源码构建（需要 [Odin](https://odin-lang.org) 工具链）：
+
+```sh
+git clone https://github.com/vajraimb/odin-infer && cd odin-infer
 ./build.sh                                  # 构建 + 单测，产出 bin/odin-serve bin/odin-cli
-# 把 GGUF 软链到 models/（见 models/README.md），然后：
 MODEL=./models/<你的模型>.gguf ./serve.sh   # http://127.0.0.1:9748
 ```
+
+> 模型 GGUF 不在仓库里（gitignored）：从 Hugging Face 下载后放 `models/` 或
+> 任意路径（见 models/README.md 的推荐布局）。
 
 MCP（给 agent 用）：
 
