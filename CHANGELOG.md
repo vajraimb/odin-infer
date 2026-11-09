@@ -4,7 +4,11 @@
 
 - Full quant dequant coverage: Q2_K/Q3_K/Q5_K/Q8_K + IQ family (IQ1_S/IQ1_M/
   IQ2_XXS/XS/S/IQ3_XXS/S/IQ4_NL/XS), bit-exact vs llama.cpp. Unsloth Dynamic
-  GGUFs load — Qwen3.8-27B-UD-IQ2_XXS validated end-to-end (CPU).
+  GGUFs load — Qwen3.8-27B-UD-IQ2_XXS validated end-to-end.
+- Metal IQ/k-quant GEMV kernels: Qwen3.8-27B decodes on GPU (223 ms/tok,
+  CPU-vs-Metal max_abs ~1.4e-3).
+- FIXED: shader library failed to compile since v0.2.0 ('half' reserved word +
+  uint3 field misuse) — every model silently fell back to CPU.
 
 All notable changes are recorded here. Format: keep it human-readable.
 
