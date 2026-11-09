@@ -1,5 +1,16 @@
 # Changelog · 更新日志
 
+## v0.4.0 — 2026-11-09
+
+- Batched MMQ for IQ/k-quant types (11 new kernels): Qwen3.8-27B Dynamic
+  mixed-quant prompts prefill batched (~1.8x GPU); batch vs per-token
+  max_abs 5.7e-3 prefill / 6.6e-3 decode, argmax agrees. Fixed a latent
+  m_b_proj_half overflow on models where att_head_dim > dim.
+- OpenAI-path prefix cache / conversation continuity (also covers MCP
+  odin.chat): continuation, system-boundary snapshot, full-reset branches.
+- docs/BENCHMARKS(.zh).md: consolidated measured data (9B vs ollama,
+  Qwen3.8-27B, MoE, quant bit-exactness, loaded-machine degradation).
+
 ## v0.3.0 — 2026-11-09
 
 
