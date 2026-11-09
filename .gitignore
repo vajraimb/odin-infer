@@ -13,3 +13,4 @@ server/serve_harness/.test-serve-old.bin
 /serve
 .tmp-cache/
 __pycache__/
+/q38_load_test.bin
