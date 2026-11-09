@@ -1,6 +1,7 @@
 # Changelog · 更新日志
 
-## Unreleased
+## v0.3.0 — 2026-11-09
+
 
 - Full quant dequant coverage: Q2_K/Q3_K/Q5_K/Q8_K + IQ family (IQ1_S/IQ1_M/
   IQ2_XXS/XS/S/IQ3_XXS/S/IQ4_NL/XS), bit-exact vs llama.cpp. Unsloth Dynamic

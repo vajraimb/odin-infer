@@ -72,7 +72,11 @@ residency, cooled machine:
 
 - **Qwen3.5 hybrid attention** (Ornith / heretic family): text-only, 248k vocab.
   The 9B is validated end-to-end; other sizes of the same architecture load
-  automatically from GGUF metadata (MTP-aware loader).
+  automatically from GGUF metadata (MTP-aware loader) — including
+  **Qwen3.8-27B** (GPU decode verified, ctx 8192).
+- **Any llama.cpp quant**: Q2_K..Q8_K + the IQ family (IQ1_S..IQ4_XS) are
+  implemented bit-exact vs llama.cpp — Unsloth "Dynamic" mixed-quant GGUFs
+  load and decode on GPU.
 - **Qwen3.5-MoE** (35B-A3B / 122B-A10B / 397B-A17B): CPU + Metal paths
   supported — softmax top-k routing, per-expert GEMV dispatch (Q4_K/Q5_0/Q8_0/
   Q6_K), sigmoid-gated shared expert; Metal output matches CPU to ~3e-3

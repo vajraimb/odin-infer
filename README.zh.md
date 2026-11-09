@@ -70,7 +70,10 @@ M3 / 16GB，DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic（Q4_K_M），单引�
 **定位在 Qwen3.5 及以上：**
 
 - **Qwen3.5 混合注意力**（Ornith / heretic 家族）：文本，248k 词表。9B 已
-  端到端验收；同架构其他尺寸靠 GGUF 元数据自动加载（MTP 感知加载器）。
+  端到端验收；同架构其他尺寸靠 GGUF 元数据自动加载（MTP 感知加载器）——
+  包括 **Qwen3.8-27B**（GPU 解码已验证，ctx 8192）。
+- **任意 llama.cpp 量化**：Q2_K..Q8_K + IQ 家族（IQ1_S..IQ4_XS）逐位一致
+  实现——unsloth "Dynamic" 混合量化 GGUF 可加载并 GPU 解码。
 - **Qwen3.5-MoE**（35B-A3B / 122B-A10B / 397B-A17B）：CPU + Metal 双路径
   已支持——softmax top-k 路由、逐专家 GEMV 分派（Q4_K/Q5_0/Q8_0/Q6_K）、
   sigmoid 门控共享专家；Metal 输出与 CPU 一致（~3e-3，fastMath），0.8B-MoE
