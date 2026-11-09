@@ -122,6 +122,11 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   （~0.4-1.3s/token）；ctx 8192 已验证（kv=1.07GB，总占用 8.5GB/49%）。
 - dense 批量 prefill（enc_mm）仅支持 Q4_K/Q6_K；model_batch_mm_ok 把关，
   混合量化模型回退逐 token Metal（27B 的 IQ 批量 prefill 记为后续）。
+- 前缀缓存/会话连续性：两条 HTTP 路径（OpenAI 与 Ollama）都跨请求复用引擎
+  状态——延续（prompt 是上次 token 序列的精确前缀延伸时只 prefill 新尾）、
+  系统边界快照（恢复后只 prefill 后缀）、否则全量 reset。OpenAI 路径在
+  v0.3.x 周期补齐（MCP 的 odin.chat 自动继承）。计数器：/api/state 的
+  pc_continuation_hits / pc_snapshot_hits。
 - 专家张量布局（已对真实 unsloth 35B-A3B 头部验证）：`ffn_gate_inp`
   [dim, n_expert]，`ffn_up_exps`/`ffn_gate_exps` [dim, n_ff_exp, n_expert]，
   `ffn_down_exps` [n_ff_exp, dim, n_expert]——ne0 是收缩维，量化粒度 = 一行
