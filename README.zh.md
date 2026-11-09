@@ -62,8 +62,10 @@ M3 / 16GB，DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic（Q4_K_M），单引�
 | 首 token | **73 ms** | ~90 ms |
 | 二进制体积 | **7.1 MB** | 大二进制 + 运行时依赖 |
 
-> 口径见 [POSITIONING.zh.md](POSITIONING.zh.md) 第五节；GEMV 内核的完整对照
-> 实验在 [packages/qwen3_5/README.md](packages/qwen3_5/README.md)。
+> 完整数字、Qwen3.8-27B 与 MoE 表格、满载降级形态见
+> [docs/BENCHMARKS.zh.md](docs/BENCHMARKS.zh.md)；口径见
+> [POSITIONING.zh.md](POSITIONING.zh.md) 第五节；GEMV 内核对照实验在
+> [packages/qwen3_5/README.md](packages/qwen3_5/README.md)。
 
 ## 支持什么
 
