@@ -121,7 +121,14 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   （生产形状，codebook 以 MSL 常量内嵌）。Qwen3.8-27B 可 GPU 解码
   （~0.4-1.3s/token）；ctx 8192 已验证（kv=1.07GB，总占用 8.5GB/49%）。
 - dense 批量 prefill（enc_mm）仅支持 Q4_K/Q6_K；model_batch_mm_ok 把关，
-  混合量化模型回退逐 token Metal（27B 的 IQ 批量 prefill 记为后续）。
+  混合量化模型回退逐 token Metal。IQ 批量 prefill 已实现（见下一条）。
+- dense 批量 prefill（enc_mm）现已支持 13 种量化——Q4_K/Q6_K/Q8_0/Q2_K/Q3_K
+  + IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS（v3 形状 MMQ
+  内核，dequant 与 GEMV 一致）。27B 的 Dynamic 混合量化 prefill 已批量化
+  （~1.8x GPU，30-token prompt 227 vs 420 ms/tok）；批量 vs 逐 token prefill
+  max_abs ~5.7e-3、解码步 ~6.6e-3（64 层 MLP 舍入残留，argmax 一致）。
+  真实 token 的注意力列用 GEMV 覆盖以保持状态近精确。IQ 的 b64 变体为
+  后续性能项。GGUF 检查工具：tools/inspect_iq_gguf.py + tools/gguf_meta.py。
 - 前缀缓存/会话连续性：两条 HTTP 路径（OpenAI 与 Ollama）都跨请求复用引擎
   状态——延续（prompt 是上次 token 序列的精确前缀延伸时只 prefill 新尾）、
   系统边界快照（恢复后只 prefill 后缀）、否则全量 reset。OpenAI 路径在
