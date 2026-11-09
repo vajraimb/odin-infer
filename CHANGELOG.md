@@ -9,6 +9,11 @@
   CPU-vs-Metal max_abs ~1.4e-3).
 - FIXED: shader library failed to compile since v0.2.0 ('half' reserved word +
   uint3 field misuse) — every model silently fell back to CPU.
+- FIXED: MoE grouped-GEMM batch prefill — three stacked bugs (zero-grid MMQ
+  for M=16 ssm tensors, top-k threadgroup race across tokens, MMQ ordering
+  amplification); batch prefill is now the default Metal path (max_abs 8e-4
+  vs per-token, ~40% faster).
+- Qwen3.8-27B validated at ctx 8192 (kv 1.07 GB, coherent long-prompt answer).
 
 All notable changes are recorded here. Format: keep it human-readable.
 
