@@ -661,6 +661,8 @@ handle_chat :: proc(body: string) -> string {
 		next = sampler.sample(&g_state.samp, logits)
 	}
 
+	save_session_state()
+
 	ttft := t_first - t_start
 	t_total := time_to_ms() - t_first  // decode only (excludes prefill)
 	tps := gen > 0 && t_total > 0 ? f64(gen) * 1000.0 / f64(t_total) : 0.0
@@ -2500,23 +2502,89 @@ handle_openai_chat :: proc(body: string) -> string {
 	defer delete(prompt)
 	t1 := time_to_ms()
 
-	// RESET engine state for stateless OpenAI semantics
-	q35.engine_reset_state(&g_state.engine)
-	g_state.pos = 0
-	t2 := time_to_ms()
-
 	encoded, err := tok35.encode(&g_state.tok, prompt)
 	if err != nil {
 		return `{"error":{"message":"encode failed","type":"internal_error"}}`
 	}
 	t3 := time_to_ms()
 
-	// Prefill all but last token
-	if len(encoded) > 1 {
-		_ = q35.engine_forward_batch(&g_state.engine, encoded[:len(encoded)-1], 0)
+	// ---- prefix cache (same three-branch logic as the Ollama path) ----
+	common := 0
+	max_common := min(len(encoded), len(g_state.last_tokens))
+	for common < max_common && encoded[common] == g_state.last_tokens[common] {
+		common += 1
+	}
+	snap_pos := 0
+	for i in 3 ..< len(encoded) - 1 {
+		if encoded[i] == EOS { snap_pos = i + 2; break }
+	}
+	snap_ok := snap_pos >= 5 && snap_pos < len(encoded)
+
+	prefix_matches := false
+	if len(g_state.prefix_tokens) > 0 && len(encoded) > len(g_state.prefix_tokens) {
+		prefix_matches = true
+		for i in 0 ..< len(g_state.prefix_tokens) {
+			if encoded[i] != g_state.prefix_tokens[i] { prefix_matches = false; break }
+		}
+	}
+	can_continue := common == len(g_state.last_tokens) && common > 0 &&
+		common < len(encoded) && g_state.pos == common - 1
+
+	t_reset_ms: i64 = 0
+	if can_continue && (!prefix_matches || common >= g_state.prefix_pos) {
+		new_tokens := encoded[common:len(encoded) - 1]
+		if len(new_tokens) > 0 {
+			_ = q35.engine_forward_batch(&g_state.engine, new_tokens, common)
+		}
+		g_state.pos = len(encoded) - 1
+		g_state.pc_continuation_hits += 1
+	} else if prefix_matches {
+		q35.engine_restore_full_state(&g_state.engine,
+			g_state.prefix_kv_k, g_state.prefix_kv_v,
+			g_state.prefix_conv, g_state.prefix_rec)
+		g_state.pos = g_state.prefix_pos
+		suffix_tokens := encoded[g_state.prefix_pos:len(encoded) - 1]
+		if len(suffix_tokens) > 0 {
+			_ = q35.engine_forward_batch(&g_state.engine, suffix_tokens, g_state.prefix_pos)
+		}
+		g_state.pos = len(encoded) - 1
+		g_state.pc_snapshot_hits += 1
+	} else {
+		t_r0 := time_to_ms()
+		q35.engine_reset_state(&g_state.engine)
+		t_reset_ms = time_to_ms() - t_r0
+		g_state.pos = 0
+		if snap_ok {
+			_ = q35.engine_forward_batch(&g_state.engine, encoded[:snap_pos], 0)
+			g_state.pos = snap_pos
+			{
+				prev := context.allocator
+				context.allocator = g_heap
+				if len(g_state.prefix_kv_k) > 0 {
+					delete(g_state.prefix_kv_k); delete(g_state.prefix_kv_v)
+					delete(g_state.prefix_conv); delete(g_state.prefix_rec)
+				}
+				g_state.prefix_kv_k, g_state.prefix_kv_v,
+					g_state.prefix_conv, g_state.prefix_rec =
+					q35.engine_save_full_state(&g_state.engine)
+				context.allocator = prev
+			}
+			clear(&g_state.prefix_tokens)
+			append(&g_state.prefix_tokens, ..encoded[:snap_pos])
+			g_state.prefix_pos = snap_pos
+		}
+		if snap_pos < len(encoded) - 1 {
+			_ = q35.engine_forward_batch(&g_state.engine, encoded[snap_pos:len(encoded) - 1], g_state.pos)
+		}
 		g_state.pos = len(encoded) - 1
 	}
-	t4 := time_to_ms()
+	t2 := time_to_ms()
+	t4 := t2
+
+	// refresh the continuation cache with this request's full token sequence
+	// (generated tokens are appended inside the loop below)
+	clear(&g_state.last_tokens)
+	append(&g_state.last_tokens, ..encoded)
 
 	// Generate
 	gen_buf: strings.Builder
@@ -2547,6 +2615,7 @@ handle_openai_chat :: proc(body: string) -> string {
 		if gen == 0 { t_first = time_to_ms() }
 		gen += 1
 		g_state.pos += 1
+		append(&g_state.last_tokens, next)
 		if gen >= max_tokens { break }
 		if g_state.pos >= q35.engine_config(&g_state.engine).seq_len { break }
 		t_fwd0 := time_to_ms()
@@ -2554,6 +2623,8 @@ handle_openai_chat :: proc(body: string) -> string {
 		fwd_cpu_ms += time_to_ms() - t_fwd0
 		next = sampler.sample(&g_state.samp, logits)
 	}
+
+	save_session_state()
 
 	ttft := t_first - t_start
 	t_total := time_to_ms() - t_first  // decode only (excludes prefill)
