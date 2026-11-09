@@ -46,7 +46,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # release notes = the latest section of CHANGELOG.md
+          awk 'NR==1{next} /^## v/{if (seen) exit; seen=1} {print}' CHANGELOG.md > /tmp/notes.md
           gh release create "$GITHUB_REF_NAME" \
             bin/odin-serve bin/odin-cli \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes
+            --notes-file /tmp/notes.md
