@@ -119,7 +119,14 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   Metal，MOE_BATCH=1 启用批量路径。
 - Metal IQ/k-quant GEMV 内核：gemv_q2_k/q3_k/q5_k/q8_k + 9 个 IQ 内核
   （生产形状，codebook 以 MSL 常量内嵌）。Qwen3.8-27B 可 GPU 解码
-  （~0.4-1.3s/token）；ctx 8192 已验证（kv=1.07GB，总占用 8.5GB/49%）。
+  （~0.4-1.3s/token）；ctx 8192 已验证（Q8_0 KV 0.27GB，总占用 7.7GB），
+  ctx 32768 kv 1.14GB（总占用 8.56GB）。
+- KV 缓存默认 Q8_0 量化（KV_Q8=0 退回旧 f16 Metal 路径）。对称量化
+  d=amax/127，与 llama.cpp 逐位一致。布局 position-major
+  [n_full][seq_len][kv_dim/32 块][34B]；CPU Run_State 保持 fp32、在快照边界
+  转换（CPU 恢复保真 ~4e-2，Metal 快照逐字节精确）。.oikv 为 KV_VERSION=2
+  （v1 文件明确拒绝）。离群值重的 V 缓存上 Q8 误差真实存在（27B logits
+  ~1e-1），但 argmax/质量不受影响——llama.cpp 标准做法。
 - dense 批量 prefill（enc_mm）仅支持 Q4_K/Q6_K；model_batch_mm_ok 把关，
   混合量化模型回退逐 token Metal。IQ 批量 prefill 已实现（见下一条）。
 - dense 批量 prefill（enc_mm）现已支持 13 种量化——Q4_K/Q6_K/Q8_0/Q2_K/Q3_K
