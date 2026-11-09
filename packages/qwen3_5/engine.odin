@@ -102,12 +102,32 @@ model_batch_mm_ok :: proc(t: ^Transformer) -> bool {
 
 engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
 	if e.transformer.config.is_moe {
-		// KNOWN ISSUE: forward_gpu_batch_moe (grouped GEMM) diverges from the
-		// per-token path on real Metal (~9-17 max_abs at layer 0; the T%8
-		// padding was one bug, the attention-residual stage still diverges —
-		// see AGENTS.md traps). Per-token Metal prefill is bit-correct and
-		// still GPU-accelerated; re-enable the batch path once it is fixed.
 		if e.metal_ready {
+			if os.get_env("MOE_BATCH", context.temp_allocator) == "1" {
+				logits: []f32 = nil
+				i := 0
+				n := len(tokens)
+				for i < n {
+					rem := n - i
+					if rem >= 8 {
+						chunk := min(MOE_BATCH_T, rem)
+						chunk -= chunk % 8
+						logits = forward_gpu_batch_moe(&e.transformer, tokens[i : i + chunk], pos_start + i, chunk)
+						i += chunk
+					} else if rem >= 3 {
+						padded: [8]int
+						for j in 0 ..< 8 {
+							padded[j] = tokens[i + min(j, rem - 1)]
+						}
+						logits = forward_gpu_batch_moe(&e.transformer, padded[:], pos_start + i, rem)
+						i += rem
+					} else {
+						logits = forward_gpu(&e.transformer, tokens[i], pos_start + i)
+						i += 1
+					}
+				}
+				return logits
+			}
 			logits: []f32 = nil
 			for i in 0 ..< len(tokens) {
 				logits = forward_gpu(&e.transformer, tokens[i], pos_start + i)

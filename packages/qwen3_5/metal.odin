@@ -3510,6 +3510,12 @@ moe_ffn_gpu :: proc(enc: ^^MTL.ComputeCommandEncoder, cmd: ^^MTL.CommandBuffer, 
 	enc^->endEncoding()
 	cmd^->commit()
 	cmd^->waitUntilCompleted()
+	if os.get_env("MOE_BATCH_DEBUG", context.temp_allocator) == "1" && l == 0 {
+		lout := m_b_lout->contentsAsSlice([]f32)[:8]
+		qkv2 := m_b_qkv2->contentsAsSlice([]f32)[:8]
+		fmt.eprintf("1tok lout[0..4]=%.4f %.4f %.4f %.4f qkv2[0..4]=%.4f %.4f %.4f %.4f", lout[0], lout[1], lout[2], lout[3], qkv2[0], qkv2[1], qkv2[2], qkv2[3])
+		fmt.eprintln()
+	}
 	sel := m_b_moe_sel->contentsAsSlice([]i32)[:used]
 	cmd2 := m_queue->commandBuffer()
 	enc2 := cmd2->computeCommandEncoder()
