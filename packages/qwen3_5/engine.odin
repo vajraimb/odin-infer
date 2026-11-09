@@ -103,7 +103,11 @@ model_batch_mm_ok :: proc(t: ^Transformer) -> bool {
 engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
 	if e.transformer.config.is_moe {
 		if e.metal_ready {
-			if os.get_env("MOE_BATCH", context.temp_allocator) == "1" {
+			// Batched MoE prefill is the default on Metal (grouped GEMM + one
+			// sync per layer vs two per token; the attention blocks GEMV the
+			// real tokens so they stay bit-identical with the per-token path).
+			// MOE_BATCH=0 falls back to per-token prefill (debug / A-B switch).
+			if os.get_env("MOE_BATCH", context.temp_allocator) != "0" {
 				logits: []f32 = nil
 				i := 0
 				n := len(tokens)

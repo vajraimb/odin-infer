@@ -2003,7 +2003,9 @@ struct GemmDims { uint M; uint N; uint K; };
 // C[M,N] = A[M,K](Q4_K) @ B[K,N](half). Tuned: 4 simdgroups/tg, BM=32 x BN=8 tile,
 // sa[32x32] dequantized-once staging shared across M-rows, and the dequant computes
 // one Q4_K scale per 8-element chunk (a chunk's 8 cols share one super-block half).
-// M must be a multiple of 32, N of 8, K of 256. Bit-identical to the per-element form.
+// N must be a multiple of 8, K of 256. M may be any positive value: the grid is
+// ceil(M/32) threadgroups and rows >= M are guarded (load + store).
+// Bit-identical to the per-element form.
 kernel void gemm_q4k_f32(
     device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
     device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
@@ -2022,6 +2024,7 @@ kernel void gemm_q4k_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint tt = 0; tt < 1; tt++) {
             uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row >= M) { continue; }   // rows past M: never read A (may overrun the tensor)
             uint e_base = k + col_base;
             device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
             int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
@@ -2049,7 +2052,7 @@ kernel void gemm_q4k_f32(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
 // Q6_K MMQ (matches ggml dequant_q6_k). Q6_K block = 210 bytes: ql[128],qh[64],sc[16](int8),d(half).
@@ -2087,6 +2090,7 @@ kernel void gemm_q6k_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint tt = 0; tt < 1; tt++) {
             uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row >= M) { continue; }   // rows past M: never read A (may overrun the tensor)
             uint e_base = k + col_base;
             device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 210;
             int ew = int(e_base & 255);
@@ -2119,7 +2123,7 @@ kernel void gemm_q6k_f32(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
 // bm=64 bk=64 variants (autotune winner, gemm_harness/gemm_autotune.odin):
@@ -2465,8 +2469,12 @@ kernel void moe_softmax_topk_b(device const float *logits [[buffer(0)]],
     constant uint3 &P [[buffer(3)]], uint t [[thread_position_in_grid]]) {
     uint n = P.x, k = P.y, T = P.z;
     if (t >= T) return;
-    threadgroup float probs[256];
-    threadgroup bool picked[256];
+    // Per-THREAD (not threadgroup) scratch: all T token threads run in one
+    // threadgroup (SIMD lockstep); a threadgroup array would be shared and the
+    // lanes would stomp each other's probs/picked, giving every token one
+    // token's top-k (observed: all tokens got token 0's experts).
+    float probs[256];
+    bool picked[256];
     device const float *lg = logits + (ulong)t * n;
     float m = -1e30;
     for (uint j = 0; j < n; j++) m = max(m, lg[j]);
@@ -3511,9 +3519,11 @@ moe_ffn_gpu :: proc(enc: ^^MTL.ComputeCommandEncoder, cmd: ^^MTL.CommandBuffer, 
 	cmd^->commit()
 	cmd^->waitUntilCompleted()
 	if os.get_env("MOE_BATCH_DEBUG", context.temp_allocator) == "1" && l == 0 {
-		lout := m_b_lout->contentsAsSlice([]f32)[:8]
-		qkv2 := m_b_qkv2->contentsAsSlice([]f32)[:8]
-		fmt.eprintf("1tok lout[0..4]=%.4f %.4f %.4f %.4f qkv2[0..4]=%.4f %.4f %.4f %.4f", lout[0], lout[1], lout[2], lout[3], qkv2[0], qkv2[1], qkv2[2], qkv2[3])
+		// Tidy A/B dump vs the batch path's "bat" line (MOE_BATCH_DEBUG=1): the
+		// per-token values are the reference for the batch-compare tolerance.
+		lout := m_b_lout->contentsAsSlice([]f32)[:4]
+		qkv2 := m_b_qkv2->contentsAsSlice([]f32)[:4]
+		fmt.eprintf("1tok lout[0..4]=%.6f %.6f %.6f %.6f qkv2[0..4]=%.6f %.6f %.6f %.6f", lout[0], lout[1], lout[2], lout[3], qkv2[0], qkv2[1], qkv2[2], qkv2[3])
 		fmt.eprintln()
 	}
 	sel := m_b_moe_sel->contentsAsSlice([]i32)[:used]
@@ -3660,7 +3670,9 @@ enc_q4k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_of
 	} else {
 		enc->setComputePipelineState(m_pso_q4k)
 		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
-		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 32), 1}, MTL.Size{128, 1, 1})
+		// ceil: M < 32 (e.g. MoE in_b/in_a with n_vh=16) must still dispatch
+		// ONE threadgroup; the kernel guards rows >= M (load + store).
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
 	}
 }
 
@@ -3673,7 +3685,8 @@ enc_q6k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_of
 	enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
 	dims := GemmDims{u32(M), u32(N), u32(K)}
 	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
-	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 32), 1}, MTL.Size{128, 1, 1})
+	// ceil: same M < 32 zero-grid hazard as enc_q4k; kernel guards rows >= M.
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
 }
 
 // dispatch batched GEMM by weight quant kind (Q4_K or Q6_K).
@@ -3711,12 +3724,15 @@ enc_conv1d_batch :: proc(enc: ^MTL.ComputeCommandEncoder, x, out: ^MTL.Buffer, c
 	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
 }
 
-// Slide conv_state to the chunk's last km1 inputs.
+// Slide conv_state to the chunk's last km1 inputs. n_real < T when the caller
+// padded the tail to a multiple of 8 with repeats: the state must keep the last
+// km1 REAL inputs, not the padded filler rows (a filler row in the state would
+// poison the next chunk's / next decode token's conv history).
 @(private = "file")
-enc_conv1d_update :: proc(enc: ^MTL.ComputeCommandEncoder, x, conv_state: ^MTL.Buffer, conv_state_off: NS.UInteger, conv_dim, T, kernel: int) {
+enc_conv1d_update :: proc(enc: ^MTL.ComputeCommandEncoder, x, conv_state: ^MTL.Buffer, conv_state_off: NS.UInteger, conv_dim, n_real, kernel: int) {
 	enc->setComputePipelineState(m_pso_conv_update)
 	enc->setBuffer(x, 0, 0); enc->setBuffer(conv_state, conv_state_off, 1)
-	P := [4]u32{u32(conv_dim), u32(T), u32(kernel), u32(kernel - 1)}
+	P := [4]u32{u32(conv_dim), u32(n_real), u32(kernel), u32(kernel - 1)}
 	enc->setBytes(bytes_of(&P, size_of(P)), 2)
 	n := conv_dim * (kernel - 1); tg := min(n, 256)
 	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
@@ -4048,6 +4064,20 @@ switch lw.layer_type {
 			enc_proj_fwd(enc, fa.wq.kind, raw_data(fa.wq.data), m_b_bxb, qproj_dim, T, dim, m_b_qproj_t)
 			enc_proj_fwd(enc, fa.wk.kind, raw_data(fa.wk.data), m_b_bxb, kv_dim, T, dim, m_b_kt)
 			enc_proj_fwd(enc, fa.wv.kind, raw_data(fa.wv.data), m_b_bxb, kv_dim, T, dim, m_b_vt)
+			// Real tokens: overwrite the MMQ columns with the per-token GEMV so
+			// q/k/v are bit-identical to the per-token path (the MMQ's f16-B +
+			// different accumulation order otherwise diverges ~1e-4 and the
+			// gated-delta / MoE router amplify it beyond the 5e-3 tolerance).
+			// The MMQ result only survives in the filler columns (n_real..T-1).
+			{
+				qproj_b2 := NS.UInteger(qproj_dim * 4); kv_b2 := NS.UInteger(kv_dim * 4)
+				for t in 0 ..< n_real {
+					ox := NS.UInteger(t) * dim_bytes
+					enc_gemv(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), m_b_bxb, ox, m_b_qproj_t, NS.UInteger(t) * qproj_b2, dim, qproj_dim)
+					enc_gemv(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), m_b_bxb, ox, m_b_kt, NS.UInteger(t) * kv_b2, dim, kv_dim)
+					enc_gemv(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), m_b_bxb, ox, m_b_vt, NS.UInteger(t) * kv_b2, dim, kv_dim)
+				}
+			}
 			// per-token stateful: qnorm / rope / store_kv / attention / gate
 			slot := transformer.full_slot[l]
 			kv_loff := NS.UInteger(slot) * kv_layer_bytes
@@ -4095,6 +4125,13 @@ switch lw.layer_type {
 			} // end QPROF_NOFULL guard
 			// batched wo -> residual
 			enc_proj_fwd(enc, fa.wo.kind, raw_data(fa.wo.data), m_b_xb3t, dim, T, att_head_dim, m_b_xb2t)
+			{
+				// real tokens: GEMV-overwrite for bit-exactness with the per-token path
+				ahd_b := NS.UInteger(att_head_dim * 4)
+				for t in 0 ..< n_real {
+					enc_gemv(enc, fa.wo.kind, woff(raw_data(fa.wo.data)), m_b_xb3t, NS.UInteger(t) * ahd_b, m_b_xb2t, NS.UInteger(t) * dim_bytes, att_head_dim, dim)
+				}
+			}
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 
 		case .Linear_Attention:
@@ -4103,6 +4140,22 @@ switch lw.layer_type {
 			enc_proj_fwd(enc, la.in_z.kind, raw_data(la.in_z.data), m_b_bxb, value_dim, T, dim, m_b_zt)
 			enc_proj_fwd(enc, la.in_b.kind, raw_data(la.in_b.data), m_b_bxb, n_vh, T, dim, m_b_bt)
 			enc_proj_fwd(enc, la.in_a.kind, raw_data(la.in_a.data), m_b_bxb, n_vh, T, dim, m_b_at)
+			// Real tokens: overwrite the MMQ columns with the per-token GEMV so
+			// the conv/delta inputs (and the recurrent state they update) are
+			// bit-identical to the per-token path. The MMQ's f16-B + different
+			// accumulation order otherwise diverges ~1e-4, and the gated-delta
+			// recurrence + MoE router amplify it beyond the 5e-3 tolerance.
+			// The MMQ result only survives in the filler columns (n_real..T-1).
+			{
+				qkv_b3 := NS.UInteger(conv_dim * 4); z_b3 := NS.UInteger(value_dim * 4); ba_b3 := NS.UInteger(n_vh * 4)
+				for t in 0 ..< n_real {
+					ox := NS.UInteger(t) * dim_bytes
+					enc_gemv(enc, la.in_qkv.kind, woff(raw_data(la.in_qkv.data)), m_b_bxb, ox, m_b_qkv_t, NS.UInteger(t) * qkv_b3, dim, conv_dim)
+					enc_gemv(enc, la.in_z.kind, woff(raw_data(la.in_z.data)), m_b_bxb, ox, m_b_zt, NS.UInteger(t) * z_b3, dim, value_dim)
+					enc_gemv(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), m_b_bxb, ox, m_b_bt, NS.UInteger(t) * ba_b3, dim, n_vh)
+					enc_gemv(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), m_b_bxb, ox, m_b_at, NS.UInteger(t) * ba_b3, dim, n_vh)
+				}
+			}
 			// batched conv1d (Stage 2): all T tokens at once, causal left-pad from conv_state
 			slot := transformer.lin_slot[l]
 			conv_off := NS.UInteger(slot * conv_state_stride * 4)
@@ -4147,6 +4200,12 @@ switch lw.layer_type {
 			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
+			{
+				// real tokens: GEMV-overwrite for bit-exactness with the per-token path
+				for t in 0 ..< n_real {
+					enc_gemv(enc, la.out.kind, woff(raw_data(la.out.data)), m_b_loutt, NS.UInteger(t) * lout_b, m_b_xb2t, NS.UInteger(t) * dim_bytes, value_dim, dim)
+				}
+			}
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 		}
 
@@ -4169,6 +4228,24 @@ switch lw.layer_type {
 		enc->endEncoding()
 		cmd->commit()
 		cmd->waitUntilCompleted()
+		if os.get_env("MOE_BATCH_DEBUG", context.temp_allocator) == "1" && l == 0 {
+			// Tidy A/B dump vs the per-token path's "1tok" line (MOE_BATCH_DEBUG=1):
+			// post-attn x / zt/bt/at / loutt / qkv2t must match the per-token path
+			// (bit-exact for the real tokens; MMQ noise would show up here as ~1e-4).
+			bx := m_b_bx->contentsAsSlice([]f32)[:4]
+			xb2t := m_b_xb2t->contentsAsSlice([]f32)[:4]
+			zt := m_b_zt->contentsAsSlice([]f32)[:4]
+			bt := m_b_bt->contentsAsSlice([]f32)[:4]
+			at := m_b_at->contentsAsSlice([]f32)[:4]
+			loutt := m_b_loutt->contentsAsSlice([]f32)[:4]
+			qkv2t := m_b_qkv2_t->contentsAsSlice([]f32)[:4]
+			fmt.eprintf("bat  x[0..4]=%.6f %.6f %.6f %.6f xb2t[0..4]=%.6f %.6f %.6f %.6f", bx[0], bx[1], bx[2], bx[3], xb2t[0], xb2t[1], xb2t[2], xb2t[3])
+			fmt.eprintln()
+			fmt.eprintf("bat  zt[0..4]=%.6f %.6f %.6f %.6f bt[0..4]=%.6f %.6f %.6f %.6f at[0..4]=%.6f %.6f %.6f %.6f", zt[0], zt[1], zt[2], zt[3], bt[0], bt[1], bt[2], bt[3], at[0], at[1], at[2], at[3])
+			fmt.eprintln()
+			fmt.eprintf("bat  loutt[0..4]=%.6f %.6f %.6f %.6f qkv2t[0..4]=%.6f %.6f %.6f %.6f", loutt[0], loutt[1], loutt[2], loutt[3], qkv2t[0], qkv2t[1], qkv2t[2], qkv2t[3])
+			fmt.eprintln()
+		}
 		sel := m_b_moe_sel_b->contentsAsSlice([]i32)[:T * used]
 		cmd2 := m_queue->commandBuffer()
 		enc2 := cmd2->computeCommandEncoder()
