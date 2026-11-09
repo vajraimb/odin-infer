@@ -1,13 +1,18 @@
 /* Acceptance test for the IQ/K quant dequant port: loads the 27B dynamic
-   mixed-quant Qwen3.5 GGUF (CPU only), prints its quant histogram, then runs
-   ONE forward on token 1 and reports logits finiteness + argmax + wall time.
+   mixed-quant Qwen3.5 GGUF, prints its quant histogram, then runs ONE forward
+   on token 1 and reports logits finiteness + argmax + wall time.
+
+   --compare mode: load the model TWICE (CPU engine + Metal engine), run
+   engine_forward for 2 tokens on each (same tokens, pos 0 and 1), compare the
+   logits elementwise (max_abs diff + count of |diff| > 1e-2) and report the
+   per-token GPU wall time.
 
    Run:
      odin run tools/q38_load_test.odin -file \
        -collection:ggml=packages -collection:infer=packages \
        -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
        -collection:sampler=packages -collection:tokenizer=packages \
-       -- /Users/vajra/Downloads/Qwen3.8-27B-UD-IQ2_XXS.gguf [max_ctx]
+       -- /Users/vajra/Downloads/Qwen3.8-27B-UD-IQ2_XXS.gguf [max_ctx] [--compare]
 */
 
 package main
@@ -49,22 +54,43 @@ kind_name :: proc(k: ggml.GGML_Type) -> string {
 	return "?"
 }
 
-main :: proc() {
-	if len(os.args) < 2 {
-		fmt.eprintln("usage: q38_load_test <model.gguf> [max_ctx]")
-		os.exit(2)
-	}
-	path := os.args[1]
-	max_ctx := 256
-	if len(os.args) > 2 {
-		if v, ok := strconv.parse_int(os.args[2]); ok {
-			max_ctx = v
+compare_logits :: proc(cpu, gpu: []f32, label: string) {
+	max_abs := f32(0)
+	over_count := 0
+	n := min(len(cpu), len(gpu))
+	for i in 0 ..< n {
+		d := math.abs(cpu[i] - gpu[i])
+		if d > max_abs {
+			max_abs = d
+		}
+		if d > 1e-2 {
+			over_count += 1
 		}
 	}
+	fmt.printf(
+		"%s: n=%d max_abs_diff=%.6e count(|diff|>1e-2)=%d (cpu_argmax=%d gpu_argmax=%d)\n",
+		label,
+		n,
+		max_abs,
+		over_count,
+		argmax_of(cpu),
+		argmax_of(gpu),
+	)
+}
 
-	t_start := time.now()
+argmax_of :: proc(v: []f32) -> int {
+	best := f32(-3.4028235e38)
+	idx := -1
+	for i in 0 ..< len(v) {
+		if v[i] > best {
+			best = v[i]
+			idx = i
+		}
+	}
+	return idx
+}
 
-	// ---- pass 1: quant histogram straight from the GGUF file ----
+print_histogram :: proc(path: string) {
 	g: ggml.GGUF_File
 	ggml.parse_gguf(path, &g)
 	hist := make(map[ggml.GGML_Type]int)
@@ -82,9 +108,85 @@ main :: proc() {
 	}
 	fmt.eprintfln("  total tensors: %d", total)
 	ggml.free_gguf(&g)
+}
 
-	// ---- engine load, CPU only ----
-	engine, ok := q35.engine_load(
+main :: proc() {
+	if len(os.args) < 2 {
+		fmt.eprintln("usage: q38_load_test <model.gguf> [max_ctx] [--compare]")
+		os.exit(2)
+	}
+	path := os.args[1]
+	max_ctx := 256
+	compare := false
+	for a in os.args[2:] {
+		if a == "--compare" {
+			compare = true
+		} else if v, ok := strconv.parse_int(a); ok {
+			max_ctx = v
+		}
+	}
+
+	t_start := time.now()
+
+	// ---- pass 1: quant histogram straight from the GGUF file ----
+	print_histogram(path)
+
+	if !compare {
+		// ---- engine load, CPU only ----
+		engine, ok := q35.engine_load(
+			path,
+			q35.Engine_Opts {
+				max_ctx = max_ctx,
+				num_threads = os.get_processor_core_count(),
+				use_metal = false,
+			},
+		)
+		if !ok {
+			fmt.eprintln("engine_load failed")
+			os.exit(1)
+		}
+		fmt.eprintfln("model loaded (cpu, max_ctx=%d) in %v", max_ctx, time.since(t_start))
+
+		// ---- ONE forward on token 1 at position 0 ----
+		t_fwd := time.now()
+		logits := q35.engine_forward(&engine, 1, 0)
+		wall := time.since(t_fwd)
+
+		finite := true
+		argmax := -1
+		best := f32(-3.4028235e38)
+		nonfinite_count := 0
+		for i in 0 ..< len(logits) {
+			v := logits[i]
+			if math.is_nan(v) || math.is_inf(v) {
+				finite = false
+				nonfinite_count += 1
+				continue
+			}
+			if v > best {
+				best = v
+				argmax = i
+			}
+		}
+		fmt.printf(
+			"n_logits=%d finite=%v nonfinite_count=%d argmax_token=%d logits[argmax]=%v\n",
+			len(logits),
+			finite,
+			nonfinite_count,
+			argmax,
+			best,
+		)
+		fmt.printf("forward_wall_time=%v\n", wall)
+
+		q35.engine_destroy(&engine)
+		return
+	}
+
+	// ---- compare mode: CPU engine vs Metal engine, 2 tokens each ----
+	tokens := []int{1, 2}
+
+	// CPU engine
+	cpu_engine, cpu_ok := q35.engine_load(
 		path,
 		q35.Engine_Opts {
 			max_ctx = max_ctx,
@@ -92,42 +194,62 @@ main :: proc() {
 			use_metal = false,
 		},
 	)
-	if !ok {
-		fmt.eprintln("engine_load failed")
+	if !cpu_ok {
+		fmt.eprintln("CPU engine_load failed")
 		os.exit(1)
 	}
 	fmt.eprintfln("model loaded (cpu, max_ctx=%d) in %v", max_ctx, time.since(t_start))
 
-	// ---- ONE forward on token 1 at position 0 ----
-	t_fwd := time.now()
-	logits := q35.engine_forward(&engine, 1, 0)
-	wall := time.since(t_fwd)
-
-	finite := true
-	argmax := -1
-	best := f32(-3.4028235e38)
-	nonfinite_count := 0
-	for i in 0 ..< len(logits) {
-		v := logits[i]
-		if math.is_nan(v) || math.is_inf(v) {
-			finite = false
-			nonfinite_count += 1
-			continue
-		}
-		if v > best {
-			best = v
-			argmax = i
-		}
-	}
-	fmt.printf(
-		"n_logits=%d finite=%v nonfinite_count=%d argmax_token=%d logits[argmax]=%v\n",
-		len(logits),
-		finite,
-		nonfinite_count,
-		argmax,
-		best,
+	// Metal engine (skip the first-run autotune so the compare run is
+	// deterministic and fast; the 27B tune table would not be reused anyway).
+	os.set_env("ODIN_TUNE", "0")
+	gpu_engine, gpu_ok := q35.engine_load(
+		path,
+		q35.Engine_Opts {
+			max_ctx = max_ctx,
+			num_threads = 1,
+			use_metal = true,
+		},
 	)
-	fmt.printf("forward_wall_time=%v\n", wall)
+	if !gpu_ok {
+		fmt.eprintln("Metal engine_load failed")
+		os.exit(1)
+	}
+	if !gpu_engine.metal_ready {
+		fmt.eprintln("Metal engine did not come up (metal_ready=false) — cannot compare")
+		os.exit(1)
+	}
+	fmt.eprintfln("model loaded (metal, max_ctx=%d) in %v", max_ctx, time.since(t_start))
 
-	q35.engine_destroy(&engine)
+	// CPU forwards (slow on a loaded machine: ~15-50s/token on 27B)
+	cpu_logits: [2][]f32
+	cpu_wall: [2]time.Duration
+	for i in 0 ..< 2 {
+		t_fwd := time.now()
+		logits := q35.engine_forward(&cpu_engine, tokens[i], i)
+		cpu_wall[i] = time.since(t_fwd)
+		cpu_logits[i] = make([]f32, len(logits))
+		copy(cpu_logits[i], logits)
+		fmt.eprintfln("cpu forward token %d (pos %d) done in %v", tokens[i], i, cpu_wall[i])
+	}
+	q35.engine_destroy(&cpu_engine)
+
+	// GPU forwards
+	gpu_logits: [2][]f32
+	gpu_wall: [2]time.Duration
+	for i in 0 ..< 2 {
+		t_fwd := time.now()
+		logits := q35.engine_forward(&gpu_engine, tokens[i], i)
+		gpu_wall[i] = time.since(t_fwd)
+		gpu_logits[i] = make([]f32, len(logits))
+		copy(gpu_logits[i], logits)
+		fmt.eprintfln("gpu forward token %d (pos %d) done in %v", tokens[i], i, gpu_wall[i])
+	}
+
+	compare_logits(cpu_logits[0], gpu_logits[0], "compare token 1 (pos 0)")
+	compare_logits(cpu_logits[1], gpu_logits[1], "compare token 2 (pos 1)")
+	fmt.printf("gpu_wall_token1=%v\n", gpu_wall[0])
+	fmt.printf("gpu_wall_token2=%v\n", gpu_wall[1])
+
+	q35.engine_destroy(&gpu_engine)
 }
