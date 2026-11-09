@@ -7,12 +7,20 @@
    logits elementwise (max_abs diff + count of |diff| > 1e-2) and report the
    per-token GPU wall time.
 
+   --batch-compare mode: load the model TWICE (two Metal engines). Engine A
+   prefills a prompt via engine_forward_batch (batched MMQ), engine B prefills
+   the same prompt per-token (engine_forward loop). Compares the prefill logits
+   (last token) and then ONE decode step on both engines (same next token) —
+   the decode step uses the SAME per-token kernels in both engines, so its
+   tightness shows whether the KV/conv/recurrent states after the two prefill
+   paths agree. Times both prefill paths (3 runs each, state reset between).
+
    Run:
      odin run tools/q38_load_test.odin -file \
        -collection:ggml=packages -collection:infer=packages \
        -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
        -collection:sampler=packages -collection:tokenizer=packages \
-       -- /Users/vajra/Downloads/Qwen3.8-27B-UD-IQ2_XXS.gguf [max_ctx] [--compare]
+       -- /Users/vajra/Downloads/Qwen3.8-27B-UD-IQ2_XXS.gguf [max_ctx] [--compare | --batch-compare]
 */
 
 package main
@@ -118,9 +126,12 @@ main :: proc() {
 	path := os.args[1]
 	max_ctx := 256
 	compare := false
+	batch_compare := false
 	for a in os.args[2:] {
 		if a == "--compare" {
 			compare = true
+		} else if a == "--batch-compare" {
+			batch_compare = true
 		} else if v, ok := strconv.parse_int(a); ok {
 			max_ctx = v
 		}
@@ -131,7 +142,7 @@ main :: proc() {
 	// ---- pass 1: quant histogram straight from the GGUF file ----
 	print_histogram(path)
 
-	if !compare {
+	if !compare && !batch_compare {
 		// ---- engine load, CPU only ----
 		engine, ok := q35.engine_load(
 			path,
@@ -179,6 +190,11 @@ main :: proc() {
 		fmt.printf("forward_wall_time=%v\n", wall)
 
 		q35.engine_destroy(&engine)
+		return
+	}
+
+	if batch_compare {
+		batch_compare_run(path, max_ctx)
 		return
 	}
 
@@ -252,4 +268,98 @@ main :: proc() {
 	fmt.printf("gpu_wall_token2=%v\n", gpu_wall[1])
 
 	q35.engine_destroy(&gpu_engine)
+}
+
+// ---- batch-compare mode: batched MMQ prefill vs per-token prefill ----
+// NOTE: the Metal state in qwen3_5 is a global singleton (metal_init sets
+// module-level buffers/mmap), so two engines would share it. Use ONE engine:
+// leg A = engine_forward_batch, leg B = engine_forward loop, with
+// engine_reset_state between legs and logits COPIED out immediately (forward
+// returns a slice into the shared logits buffer that the next forward
+// overwrites). Compare prefill logits + one decode step (same per-token
+// kernels in both legs after prefill -> isolates KV/conv/recurrent state
+// agreement).
+batch_compare_run :: proc(path: string, max_ctx: int) {
+	os.set_env("ODIN_TUNE", "0")
+	os.set_env("QTIMING", "1")
+
+	// fixed deterministic prompt of N tokens (ids need no tokenizer; both
+	// legs see identical inputs)
+	n_tok := 30
+	tokens := make([]int, n_tok)
+	for i in 0 ..< n_tok {
+		tokens[i] = 100 + i
+	}
+	next_tok := 200
+
+	fmt.eprintfln("batch-compare: prompt_len=%d max_ctx=%d", n_tok, max_ctx)
+
+	engine, ok := q35.engine_load(path, q35.Engine_Opts{max_ctx = max_ctx, num_threads = 1, use_metal = true})
+	if !ok || !engine.metal_ready {
+		fmt.eprintln("batch-compare: engine failed to load Metal")
+		os.exit(1)
+	}
+	fmt.eprintfln("engine loaded (batch path enabled: %v)", engine.batch_mm_ok)
+	if !engine.batch_mm_ok {
+		fmt.eprintln("batch-compare: batch_mm_ok=false — the model will NOT use the batched path; aborting (kernel coverage incomplete)")
+		os.exit(1)
+	}
+
+	copy_logits :: proc(src: []f32) -> []f32 {
+		dst := make([]f32, len(src))
+		copy(dst, src)
+		return dst
+	}
+	prefill_batch :: proc(e: ^q35.Engine, tokens: []int) -> []f32 {
+		return q35.engine_forward_batch(e, tokens, 0)
+	}
+	prefill_tok :: proc(e: ^q35.Engine, tokens: []int) -> []f32 {
+		logits: []f32 = nil
+		for i in 0 ..< len(tokens) {
+			logits = q35.engine_forward(e, tokens[i], i)
+		}
+		return logits
+	}
+
+	// leg A: batch prefill (timed x3, keep run 1's logits + decode step)
+	batch_wall: [3]time.Duration
+	logits_a: []f32
+	d_a: []f32
+	for r in 0 ..< 3 {
+		q35.engine_reset_state(&engine)
+		t0 := time.now()
+		logits := prefill_batch(&engine, tokens)
+		batch_wall[r] = time.since(t0)
+		if r == 0 {
+			logits_a = copy_logits(logits)
+			d_a = copy_logits(q35.engine_forward(&engine, next_tok, n_tok))
+		}
+		fmt.eprintfln("batch run %d: wall=%v", r + 1, batch_wall[r])
+	}
+
+	// leg B: per-token prefill (timed x3, keep run 1's logits + decode step)
+	tok_wall: [3]time.Duration
+	logits_b: []f32
+	d_b: []f32
+	for r in 0 ..< 3 {
+		q35.engine_reset_state(&engine)
+		t1 := time.now()
+		logits := prefill_tok(&engine, tokens)
+		tok_wall[r] = time.since(t1)
+		if r == 0 {
+			logits_b = copy_logits(logits)
+			d_b = copy_logits(q35.engine_forward(&engine, next_tok, n_tok))
+		}
+		fmt.eprintfln("per-token run %d: wall=%v", r + 1, tok_wall[r])
+	}
+
+	// prefill logits compare
+	compare_logits(logits_b, logits_a, "batch-compare: prefill logits (batch vs per-token)")
+	// decode-step compare (same per-token kernels both legs; diff = state drift)
+	compare_logits(d_b, d_a, "batch-compare: decode step logits (batch vs per-token)")
+
+	fmt.printf("batch_wall_runs=%v %v %v\n", batch_wall[0], batch_wall[1], batch_wall[2])
+	fmt.printf("per_token_wall_runs=%v %v %v\n", tok_wall[0], tok_wall[1], tok_wall[2])
+
+	q35.engine_destroy(&engine)
 }

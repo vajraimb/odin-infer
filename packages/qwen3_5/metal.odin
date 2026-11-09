@@ -2126,6 +2126,632 @@ kernel void gemm_q6k_f32(
     if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
+// ============ IQ MMQ family (v3 shape: 4 simdgroups/tg, BM=32 x BN=8, BK=32) ============
+// Each kernel dequants one 8-element chunk per thread into sa, sharing the
+// per-32-element sub-block scale across the chunk's 8 columns (the chunks are
+// aligned to sub-block boundaries because BK=32 and col_base%8==0). The
+// per-block math is copied from the matching gemv_* kernel so the values are
+// bit-identical to the per-token path (only the accumulation order differs).
+
+// IQ1_S: block = 50 bytes: d(2), qs[32], qh[16]. 8 sub-blocks of 32.
+kernel void gemm_iq1s_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 50;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 50;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * qh = blk + 34;
+                uint ib = (uint)ew >> 5;
+                uint qhv = (uint)qh[2 * ib] | ((uint)qh[2 * ib + 1] << 8);
+                float dl = d * (float)(2 * (int)((qhv >> 12) & 7) + 1);
+                float delta = (qhv & 0x8000) == 0 ? 0.125f : -0.125f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint idx = (uint)qs[4 * ib + l] | (((qhv >> (3 * l)) & 7) << 8);
+                ulong grid = iq1s_grid[idx];
+                for (uint j = 0; j < 8; j++) {
+                    float gv = (float)((char)((grid >> (8 * j)) & 0xff));
+                    sa[row * 32 + col_base + j] = (half)(dl * (gv + delta));
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ1_M: block = 56 bytes: qs[32], qh[16], scales[8].
+kernel void gemm_iq1m_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 56;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 56;
+                int ew = int(e_base & 255);
+                device const uchar * qs = blk; device const uchar * qh = blk + 32;
+                device const uchar * scales = blk + 48;
+                uint sc0 = (uint)scales[0] | ((uint)scales[1] << 8);
+                uint sc1 = (uint)scales[2] | ((uint)scales[3] << 8);
+                uint sc2 = (uint)scales[4] | ((uint)scales[5] << 8);
+                uint sc3 = (uint)scales[6] | ((uint)scales[7] << 8);
+                uint scale = (sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000);
+                float d = half_to_float((ushort)scale);
+                uint ib = (uint)ew >> 5;
+                uint sc[4] = {sc0, sc1, sc2, sc3};
+                uint scv = (ib & 1) == 0 ? sc[ib / 2] : (sc[ib / 2] >> 6);
+                float dl1 = d * (float)(2 * (int)((scv >> 0) & 0x7) + 1);
+                float dl2 = d * (float)(2 * (int)((scv >> 3) & 0x7) + 1);
+                uint l = ((uint)ew >> 3) & 3;
+                uint qoff = 4 * ib; uint qhoff = 2 * ib;
+                uint idx; float delta;
+                if (l == 0)      { idx = (uint)qs[qoff + 0] | (((uint)qh[qhoff + 0] << 8) & 0x700); delta = (qh[qhoff + 0] & 0x08) == 0 ? 0.125f : -0.125f; }
+                else if (l == 1) { idx = (uint)qs[qoff + 1] | (((uint)qh[qhoff + 0] << 4) & 0x700); delta = (qh[qhoff + 0] & 0x80) == 0 ? 0.125f : -0.125f; }
+                else if (l == 2) { idx = (uint)qs[qoff + 2] | (((uint)qh[qhoff + 1] << 8) & 0x700); delta = (qh[qhoff + 1] & 0x08) == 0 ? 0.125f : -0.125f; }
+                else             { idx = (uint)qs[qoff + 3] | (((uint)qh[qhoff + 1] << 4) & 0x700); delta = (qh[qhoff + 1] & 0x80) == 0 ? 0.125f : -0.125f; }
+                float dl = (l < 2) ? dl1 : dl2;
+                ulong grid = iq1s_grid[idx];
+                for (uint j = 0; j < 8; j++) {
+                    float gv = (float)((char)((grid >> (8 * j)) & 0xff));
+                    sa[row * 32 + col_base + j] = (half)(dl * (gv + delta));
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ2_XXS: block = 66 bytes: d(2), 8 x (qs[4] + aux32[4]).
+kernel void gemm_iq2xxs_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 66;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 66;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                uint ib32 = (uint)ew >> 5;
+                uint qb = 2 + 8 * ib32;
+                uint aux1 = (uint)blk[qb + 4] | ((uint)blk[qb + 5] << 8) | ((uint)blk[qb + 6] << 16) | ((uint)blk[qb + 7] << 24);
+                float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                ulong grid = iq2xxs_grid[blk[qb + l]];
+                uchar signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float s = (signs & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j] = (half)(db * v * s);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ2_XS: block = 74 bytes: d(2), qs[64] (16-bit codes), sc[8].
+kernel void gemm_iq2xs_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 74;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 74;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                uint ib32 = (uint)ew >> 5;
+                uchar sc = blk[66 + ib32];
+                float db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+                float db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint qoff = 2 + 2 * (4 * ib32 + l);
+                uint q = (uint)blk[qoff] | ((uint)blk[qoff + 1] << 8);
+                ulong grid = iq2xs_grid[q & 511];
+                uchar signs = ksigns_iq2xs[q >> 9];
+                float dl = (l < 2) ? db0 : db1;
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float s = (signs & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j] = (half)(dl * v * s);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ2_S: block = 82 bytes: d(2), qs[32], signs[32], qh[8], scales[8].
+kernel void gemm_iq2s_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 82;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 82;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * signs = blk + 34;
+                device const uchar * qh = blk + 66; device const uchar * scales = blk + 74;
+                uint ib32 = (uint)ew >> 5;
+                uchar sc = scales[ib32];
+                float db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+                float db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint idx = (uint)qs[4 * ib32 + l] | (((uint)qh[ib32] << (8 - 2 * l)) & 0x300);
+                ulong grid = iq2s_grid[idx];
+                uchar sn = signs[4 * ib32 + l];
+                float dl = (l < 2) ? db0 : db1;
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float s = (sn & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j] = (half)(dl * v * s);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ3_XXS: block = 98 bytes: d(2), qs[64] (2 bytes per 8 elems), sas[32] (signs+scale).
+kernel void gemm_iq3xxs_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 98;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 98;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * sas = blk + 66;
+                uint ib32 = (uint)ew >> 5;
+                uint sb_ = 4 * ib32;
+                uint aux = (uint)sas[sb_] | ((uint)sas[sb_ + 1] << 8) | ((uint)sas[sb_ + 2] << 16) | ((uint)sas[sb_ + 3] << 24);
+                float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                uint l = ((uint)ew >> 3) & 3;
+                uchar signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+                uint g1 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 0]];
+                uint g2 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 1]];
+                for (uint j = 0; j < 4; j++) {
+                    float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                    float v2 = (float)((g2 >> (8 * j)) & 0xff);
+                    float s1 = (signs & kmask_iq2xs[j + 0]) == 0 ? 1.0f : -1.0f;
+                    float s2 = (signs & kmask_iq2xs[j + 4]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j + 0] = (half)(db * v1 * s1);
+                    sa[row * 32 + col_base + j + 4] = (half)(db * v2 * s2);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ3_S: block = 110 bytes: d(2), qs[64], qh[8], signs[32], scales[4].
+kernel void gemm_iq3s_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 110;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 110;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * qh = blk + 66;
+                device const uchar * signs = blk + 74; device const uchar * scales = blk + 106;
+                uint ib32 = (uint)ew >> 5;
+                uint qoff = 8 * ib32; uint signoff = 4 * ib32; uint qhoff = 2 * (ib32 >> 1);
+                float db1 = d * (float)(1 + 2 * (int)(scales[qhoff / 2] & 0xF));
+                float db2 = d * (float)(1 + 2 * (int)(scales[qhoff / 2] >> 4));
+                uint l = ((uint)ew >> 3) & 3;
+                uint qhi = qhoff + (ib32 & 1);
+                uint idx1 = (uint)qs[qoff + 2 * l + 0] | (((uint)qh[qhi] << (8 - 2 * l)) & 256);
+                uint idx2 = (uint)qs[qoff + 2 * l + 1] | (((uint)qh[qhi] << (7 - 2 * l)) & 256);
+                uint g1 = iq3s_grid[idx1]; uint g2 = iq3s_grid[idx2];
+                uchar sn = signs[signoff + l];
+                float dl = (ib32 & 1) == 0 ? db1 : db2;
+                for (uint j = 0; j < 4; j++) {
+                    float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                    float v2 = (float)((g2 >> (8 * j)) & 0xff);
+                    float s1 = (sn & kmask_iq2xs[j + 0]) == 0 ? 1.0f : -1.0f;
+                    float s2 = (sn & kmask_iq2xs[j + 4]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 32 + col_base + j + 0] = (half)(dl * v1 * s1);
+                    sa[row * 32 + col_base + j + 4] = (half)(dl * v2 * s2);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// IQ4_XS: block = 136 bytes: d(2), scales_h(2), scales_l[4], qs[128] (16 per sub-block).
+kernel void gemm_iq4xs_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 136;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 136;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                uint scales_h = (uint)blk[2] | ((uint)blk[3] << 8);
+                device const uchar * scales_l = blk + 4;
+                device const uchar * qs = blk + 8;
+                uint ib = (uint)ew >> 5;
+                int ls = (int)((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (int)(((scales_h >> (2 * ib)) & 3) << 4);
+                float dl = d * (float)(ls - 32);
+                uint e32 = (uint)ew & 31;
+                uint qoff = 16 * ib;
+                for (uint j = 0; j < 8; j++) {
+                    uchar qb = qs[qoff + (e32 & 15) + j];
+                    float v = (float)kvalues_iq4nl[(e32 < 16) ? (qb & 0xF) : (qb >> 4)];
+                    sa[row * 32 + col_base + j] = (half)(dl * v);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// Q2_K: block = 84 bytes: scales[16], qs[64], d(2) at +80, dmin(2) at +82.
+kernel void gemm_q2k_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 84;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 84;
+                int ew = int(e_base & 255);
+                device const uchar * scales = blk; device const uchar * qs = blk + 16;
+                float d = (float)(*(device const half *)(blk + 80));
+                float dmin = (float)(*(device const half *)(blk + 82));
+                uint g = (uint)ew >> 5;            // 0..7: h = g/4, s = g%4
+                uint sub = ((uint)ew >> 4) & 1;    // first/second 16 elems of the 32-group
+                uint l = (uint)ew & 15;            // 0 or 8 (col_base is 0/8/16/24)
+                uchar sc = scales[2 * g + sub];
+                float dl = d * (float)(sc & 0xF); float ml = dmin * (float)(sc >> 4);
+                uint qoff = 32 * (g >> 2); uint shift = 2 * (g & 3);
+                for (uint j = 0; j < 8; j++) {
+                    float v = dl * (float)((qs[qoff + 16 * sub + l + j] >> shift) & 3) - ml;
+                    sa[row * 32 + col_base + j] = (half)v;
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// Q3_K: block = 110 bytes: hmask[32], qs[64], scales[12], d(2) at +108.
+kernel void gemm_q3k_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 256) * 110;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 110;
+                int ew = int(e_base & 255);
+                device const uchar * hm = blk; device const uchar * qs = blk + 32;
+                device const uchar * scales = blk + 96;
+                float d = (float)(*(device const half *)(blk + 108));
+                uint aux0 = (uint)scales[0] | ((uint)scales[1] << 8) | ((uint)scales[2] << 16) | ((uint)scales[3] << 24);
+                uint aux1 = (uint)scales[4] | ((uint)scales[5] << 8) | ((uint)scales[6] << 16) | ((uint)scales[7] << 24);
+                uint tmp  = (uint)scales[8] | ((uint)scales[9] << 8) | ((uint)scales[10] << 16) | ((uint)scales[11] << 24);
+                const uint KMASK1 = 0x03030303u; const uint KMASK2 = 0x0f0f0f0fu;
+                uint aux2 = ((aux0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+                uint aux3 = ((aux1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+                aux0 = (aux0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+                aux1 = (aux1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+                uint g = (uint)ew >> 5;
+                uint sub = ((uint)ew >> 4) & 1;
+                uint l = (uint)ew & 15;
+                uint is = 2 * g + sub;
+                float dl = d * (float)((int)(char)q3k_scale_byte(is, aux0, aux1, aux2, aux3) - 32);
+                uchar m = (uchar)(1 << g);   // m = 1<<s but s counts across BOTH halves (m not reset in the GEMV/CPU loops)
+                uint shift = 2 * (g & 3); uint qoff = 32 * (g >> 2);
+                for (uint j = 0; j < 8; j++) {
+                    int q = (int)((qs[qoff + 16 * sub + l + j] >> shift) & 3) - (int)((hm[16 * sub + l + j] & m) == 0 ? 4 : 0);
+                    sa[row * 32 + col_base + j] = (half)(dl * (float)q);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
+// Q8_0: block = 34 bytes (f16 d + 32 int8), 32 elems/block -> K % 32, not K % 256.
+kernel void gemm_q8_0_f32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 8;
+    const ulong row_bytes = (ulong)(K / 32) * 34;
+    threadgroup half sa[32 * 32];
+    threadgroup half sb[32 * 8];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = sgitg * 8;
+    for (uint k = 0; k < K; k += 32) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint row = tiitg >> 2, col_base = (tiitg & 3) * 8;
+            if (r0 + row < M) {
+                uint e_base = k + col_base;
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 32) * 34;
+                uint ew = e_base & 31;
+                float d = (float)(*(device const half *)blk);
+                device const char * qs = (device const char *)(blk + 2);
+                for (uint j = 0; j < 8; j++) {
+                    sa[row * 32 + col_base + j] = (half)(d * (float)qs[ew + j]);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 32 * 8; t += 128) {
+            uint kr = t >> 3, nc = t & 7;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 4; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 32 + ik * 8, 32);
+            simdgroup_load(b_tile, sb + ik * 64, 8);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
+}
+
 // bm=64 bk=64 variants (autotune winner, gemm_harness/gemm_autotune.odin):
 // 8 simdgroups (256 threads), sa[64x64], sb[64x8], k-step 64. Requires M%64==0.
 // NB: qs index uses the within-32-group column l32 = e_base&31 (== col_base only
@@ -2545,6 +3171,10 @@ m_pso_q4k_b64: ^MTL.ComputePipelineState // Stage 1a autotuned bm=64 bk=64 (M%64
 @(private = "file")
 g_b64_seen: bool // one-shot dispatch confirmation (debug)
 @(private = "file")
+// Stage 1a IQ/K/Q8 MMQ kernels (v3 shape: BM=32 x BN=8, BK=32)
+m_pso_iq1s_mm, m_pso_iq1m_mm, m_pso_iq2xxs_mm, m_pso_iq2xs_mm, m_pso_iq2s_mm,
+m_pso_iq3xxs_mm, m_pso_iq3s_mm, m_pso_iq4xs_mm, m_pso_q2k_mm, m_pso_q3k_mm, m_pso_q80_mm: ^MTL.ComputePipelineState
+@(private = "file")
 m_pso_conv_batch, m_pso_conv_update: ^MTL.ComputePipelineState // Stage 2 batched conv1d
 @(private = "file")
 m_pso_l2norm_batch, m_pso_rmsgated_batch, m_pso_chunked_delta: ^MTL.ComputePipelineState // Stage 2 chunked delta
@@ -2960,6 +3590,12 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_delta = make_pso(lib, "delta_recurrent"); m_pso_rmsgated = make_pso(lib, "rmsnorm_gated")
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
 	m_pso_q4k_b64 = make_pso(lib, "gemm_q4k_f32_b64")
+	m_pso_iq1s_mm = make_pso(lib, "gemm_iq1s_f32"); m_pso_iq1m_mm = make_pso(lib, "gemm_iq1m_f32")
+	m_pso_iq2xxs_mm = make_pso(lib, "gemm_iq2xxs_f32"); m_pso_iq2xs_mm = make_pso(lib, "gemm_iq2xs_f32")
+	m_pso_iq2s_mm = make_pso(lib, "gemm_iq2s_f32"); m_pso_iq3xxs_mm = make_pso(lib, "gemm_iq3xxs_f32")
+	m_pso_iq3s_mm = make_pso(lib, "gemm_iq3s_f32"); m_pso_iq4xs_mm = make_pso(lib, "gemm_iq4xs_f32")
+	m_pso_q2k_mm = make_pso(lib, "gemm_q2k_f32"); m_pso_q3k_mm = make_pso(lib, "gemm_q3k_f32")
+	m_pso_q80_mm = make_pso(lib, "gemm_q8_0_f32")
 	m_pso_cast = make_pso(lib, "cast_f32_f16"); m_pso_copy = make_pso(lib, "copy_f32")
 	m_pso_tr_h16 = make_pso(lib, "transpose_to_f16"); m_pso_tr_f32 = make_pso(lib, "transpose_f32")
 	m_pso_conv_batch = make_pso(lib, "conv1d_batch_silu"); m_pso_conv_update = make_pso(lib, "conv1d_update_state")
@@ -3015,7 +3651,10 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// Stage 1b batched attention-projection buffers
 	qproj_dim := c.n_heads * c.head_dim * 2 // wq output (q+gate interleaved)
 	proj_max_out := max(max(qproj_dim, conv_dim), max(c.dim, value_dim))
-	m_b_proj_half = new_shared_bytes(c.dim * mt * 2)              // half [dim x T]
+	// The transposed-half B scratch is fed by enc_proj_fwd with K_in = dim
+	// (q/k/v/z/b/a), att_head_dim (wo) or value_dim (ssm out) — size for the max.
+	proj_max_k := max(max(c.dim, att_head_dim), value_dim)
+	m_b_proj_half = new_shared_bytes(proj_max_k * mt * 2)          // half [max_k x T]
 	m_b_proj_outf = new_shared_bytes(proj_max_out * mt * 4)       // f32 [max_out x T]
 	m_b_qproj_t = new_shared_bytes(qproj_dim * mt * 4)
 	m_b_qkv_t = new_shared_bytes(conv_dim * mt * 4)
@@ -3689,14 +4328,37 @@ enc_q6k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_of
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
 }
 
-// dispatch batched GEMM by weight quant kind (Q4_K or Q6_K).
+// Generic v3 MMQ dispatcher (BM=32 x BN=8, BK=32, 128 threads, 4 simdgroups) for
+// the IQ/K/Q8 kinds. Same shape as gemm_q6k_f32; every new MMQ kernel guards rows
+// >= M so M may be any positive value and N % 8 must hold (batch chunks are).
+@(private = "file")
+enc_mm_v3 :: proc(enc: ^MTL.ComputeCommandEncoder, pso: ^MTL.ComputePipelineState, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
+	enc->setComputePipelineState(pso)
+	enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+	dims := GemmDims{u32(M), u32(N), u32(K)}
+	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
+}
+
+// dispatch batched GEMM by weight quant kind (Q4_K/Q6_K + IQ/K/Q8_0 MMQ).
 @(private = "file")
 enc_mm :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
 	#partial switch kind {
 	case .Q4_K: enc_q4k(enc, w, B, B_off, C, C_off, M, N, K)
 	case .Q6_K: enc_q6k(enc, w, B, B_off, C, C_off, M, N, K)
+	case .IQ1_S:   enc_mm_v3(enc, m_pso_iq1s_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ1_M:   enc_mm_v3(enc, m_pso_iq1m_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_XXS: enc_mm_v3(enc, m_pso_iq2xxs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_XS:  enc_mm_v3(enc, m_pso_iq2xs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_S:   enc_mm_v3(enc, m_pso_iq2s_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ3_XXS: enc_mm_v3(enc, m_pso_iq3xxs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ3_S:   enc_mm_v3(enc, m_pso_iq3s_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ4_XS:  enc_mm_v3(enc, m_pso_iq4xs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .Q2_K:    enc_mm_v3(enc, m_pso_q2k_mm, w, B, B_off, C, C_off, M, N, K)
+	case .Q3_K:    enc_mm_v3(enc, m_pso_q3k_mm, w, B, B_off, C, C_off, M, N, K)
+	case .Q8_0:    enc_mm_v3(enc, m_pso_q80_mm, w, B, B_off, C, C_off, M, N, K)
 	case:
-		fmt.eprintf("enc_mm: unsupported batched quant type %v (need Q4_K/Q6_K)\n", kind)
+		fmt.eprintf("enc_mm: unsupported batched quant type %v (no MMQ kernel)\n", kind)
 		os.exit(1)
 	}
 }
@@ -4380,6 +5042,20 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			enc_proj_fwd(enc, fa.wq.kind, raw_data(fa.wq.data), m_b_bxb, qproj_dim, T, dim, m_b_qproj_t)
 			enc_proj_fwd(enc, fa.wk.kind, raw_data(fa.wk.data), m_b_bxb, kv_dim, T, dim, m_b_kt)
 			enc_proj_fwd(enc, fa.wv.kind, raw_data(fa.wv.data), m_b_bxb, kv_dim, T, dim, m_b_vt)
+			// Real tokens: overwrite the MMQ columns with the per-token GEMV so
+			// q/k/v are bit-identical to the per-token path (the MMQ's f16-B +
+			// different accumulation order otherwise diverges ~1e-4 and the
+			// KV cache + recurrent state amplify it across the prefill).
+			// The MMQ result only survives in the filler columns (n_real..T-1).
+			{
+				qproj_b2 := NS.UInteger(qproj_dim * 4); kv_b2 := NS.UInteger(kv_dim * 4)
+				for t in 0 ..< n_real {
+					ox := NS.UInteger(t) * dim_bytes
+					enc_gemv(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), m_b_bxb, ox, m_b_qproj_t, NS.UInteger(t) * qproj_b2, dim, qproj_dim)
+					enc_gemv(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), m_b_bxb, ox, m_b_kt, NS.UInteger(t) * kv_b2, dim, kv_dim)
+					enc_gemv(enc, fa.wv.kind, woff(raw_data(fa.wv.data)), m_b_bxb, ox, m_b_vt, NS.UInteger(t) * kv_b2, dim, kv_dim)
+				}
+			}
 			// per-token stateful: qnorm / rope / store_kv / attention / gate
 			slot := transformer.full_slot[l]
 			kv_loff := NS.UInteger(slot) * kv_layer_bytes
@@ -4427,6 +5103,13 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			} // end QPROF_NOFULL guard
 			// batched wo -> residual
 			enc_proj_fwd(enc, fa.wo.kind, raw_data(fa.wo.data), m_b_xb3t, dim, T, att_head_dim, m_b_xb2t)
+			{
+				// real tokens: GEMV-overwrite for bit-exactness with the per-token path
+				ahd_b := NS.UInteger(att_head_dim * 4)
+				for t in 0 ..< n_real {
+					enc_gemv(enc, fa.wo.kind, woff(raw_data(fa.wo.data)), m_b_xb3t, NS.UInteger(t) * ahd_b, m_b_xb2t, NS.UInteger(t) * dim_bytes, att_head_dim, dim)
+				}
+			}
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 
 		case .Linear_Attention:
@@ -4435,6 +5118,20 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			enc_proj_fwd(enc, la.in_z.kind, raw_data(la.in_z.data), m_b_bxb, value_dim, T, dim, m_b_zt)
 			enc_proj_fwd(enc, la.in_b.kind, raw_data(la.in_b.data), m_b_bxb, n_vh, T, dim, m_b_bt)
 			enc_proj_fwd(enc, la.in_a.kind, raw_data(la.in_a.data), m_b_bxb, n_vh, T, dim, m_b_at)
+			// Real tokens: overwrite the MMQ columns with the per-token GEMV so
+			// the conv/delta inputs (and the recurrent state they update) are
+			// bit-identical to the per-token path. The MMQ result only survives
+			// in the filler columns (n_real..T-1).
+			{
+				qkv_b3 := NS.UInteger(conv_dim * 4); z_b3 := NS.UInteger(value_dim * 4); ba_b3 := NS.UInteger(n_vh * 4)
+				for t in 0 ..< n_real {
+					ox := NS.UInteger(t) * dim_bytes
+					enc_gemv(enc, la.in_qkv.kind, woff(raw_data(la.in_qkv.data)), m_b_bxb, ox, m_b_qkv_t, NS.UInteger(t) * qkv_b3, dim, conv_dim)
+					enc_gemv(enc, la.in_z.kind, woff(raw_data(la.in_z.data)), m_b_bxb, ox, m_b_zt, NS.UInteger(t) * z_b3, dim, value_dim)
+					enc_gemv(enc, la.in_b.kind, woff(raw_data(la.in_b.data)), m_b_bxb, ox, m_b_bt, NS.UInteger(t) * ba_b3, dim, n_vh)
+					enc_gemv(enc, la.in_a.kind, woff(raw_data(la.in_a.data)), m_b_bxb, ox, m_b_at, NS.UInteger(t) * ba_b3, dim, n_vh)
+				}
+			}
 			// batched conv1d (Stage 2): all T tokens at once, causal left-pad from conv_state
 			slot := transformer.lin_slot[l]
 			conv_off := NS.UInteger(slot * conv_state_stride * 4)
@@ -4479,6 +5176,13 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
+			{
+				// real tokens: GEMV-overwrite for bit-exactness with the per-token path
+				lout_b2 := NS.UInteger(value_dim * 4)
+				for t in 0 ..< n_real {
+					enc_gemv(enc, la.out.kind, woff(raw_data(la.out.data)), m_b_loutt, NS.UInteger(t) * lout_b2, m_b_xb2t, NS.UInteger(t) * dim_bytes, value_dim, dim)
+				}
+			}
 			enc_elementwise(enc, m_pso_residual, m_b_bx, m_b_xb2t, T * dim)
 		}
 

@@ -15,7 +15,7 @@ Engine_Opts :: struct {
 Engine :: struct {
 	transformer: Transformer,
 	metal_ready: bool,
-	batch_mm_ok: bool, // dense batched-MLP MMQ supports only Q4_K/Q6_K tensors
+	batch_mm_ok: bool, // dense batched-MMQ: kinds with MMQ kernels only (Q4_K/Q6_K/IQ*/Q2_K/Q3_K/Q8_0)
 }
 
 engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
@@ -73,13 +73,18 @@ engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
 // trailing 1-7 tokens run through the per-token path. Returns the logits for the
 // LAST token (the one used to predict the next token). CPU path falls back to
 // per-token forward.
-// The dense batched-prefill MMQ kernels (enc_mm / enc_proj_fwd) only handle
-// Q4_K/Q6_K. Mixed-quant models (e.g. Qwen3.8 UD-IQ2_XXS) must prefill
-// per-token on Metal or CPU.
+// The dense batched-prefill MMQ kernels (enc_mm / enc_proj_fwd) handle
+// Q4_K/Q6_K, the IQ family (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/
+// IQ4_XS), Q2_K/Q3_K and Q8_0. Models using any other kind (e.g. Q4_0/Q5_0/
+// Q8_K) must prefill per-token on Metal or CPU.
 model_batch_mm_ok :: proc(t: ^Transformer) -> bool {
 	w := &t.weights
 	ok_kind :: proc(k: ggml.GGML_Type) -> bool {
-		return k == .Q4_K || k == .Q6_K
+		#partial switch k {
+		case .Q4_K, .Q6_K, .Q8_0, .Q2_K, .Q3_K, .IQ1_S, .IQ1_M, .IQ2_XXS, .IQ2_XS, .IQ2_S, .IQ3_XXS, .IQ3_S, .IQ4_XS:
+			return true
+		}
+		return false
 	}
 	for l in 0 ..< t.config.n_layers {
 		lw := &w.layers[l]
