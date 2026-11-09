@@ -8,7 +8,7 @@
 
      Header (fixed, 80 bytes):
        magic            : u32 = 0x4F494B56   ('OIKV')
-       version          : u32 = 1
+       version          : u32 = 2
        arch             : u32 = 2            (qwen3_5)
        fingerprint      : u64                FNV-1a of identifying Config fields
        n_valid_pos      : u32                positions actually populated
@@ -34,8 +34,14 @@
    Total size for 100-token chat (Qwen3.5-9B-ish, kv_dim=1024, n_full=32):
      32 * 100 * 1024 * 4 * 2 ≈ 26 MB + small conv/recurrent blobs.
 
-   The Metal backend stores KV in f16 head-major layout in GPU buffers; this
-   module does f16↔f32 + layout conversion at save/load time (see metal.odin).
+   The Metal backend stores KV in Q8_0 (34 B per 32 elements, position-major;
+   legacy KV_Q8=0: f16 head-major) in GPU buffers; this module does
+   Q8/f16↔f32 + layout conversion at save/load time (see metal.odin).
+
+   v2 (2026-11): in-engine KV format changed to Q8_0 (KV_Q8=1). The on-disk body
+   stays canonical f32, but the version and fingerprint are bumped so files
+   written by pre-Q8 builds are refused cleanly instead of silently mixing
+   engines with different KV formats.
 */
 
 package qwen3_5
@@ -45,8 +51,13 @@ import "core:hash"
 import "core:os"
 
 KV_MAGIC :: u32(0x4F494B56) // 'O','I','K','V' little-endian
-KV_VERSION :: u32(1)
+KV_VERSION :: u32(2)         // v2: Q8_0 KV engine format (v1 = pre-Q8 builds)
 KV_ARCH_QWEN3_5 :: u32(2)
+
+// Mix-in tag so the fingerprint changes with the KV format generation: v1
+// (pre-Q8) files fail the fingerprint check on v2 engines even when the model
+// Config matches, and the version check above refuses them with a clear message.
+KV_FORMAT_TAG :: u64(0x5138_5f76_32_1e5e)
 
 KV_Header :: struct {
 	magic:           u32,
@@ -79,6 +90,8 @@ model_fingerprint :: proc(t: ^Transformer) -> u64 {
 	mix :: proc(h: u64, x: u64) -> u64 {
 		return (h ~ x) * 0x100000001b3
 	}
+	h = mix(h, u64(KV_VERSION))   // KV format generation (bumped v1→v2 for Q8_0 KV)
+	h = mix(h, KV_FORMAT_TAG)
 	h = mix(h, u64(c.dim))
 	h = mix(h, u64(c.n_layers))
 	h = mix(h, u64(c.n_heads))
@@ -278,7 +291,12 @@ cpu_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 		fmt.eprintf("kv: bad magic 0x%08x\n", h.magic); return 0, false
 	}
 	if h.version != KV_VERSION {
-		fmt.eprintf("kv: version mismatch (file=%d, supported=%d)\n", h.version, KV_VERSION); return 0, false
+		fmt.eprintf(
+			"kv: version mismatch (file=%d, supported=%d) — file written by an incompatible engine build (pre-Q8 KV format); delete it (or set KV_PERSIST=0)\n",
+			h.version,
+			KV_VERSION,
+		)
+		return 0, false
 	}
 	if h.arch != KV_ARCH_QWEN3_5 {
 		fmt.eprintf("kv: arch mismatch (file=%d, expected qwen3_5)\n", h.arch); return 0, false

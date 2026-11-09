@@ -30,9 +30,10 @@ arch with per-layer quant mix); Odinfer runs it end-to-end:
 | GPU decode | 0.2–1.3 s/tok (M3; 223 ms/tok measured warm, 1.3 s/tok under heavy load) |
 | CPU decode | 15–50 s/tok (loaded machine) |
 | GPU batched prefill | ~227 ms/tok (30-token prompt) vs ~420 ms/tok per-token |
-| CPU-vs-Metal logits | max_abs 1.4e-3 (2 tokens), 0 diffs > 1e-2 |
+| CPU-vs-Metal logits | max_abs 1.4e-3 with f16 KV (KV_Q8=0); ~1.1e-1 with the default Q8_0 KV — the V cache has outliers (amax≈85) so the per-element Q8 error is ±0.34; argmax matches in both, chat quality unaffected |
 | Batch-vs-per-token prefill | max_abs 5.7e-3, decode-step 6.6e-3, 0 diffs > 1e-2 |
-| ctx 8192 | kv 1.07 GB, total 8.5 GB on 16 GB (49%) |
+| ctx 8192 | kv 0.27 GB (Q8_0), total 7.7 GB on 16 GB |
+| ctx 32768 | kv 1.14 GB (Q8_0), total 8.56 GB (50%) — 256k needs ~9 GB KV on a 32 GB machine |
 | Quality note | 2-bit: coherent short answers; context disambiguation limited ("transformer" → electrical transformer) |
 
 ## MoE (0.8B-MoE, community qwen35moe variant)

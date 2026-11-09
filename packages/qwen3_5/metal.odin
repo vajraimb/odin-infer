@@ -1746,6 +1746,87 @@ kernel void attention(device const float *q [[buffer(0)]], device const half *kc
         xb3[(ulong)h * P.head_dim + i] = acc * inv; }
 }
 
+// ---------- Q8_0 KV cache (34 bytes per 32 elements: f16 d + 32 int8) ----------
+// Layout per layer, per buffer (K and V separate): [seq_len positions][kv_dim/32
+// blocks][34 bytes], position-major. head_dim % 32 == 0 keeps every block inside
+// one head, so block b covers kv elements [b*32, b*32+32).
+
+struct Q8StoreP { uint kv_pos_bytes; uint pos; };
+
+// Quantize the current position's K and V into the cache. One thread per block.
+kernel void store_kv_q8(device const float *ktmp [[buffer(0)]], device const float *vtmp [[buffer(1)]],
+    device uchar *kc [[buffer(2)]], device uchar *vc [[buffer(3)]], constant Q8StoreP &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    device const float *k32 = ktmp + (ulong)gid * 32;
+    device const float *v32 = vtmp + (ulong)gid * 32;
+    float kamax = 0.0, vamax = 0.0;
+    for (uint j = 0; j < 32; ++j) {
+        kamax = max(kamax, fabs(k32[j]));
+        vamax = max(vamax, fabs(v32[j]));
+    }
+    float kd = kamax / 127.0, vd = vamax / 127.0;
+    float kid = kd != 0.0 ? 1.0/kd : 0.0, vid = vd != 0.0 ? 1.0/vd : 0.0;
+    device uchar *kb = kc + (ulong)P.pos * P.kv_pos_bytes + (ulong)gid * 34;
+    device uchar *vb = vc + (ulong)P.pos * P.kv_pos_bytes + (ulong)gid * 34;
+    *(device half*)(kb) = (half)kd;
+    *(device half*)(vb) = (half)vd;
+    device char *kq = (device char*)(kb + 2);
+    device char *vq = (device char*)(vb + 2);
+    for (uint j = 0; j < 32; ++j) {
+        kq[j] = (char)round(k32[j] * kid);
+        vq[j] = (char)round(v32[j] * vid);
+    }
+}
+
+struct Q8AttnP { uint head_dim; uint kv_pos_bytes; uint kv_mul; uint pos; };
+
+// Attention reading the Q8_0 KV cache, dequantizing on the fly.
+kernel void attention_q8(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+    device const uchar *vc [[buffer(2)]], device float *xb3 [[buffer(3)]], constant Q8AttnP &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    uint nb = P.head_dim / 32;          // 32-element blocks per head
+    uint kvh = h / P.kv_mul;
+    uint hb = kvh * nb;                 // first block index of head kvh within a position
+    device const float *qh = q + (ulong)h * P.head_dim;
+    float scale = rsqrt((float)P.head_dim); uint n = P.pos + 1;
+    for (uint t = tid; t < n; t += NT) {
+        device const uchar *kb = kc + (ulong)t * P.kv_pos_bytes + (ulong)hb * 34;
+        float s = 0.0;
+        for (uint b = 0; b < nb; ++b) {
+            device const uchar *bb = kb + (ulong)b * 34;
+            float d = (float)(*(device const half*)bb);
+            device const char *qs = (device const char*)(bb + 2);
+            for (uint j = 0; j < 32; ++j) s += qh[b*32+j] * (d * (float)qs[j]);
+        }
+        scores[t] = s * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint t = tid; t < n; t += NT) lm = max(lm, scores[t]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint t = tid; t < n; t += NT) { float e = exp(scores[t] - m); scores[t] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    // value accumulation: i-parallel like the f16 kernel; the 2-byte d load is
+    // shared across the 32 threads of a block (broadcast within the cache line).
+    for (uint i = tid; i < P.head_dim; i += NT) {
+        uint bb = (kvh * P.head_dim + i) / 32;
+        uint jj = (kvh * P.head_dim + i) - bb * 32;
+        float acc = 0.0;
+        for (uint t = 0; t < n; ++t) {
+            device const uchar *vb = vc + (ulong)t * P.kv_pos_bytes + (ulong)bb * 34;
+            float d = (float)(*(device const half*)vb);
+            device const char *qs = (device const char*)(vb + 2);
+            acc += scores[t] * (d * (float)qs[jj]);
+        }
+        xb3[(ulong)h * P.head_dim + i] = acc * inv;
+    }
+}
+
 // Multiply attention output by sigmoid(gate), where gate is the second half of each head's qproj block.
 kernel void attn_gate(device float *xb3 [[buffer(0)]], device const float *qproj [[buffer(1)]],
     constant uint &head_dim [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
@@ -3159,6 +3240,7 @@ m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1
 	m_pso_q4_k_o: ^MTL.ComputePipelineState           // output-layer GEMV (32 lanes/row x 4 rows/thread, llama.cpp default shape)
 @(private = "file")
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
+	m_pso_store_kv_q8, m_pso_attn_q8: ^MTL.ComputePipelineState // Q8_0 KV cache (KV_Q8=1 default)
 	m_pso_gemv_f32, m_pso_gemv_q80, m_pso_gemv_q50, m_pso_moe_topk, m_pso_moe_combine: ^MTL.ComputePipelineState
 	m_pso_gemv_f32_b, m_pso_moe_topk_b: ^MTL.ComputePipelineState
 	m_pso_moe_up_id_q4, m_pso_moe_down_id_q80, m_pso_moe_down_id_q50: ^MTL.ComputePipelineState
@@ -3313,10 +3395,12 @@ metal_reset_state :: proc() {
 }
 
 // KV persist: Metal stores K/V as f16 head-major [n_full, n_kv_heads, seq_len,
-// head_dim]. The on-disk canonical format is f32 layer-major [n_full, seq_len,
-// kv_dim] (= [n_full, seq_len, n_kv_heads, head_dim] flattened). We do the
-// conversion in both directions here. conv_states and recurrent_states are
-// already f32 standard layout on both backends — straight copy.
+// head_dim] (legacy KV_Q8=0) or Q8_0 position-major [n_full, seq_len,
+// kv_dim/32 blocks] (default). The on-disk canonical format is f32 layer-major
+// [n_full, seq_len, kv_dim] (= [n_full, seq_len, n_kv_heads, head_dim]
+// flattened). We do the conversion in both directions here. conv_states and
+// recurrent_states are already f32 standard layout on both backends — straight
+// copy.
 
 metal_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 	if !metal_enabled { fmt.eprintln("kv: metal not enabled"); return false }
@@ -3344,42 +3428,78 @@ metal_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 	tmp: []f32 = make([]f32, tmp_size)
 	defer delete(tmp)
 
-	for l in 0 ..< c.n_full {
-		// Metal per-layer offset: l * (seq_len * kv_dim * 2) bytes
-		layer_byte_off := u64(l) * u64(c.seq_len) * u64(kv_dim) * 2
-		// Convert head-major f16 → layer-major f32
-		for h_idx in 0 ..< c.n_kv_heads {
+	if g_kv_q8 {
+		// Q8_0 position-major: per layer [seq_len][kv_dim/32 blocks][34 bytes].
+		layer_byte_off := u64(kv_layer_bytes_q8(c.seq_len, kv_dim))
+		pos_bytes := kv_pos_bytes(kv_dim)
+		for l in 0 ..< c.n_full {
+			l_off := u64(l) * layer_byte_off
+			// K: dequantize blocks straight into the canonical layer-major f32 order
 			for p in 0 ..< n_valid_pos {
-				for d in 0 ..< c.head_dim {
-					m_off := int(layer_byte_off) +
-						(h_idx * c.seq_len * c.head_dim +
-						 p * c.head_dim +
-						 d) * 2
-					f16_raw := u16(kc_bytes[m_off]) | (u16(kc_bytes[m_off + 1]) << 8)
-					cpu_off := p * kv_dim + h_idx * c.head_dim + d
-					tmp[cpu_off] = f32(transmute(f16)(f16_raw))
+				for b in 0 ..< kv_dim / QK8_0 {
+					m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
+					d := f32(transmute(f16)(u16(kc_bytes[m_off]) | (u16(kc_bytes[m_off + 1]) << 8)))
+					for j in 0 ..< QK8_0 {
+						tmp[p * kv_dim + b * QK8_0 + j] = d * f32(i8(kc_bytes[m_off + 2 + j]))
+					}
 				}
 			}
-		}
-		if !write_f32_slice(f, tmp) {
-			fmt.eprintf("kv: K write failed at layer %d\n", l); return false
-		}
-		// V: same layout
-		for h_idx in 0 ..< c.n_kv_heads {
+			if !write_f32_slice(f, tmp) {
+				fmt.eprintf("kv: K write failed at layer %d\n", l); return false
+			}
+			// V
 			for p in 0 ..< n_valid_pos {
-				for d in 0 ..< c.head_dim {
-					m_off := int(layer_byte_off) +
-						(h_idx * c.seq_len * c.head_dim +
-						 p * c.head_dim +
-						 d) * 2
-					f16_raw := u16(vc_bytes[m_off]) | (u16(vc_bytes[m_off + 1]) << 8)
-					cpu_off := p * kv_dim + h_idx * c.head_dim + d
-					tmp[cpu_off] = f32(transmute(f16)(f16_raw))
+				for b in 0 ..< kv_dim / QK8_0 {
+					m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
+					d := f32(transmute(f16)(u16(vc_bytes[m_off]) | (u16(vc_bytes[m_off + 1]) << 8)))
+					for j in 0 ..< QK8_0 {
+						tmp[p * kv_dim + b * QK8_0 + j] = d * f32(i8(vc_bytes[m_off + 2 + j]))
+					}
 				}
 			}
+			if !write_f32_slice(f, tmp) {
+				fmt.eprintf("kv: V write failed at layer %d\n", l); return false
+			}
 		}
-		if !write_f32_slice(f, tmp) {
-			fmt.eprintf("kv: V write failed at layer %d\n", l); return false
+	} else {
+		// legacy f16 head-major
+		for l in 0 ..< c.n_full {
+			// Metal per-layer offset: l * (seq_len * kv_dim * 2) bytes
+			layer_byte_off := u64(l) * u64(c.seq_len) * u64(kv_dim) * 2
+			// Convert head-major f16 → layer-major f32
+			for h_idx in 0 ..< c.n_kv_heads {
+				for p in 0 ..< n_valid_pos {
+					for d in 0 ..< c.head_dim {
+						m_off := int(layer_byte_off) +
+							(h_idx * c.seq_len * c.head_dim +
+							 p * c.head_dim +
+							 d) * 2
+						f16_raw := u16(kc_bytes[m_off]) | (u16(kc_bytes[m_off + 1]) << 8)
+						cpu_off := p * kv_dim + h_idx * c.head_dim + d
+						tmp[cpu_off] = f32(transmute(f16)(f16_raw))
+					}
+				}
+			}
+			if !write_f32_slice(f, tmp) {
+				fmt.eprintf("kv: K write failed at layer %d\n", l); return false
+			}
+			// V: same layout
+			for h_idx in 0 ..< c.n_kv_heads {
+				for p in 0 ..< n_valid_pos {
+					for d in 0 ..< c.head_dim {
+						m_off := int(layer_byte_off) +
+							(h_idx * c.seq_len * c.head_dim +
+							 p * c.head_dim +
+							 d) * 2
+						f16_raw := u16(vc_bytes[m_off]) | (u16(vc_bytes[m_off + 1]) << 8)
+						cpu_off := p * kv_dim + h_idx * c.head_dim + d
+						tmp[cpu_off] = f32(transmute(f16)(f16_raw))
+					}
+				}
+			}
+			if !write_f32_slice(f, tmp) {
+				fmt.eprintf("kv: V write failed at layer %d\n", l); return false
+			}
 		}
 	}
 
@@ -3417,7 +3537,12 @@ metal_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 		fmt.eprintf("kv: bad magic 0x%08x\n", h.magic); return 0, false
 	}
 	if h.version != KV_VERSION {
-		fmt.eprintf("kv: version mismatch (file=%d, supported=%d)\n", h.version, KV_VERSION); return 0, false
+		fmt.eprintf(
+			"kv: version mismatch (file=%d, supported=%d) — file written by an incompatible engine build (pre-Q8 KV format); delete it (or set KV_PERSIST=0)\n",
+			h.version,
+			KV_VERSION,
+		)
+		return 0, false
 	}
 	if h.arch != KV_ARCH_QWEN3_5 {
 		fmt.eprintf("kv: arch mismatch (file=%d, expected qwen3_5)\n", h.arch); return 0, false
@@ -3441,49 +3566,79 @@ metal_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 	// Zero the K/V GPU buffers first (everything beyond n_valid_pos is stale).
 	kc_bytes := m_b_kc->contentsAsSlice([]u8)
 	vc_bytes := m_b_vc->contentsAsSlice([]u8)
-	for i in 0 ..< len(kc_bytes) { kc_bytes[i] = 0 }
-	for i in 0 ..< len(vc_bytes) { vc_bytes[i] = 0 }
+	mem.zero_slice(kc_bytes)
+	mem.zero_slice(vc_bytes)
 
 	kv_dim := c.n_kv_heads * c.head_dim
 	tmp_size := int(h.n_valid_pos) * kv_dim
 	tmp: []f32 = make([]f32, tmp_size)
 	defer delete(tmp)
 
-	for l in 0 ..< c.n_full {
-		layer_byte_off := u64(l) * u64(c.seq_len) * u64(kv_dim) * 2
-		// K
-		if !read_f32_into(f, tmp) {
-			fmt.eprintf("kv: K read failed at layer %d\n", l); return 0, false
-		}
-		for h_idx in 0 ..< c.n_kv_heads {
+	if g_kv_q8 {
+		// Q8_0 position-major: per layer [seq_len][kv_dim/32 blocks][34 bytes].
+		layer_byte_off := u64(kv_layer_bytes_q8(c.seq_len, kv_dim))
+		pos_bytes := kv_pos_bytes(kv_dim)
+		for l in 0 ..< c.n_full {
+			l_off := u64(l) * layer_byte_off
+			// K: read canonical layer-major f32, quantize into 32-element blocks
+			if !read_f32_into(f, tmp) {
+				fmt.eprintf("kv: K read failed at layer %d\n", l); return 0, false
+			}
 			for p in 0 ..< int(h.n_valid_pos) {
-				for d in 0 ..< c.head_dim {
-					m_off := int(layer_byte_off) +
-						(h_idx * c.seq_len * c.head_dim +
-						 p * c.head_dim +
-						 d) * 2
-					cpu_off := p * kv_dim + h_idx * c.head_dim + d
-					f16_raw := transmute(u16)(f16(tmp[cpu_off]))
-					kc_bytes[m_off]     = u8(f16_raw & 0xff)
-					kc_bytes[m_off + 1] = u8((f16_raw >> 8) & 0xff)
+				for b in 0 ..< kv_dim / QK8_0 {
+					m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
+					quantize_q8_block(tmp[p * kv_dim + b * QK8_0:p * kv_dim + (b + 1) * QK8_0], kc_bytes[m_off:m_off + Q8_0_BLOCK_BYTES])
+				}
+			}
+			// V
+			if !read_f32_into(f, tmp) {
+				fmt.eprintf("kv: V read failed at layer %d\n", l); return 0, false
+			}
+			for p in 0 ..< int(h.n_valid_pos) {
+				for b in 0 ..< kv_dim / QK8_0 {
+					m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
+					quantize_q8_block(tmp[p * kv_dim + b * QK8_0:p * kv_dim + (b + 1) * QK8_0], vc_bytes[m_off:m_off + Q8_0_BLOCK_BYTES])
 				}
 			}
 		}
-		// V
-		if !read_f32_into(f, tmp) {
-			fmt.eprintf("kv: V read failed at layer %d\n", l); return 0, false
-		}
-		for h_idx in 0 ..< c.n_kv_heads {
-			for p in 0 ..< int(h.n_valid_pos) {
-				for d in 0 ..< c.head_dim {
-					m_off := int(layer_byte_off) +
-						(h_idx * c.seq_len * c.head_dim +
-						 p * c.head_dim +
-						 d) * 2
-					cpu_off := p * kv_dim + h_idx * c.head_dim + d
-					f16_raw := transmute(u16)(f16(tmp[cpu_off]))
-					vc_bytes[m_off]     = u8(f16_raw & 0xff)
-					vc_bytes[m_off + 1] = u8((f16_raw >> 8) & 0xff)
+	} else {
+		// legacy f16 head-major
+		for l in 0 ..< c.n_full {
+			layer_byte_off := u64(l) * u64(c.seq_len) * u64(kv_dim) * 2
+			// K
+			if !read_f32_into(f, tmp) {
+				fmt.eprintf("kv: K read failed at layer %d\n", l); return 0, false
+			}
+			for h_idx in 0 ..< c.n_kv_heads {
+				for p in 0 ..< int(h.n_valid_pos) {
+					for d in 0 ..< c.head_dim {
+						m_off := int(layer_byte_off) +
+							(h_idx * c.seq_len * c.head_dim +
+							 p * c.head_dim +
+							 d) * 2
+						cpu_off := p * kv_dim + h_idx * c.head_dim + d
+						f16_raw := transmute(u16)(f16(tmp[cpu_off]))
+						kc_bytes[m_off]     = u8(f16_raw & 0xff)
+						kc_bytes[m_off + 1] = u8((f16_raw >> 8) & 0xff)
+					}
+				}
+			}
+			// V
+			if !read_f32_into(f, tmp) {
+				fmt.eprintf("kv: V read failed at layer %d\n", l); return 0, false
+			}
+			for h_idx in 0 ..< c.n_kv_heads {
+				for p in 0 ..< int(h.n_valid_pos) {
+					for d in 0 ..< c.head_dim {
+						m_off := int(layer_byte_off) +
+							(h_idx * c.seq_len * c.head_dim +
+							 p * c.head_dim +
+							 d) * 2
+						cpu_off := p * kv_dim + h_idx * c.head_dim + d
+						f16_raw := transmute(u16)(f16(tmp[cpu_off]))
+						vc_bytes[m_off]     = u8(f16_raw & 0xff)
+						vc_bytes[m_off + 1] = u8((f16_raw >> 8) & 0xff)
+					}
 				}
 			}
 		}
@@ -3581,6 +3736,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_qnorm = make_pso(lib, "qnorm_extract"); m_pso_store_kv = make_pso(lib, "store_kv")
 	m_pso_attn = make_pso(lib, "attention"); m_pso_attn_gate = make_pso(lib, "attn_gate")
 	m_pso_swiglu = make_pso(lib, "swiglu"); m_pso_residual = make_pso(lib, "residual")
+	m_pso_store_kv_q8 = make_pso(lib, "store_kv_q8"); m_pso_attn_q8 = make_pso(lib, "attention_q8")
 	m_pso_gemv_f32 = make_pso(lib, "moe_gemv_f32"); m_pso_gemv_q80 = make_pso(lib, "moe_gemv_q80"); m_pso_gemv_q50 = make_pso(lib, "moe_gemv_q50")
 	m_pso_moe_topk = make_pso(lib, "moe_softmax_topk"); m_pso_moe_combine = make_pso(lib, "moe_combine")
 	m_pso_gemv_f32_b = make_pso(lib, "gemv_f32_b"); m_pso_moe_topk_b = make_pso(lib, "moe_softmax_topk_b")
@@ -3621,8 +3777,19 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_b_hb = new_shared(c.hidden_dim); m_b_hb2 = new_shared(c.hidden_dim)
 	m_b_ktmp = new_shared(kv_dim); m_b_vtmp = new_shared(kv_dim)
 	m_b_logits = new_shared(c.vocab_size)
-	kv_elems := c.n_full * c.seq_len * kv_dim
-	m_b_kc = new_shared_bytes(kv_elems * 2); m_b_vc = new_shared_bytes(kv_elems * 2)
+	// KV cache: Q8_0 (34 bytes per 32 elements, K and V separate buffers) unless
+	// KV_Q8=0 selects the legacy f16 path for A/B. Q8 requires kv_dim % 32 == 0.
+	if g_kv_q8 && kv_dim % 32 != 0 {
+		fmt.eprintf("metal: kv_dim=%d not a multiple of 32 — Q8 KV unsupported, using f16 KV\n", kv_dim)
+		g_kv_q8 = false
+	}
+	if g_kv_q8 {
+		kv_bytes_q8 := kv_total_bytes_q8(c.n_full, c.seq_len, kv_dim)
+		m_b_kc = new_shared_bytes(kv_bytes_q8); m_b_vc = new_shared_bytes(kv_bytes_q8)
+	} else {
+		kv_elems := c.n_full * c.seq_len * kv_dim
+		m_b_kc = new_shared_bytes(kv_elems * 2); m_b_vc = new_shared_bytes(kv_elems * 2)
+	}
 	m_b_qkv = new_shared(conv_dim); m_b_qkv2 = new_shared(conv_dim)
 	m_b_z = new_shared(value_dim); m_b_b = new_shared(c.lin_n_v_heads); m_b_a = new_shared(c.lin_n_v_heads)
 	m_b_qlin = new_shared(key_dim); m_b_klin = new_shared(key_dim); m_b_lout = new_shared(value_dim)
@@ -3684,7 +3851,15 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	if pi := NS.ProcessInfo_processInfo(); pi != nil {
 		phys := u64(NS.ProcessInfo_physicalMemory(pi))
 		if fi, ferr := os.stat(model_path, context.allocator); ferr == os.ERROR_NONE {
-			kv_bytes := 2 * u64(c.n_full) * u64(c.seq_len) * u64(c.n_kv_heads) * u64(c.head_dim) * 4
+			kv_bytes: u64
+			kv_tag: string
+			if g_kv_q8 {
+				kv_bytes = 2 * u64(kv_total_bytes_q8(c.n_full, c.seq_len, c.n_kv_heads * c.head_dim))
+				kv_tag = "Q8_0"
+			} else {
+				kv_bytes = 2 * u64(c.n_full) * u64(c.seq_len) * u64(c.n_kv_heads) * u64(c.head_dim) * 2
+				kv_tag = "f16"
+			}
 			conv_dim := c.lin_n_k_heads * c.lin_head_k_dim * 2 + c.lin_n_v_heads * c.lin_head_v_dim
 			lin_bytes :=
 				u64(c.n_linear) * u64(conv_dim) * u64(c.lin_conv_kernel - 1) * 4 +
@@ -3693,8 +3868,8 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			frac := f64(total) / f64(phys) * 100.0
 			level := "OK"
 			if frac > 85.0 { level = "WARNING: tight for this machine" }
-			fmt.eprintfln("mem: model=%.2f GB kv=%.2f GB lin=%.2f GB total=%.2f GB / physical=%.2f GB (%.0f%%) %s",
-				f64(fi.size) / 1e9, f64(kv_bytes) / 1e9, f64(lin_bytes) / 1e9, f64(total) / 1e9, f64(phys) / 1e9, frac, level)
+			fmt.eprintfln("mem: model=%.2f GB kv=%.2f GB (%s) lin=%.2f GB total=%.2f GB / physical=%.2f GB (%.0f%%) %s",
+				f64(fi.size) / 1e9, f64(kv_bytes) / 1e9, kv_tag, f64(lin_bytes) / 1e9, f64(total) / 1e9, f64(phys) / 1e9, frac, level)
 		}
 	}
 
@@ -4455,6 +4630,54 @@ enc_tr_f32 :: proc(enc: ^MTL.ComputeCommandEncoder, src, dst: ^MTL.Buffer, dim, 
 	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
 }
 
+// Per-token stateful full-attention block: store K/V into the cache (Q8_0 when
+// KV_Q8=1, legacy f16 otherwise), multi-head attention, and the sigmoid output
+// gate. Shared by forward_gpu / forward_gpu_batch / forward_gpu_batch_moe so
+// the KV_Q8 A/B branch lives in exactly one place.
+@(private = "file")
+enc_store_attn_gate :: proc(enc: ^MTL.ComputeCommandEncoder, slot: int, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim: int) {
+	if g_kv_q8 {
+		kv_layer_bytes := kv_layer_bytes_q8(seq_len, kv_dim)
+		kv_loff := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes)
+		enc->setComputePipelineState(m_pso_store_kv_q8)
+		enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
+		enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
+		q8sp := struct { kv_pos_bytes: u32, pos: u32 }{u32(kv_pos_bytes(kv_dim)), u32(pos)}
+		enc->setBytes(bytes_of(&q8sp, size_of(q8sp)), 4)
+		nb := kv_dim / QK8_0
+		enc->dispatchThreads(MTL.Size{NS.Integer(nb), 1, 1}, MTL.Size{NS.Integer(min(nb, 256)), 1, 1})
+		enc->setComputePipelineState(m_pso_attn_q8)
+		enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
+		q8ap := struct { head_dim: u32, kv_pos_bytes: u32, kv_mul: u32, pos: u32 }{
+			u32(head_dim), u32(kv_pos_bytes(kv_dim)), u32(kv_mul), u32(pos),
+		}
+		enc->setBytes(bytes_of(&q8ap, size_of(q8ap)), 4)
+		enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
+	} else {
+		kv_layer_bytes := seq_len * kv_dim * 2 // legacy f16 KV
+		kv_loff := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes)
+		enc->setComputePipelineState(m_pso_store_kv)
+		enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
+		enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
+		store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
+		enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
+		enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
+		enc->setComputePipelineState(m_pso_attn)
+		enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
+		attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
+		enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
+		enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
+	}
+	// attention output gate: o_h *= sigmoid(gate_h), gate = second half of each qproj head
+	enc->setComputePipelineState(m_pso_attn_gate)
+	enc->setBuffer(m_b_xb3, 0, 0); enc->setBuffer(m_b_qproj, 0, 1)
+	hd_u32 := u32(head_dim)
+	enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
+	enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+}
+
 forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	NS.scoped_autoreleasepool()
 	p := &transformer.config
@@ -4496,7 +4719,6 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 
 	cmd := m_queue->commandBuffer()
 	enc := cmd->computeCommandEncoder()
-	kv_layer_bytes := NS.UInteger(seq_len * kv_dim * 2)
 	conv_state_stride := conv_dim * (kernel - 1)
 	rec_state_stride := n_vh * head_k_dim * head_v_dim
 
@@ -4511,7 +4733,6 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 		case .Full_Attention:
 			fa := &lw.full
 			slot := transformer.full_slot[l]
-			kv_loff := NS.UInteger(slot) * kv_layer_bytes
 			if g_normfuse {
 				enc_gemv_norm(enc, fa.wq.kind, woff(raw_data(fa.wq.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_qproj, 0, dim, n_heads * head_dim * 2, eps)
 				enc_gemv_norm(enc, fa.wk.kind, woff(raw_data(fa.wk.data)), woff(raw_data(lw.attn_norm)), m_b_x, 0, m_b_ktmp, 0, dim, kv_dim, eps)
@@ -4538,24 +4759,8 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
 			enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
 			enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-			// store K/V (f16), attention, output gate
-			enc->setComputePipelineState(m_pso_store_kv)
-			enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
-			enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
-			store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
-			enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
-			enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
-			enc->setComputePipelineState(m_pso_attn)
-			enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
-			attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
-			enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
-			enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
-			enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
-			enc->setComputePipelineState(m_pso_attn_gate)
-			enc->setBuffer(m_b_xb3, 0, 0); enc->setBuffer(m_b_qproj, 0, 1)
-			hd_u32 := u32(head_dim)
-			enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
-			enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+			// store K/V (Q8_0 or legacy f16), attention, output gate
+			enc_store_attn_gate(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
 			} // !nosmall
 			enc_gemv(enc, fa.wo.kind, woff(raw_data(fa.wo.data)), m_b_xb3, 0, m_b_xb2, 0, att_head_dim, dim)
 			enc_elementwise(enc, m_pso_residual, m_b_x, m_b_xb2, dim)
@@ -4708,7 +4913,6 @@ forward_gpu_batch_moe :: proc(transformer: ^Transformer, tokens: []int, pos_star
 
 	cmd := m_queue->commandBuffer()
 	enc := cmd->computeCommandEncoder()
-	kv_layer_bytes := NS.UInteger(seq_len * kv_dim * 2)
 	conv_state_stride := conv_dim * (kernel - 1)
 	rec_state_stride := n_vh * head_k_dim * head_v_dim
 	dim_bytes := NS.UInteger(dim * 4)
@@ -4742,7 +4946,6 @@ switch lw.layer_type {
 			}
 			// per-token stateful: qnorm / rope / store_kv / attention / gate
 			slot := transformer.full_slot[l]
-			kv_loff := NS.UInteger(slot) * kv_layer_bytes
 			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
 			if !g_prof_nofull { // QPROF_NOFULL ablation
 			for t in 0 ..< n_real {
@@ -4765,23 +4968,7 @@ switch lw.layer_type {
 				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
 				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
 				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				enc->setComputePipelineState(m_pso_store_kv)
-				enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
-				enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
-				store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
-				enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
-				enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
-				enc->setComputePipelineState(m_pso_attn)
-				enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
-				attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
-				enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
-				enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
-				enc->setComputePipelineState(m_pso_attn_gate)
-				enc->setBuffer(m_b_xb3, 0, 0); enc->setBuffer(m_b_qproj, 0, 1)
-				hd_u32 := u32(head_dim)
-				enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
-				enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+				enc_store_attn_gate(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
 				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
 			}
 			} // end QPROF_NOFULL guard
@@ -5024,7 +5211,6 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 
 	cmd := m_queue->commandBuffer()
 	enc := cmd->computeCommandEncoder()
-	kv_layer_bytes := NS.UInteger(seq_len * kv_dim * 2)
 	conv_state_stride := conv_dim * (kernel - 1)
 	rec_state_stride := n_vh * head_k_dim * head_v_dim
 	dim_bytes := NS.UInteger(dim * 4)
@@ -5058,7 +5244,6 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			}
 			// per-token stateful: qnorm / rope / store_kv / attention / gate
 			slot := transformer.full_slot[l]
-			kv_loff := NS.UInteger(slot) * kv_layer_bytes
 			qproj_b := NS.UInteger(qproj_dim * 4); kv_b := NS.UInteger(kv_dim * 4); xb3_b := NS.UInteger(att_head_dim * 4)
 			if !g_prof_nofull { // QPROF_NOFULL ablation
 			for t in 0 ..< n_real {
@@ -5081,23 +5266,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
 				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
 				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				enc->setComputePipelineState(m_pso_store_kv)
-				enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
-				enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
-				store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
-				enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
-				enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
-				enc->setComputePipelineState(m_pso_attn)
-				enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
-				attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
-				enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
-				enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
-				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
-				enc->setComputePipelineState(m_pso_attn_gate)
-				enc->setBuffer(m_b_xb3, 0, 0); enc->setBuffer(m_b_qproj, 0, 1)
-				hd_u32 := u32(head_dim)
-				enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
-				enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
+				enc_store_attn_gate(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
 				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
 			}
 			} // end QPROF_NOFULL guard

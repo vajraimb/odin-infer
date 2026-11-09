@@ -235,17 +235,122 @@ engine_reset_state :: proc(e: ^Engine) {
 // Caller compares draft tokens against argmax of each row to accept/reject.
 // Full-state snapshot for KV prefix caching (system prompt optimization).
 // Saves KV cache + recurrent + conv states to memory. Restore is O(1) memcpy.
+//
+// The snapshot KV bytes use the SAME layout the Metal engine stores natively,
+// so a snapshot saved by a CPU engine restores on a Metal engine and vice
+// versa (byte-identical formats). See kv_q8.odin for the layout.
 engine_save_full_state :: proc(e: ^Engine) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
 	when ODIN_OS == .Darwin {
 		if e.metal_ready { return metal_save_full_state() }
 	}
-	return
+	return cpu_save_full_state(&e.transformer)
 }
 
 engine_restore_full_state :: proc(e: ^Engine, kv_k, kv_v, conv, rec: []u8) {
 	when ODIN_OS == .Darwin {
 		if e.metal_ready { metal_restore_full_state(kv_k, kv_v, conv, rec); return }
 	}
+	cpu_restore_full_state(&e.transformer, kv_k, kv_v, conv, rec)
+}
+
+// CPU full-state snapshot: the Run_State KV stays fp32 (the CPU attention dots
+// read it directly), and the conversion to/from the Metal-native byte layout
+// happens here at the snapshot boundary only. With KV_Q8=1 (default) that is
+// Q8_0 position-major [n_full][seq_len][kv_dim/32 blocks][34 B]; with KV_Q8=0
+// it is the legacy f16 head-major [n_full][n_kv_heads][seq_len][head_dim].
+// quantize_q8_block reproduces the MSL store_kv_q8 kernel bit-for-bit, and
+// f16() reproduces the MSL (half) cast, so CPU- and Metal-saved snapshots of
+// the same fp32 values are byte-identical.
+cpu_save_full_state :: proc(t: ^Transformer) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
+	c := &t.config
+	s := &t.state
+	if len(s.key_cache) == 0 { return } // no full-attention layers (or Metal engine)
+	kv_dim := c.n_kv_heads * c.head_dim
+	if g_kv_q8 {
+		kv_k = make([]u8, kv_total_bytes_q8(c.n_full, c.seq_len, kv_dim))
+		kv_v = make([]u8, kv_total_bytes_q8(c.n_full, c.seq_len, kv_dim))
+		pos_bytes := kv_pos_bytes(kv_dim)
+		layer_bytes := kv_layer_bytes_q8(c.seq_len, kv_dim)
+		for l in 0 ..< c.n_full {
+			layer_off := l * c.seq_len * kv_dim
+			for p in 0 ..< c.seq_len {
+				row_off := layer_off + p * kv_dim
+				dst_off := l * layer_bytes + p * pos_bytes
+				for b in 0 ..< kv_dim / QK8_0 {
+					quantize_q8_block(s.key_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_k[dst_off + b * Q8_0_BLOCK_BYTES:dst_off + (b + 1) * Q8_0_BLOCK_BYTES])
+					quantize_q8_block(s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_v[dst_off + b * Q8_0_BLOCK_BYTES:dst_off + (b + 1) * Q8_0_BLOCK_BYTES])
+				}
+			}
+		}
+	} else {
+		// legacy f16 head-major, matching the Metal KV_Q8=0 buffer layout
+		kv_k = make([]u8, c.n_full * c.seq_len * kv_dim * 2)
+		kv_v = make([]u8, c.n_full * c.seq_len * kv_dim * 2)
+		layer_bytes := c.seq_len * kv_dim * 2
+		for l in 0 ..< c.n_full {
+			layer_off := l * c.seq_len * kv_dim
+			for h_idx in 0 ..< c.n_kv_heads {
+				for p in 0 ..< c.seq_len {
+					for d in 0 ..< c.head_dim {
+						m_off := l * layer_bytes +
+							(h_idx * c.seq_len * c.head_dim + p * c.head_dim + d) * 2
+						cpu_off := layer_off + p * kv_dim + h_idx * c.head_dim + d
+						kraw := transmute(u16)(f16(s.key_cache[cpu_off]))
+						vraw := transmute(u16)(f16(s.value_cache[cpu_off]))
+						kv_k[m_off] = u8(kraw & 0xff); kv_k[m_off + 1] = u8((kraw >> 8) & 0xff)
+						kv_v[m_off] = u8(vraw & 0xff); kv_v[m_off + 1] = u8((vraw >> 8) & 0xff)
+					}
+				}
+			}
+		}
+	}
+	conv_src := (cast([^]u8)raw_data(s.conv_states))[:len(s.conv_states) * 4]
+	rec_src := (cast([^]u8)raw_data(s.recurrent_states))[:len(s.recurrent_states) * 4]
+	conv = make([]u8, len(conv_src)); copy(conv, conv_src)
+	rec = make([]u8, len(rec_src)); copy(rec, rec_src)
+	return
+}
+
+// Reverse of cpu_save_full_state. Overwrites the whole Run_State KV
+// (n_full * seq_len positions), so no separate zeroing pass is needed.
+cpu_restore_full_state :: proc(t: ^Transformer, kv_k, kv_v, conv, rec: []u8) {
+	c := &t.config
+	s := &t.state
+	if len(s.key_cache) == 0 { return }
+	kv_dim := c.n_kv_heads * c.head_dim
+	if g_kv_q8 {
+		pos_bytes := kv_pos_bytes(kv_dim)
+		layer_bytes := kv_layer_bytes_q8(c.seq_len, kv_dim)
+		for l in 0 ..< c.n_full {
+			layer_off := l * c.seq_len * kv_dim
+			for p in 0 ..< c.seq_len {
+				row_off := layer_off + p * kv_dim
+				src_off := l * layer_bytes + p * pos_bytes
+				for b in 0 ..< kv_dim / QK8_0 {
+					dequantize_q8_block(kv_k[src_off + b * Q8_0_BLOCK_BYTES:src_off + (b + 1) * Q8_0_BLOCK_BYTES], s.key_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+					dequantize_q8_block(kv_v[src_off + b * Q8_0_BLOCK_BYTES:src_off + (b + 1) * Q8_0_BLOCK_BYTES], s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+				}
+			}
+		}
+	} else {
+		layer_bytes := c.seq_len * kv_dim * 2
+		for l in 0 ..< c.n_full {
+			layer_off := l * c.seq_len * kv_dim
+			for h_idx in 0 ..< c.n_kv_heads {
+				for p in 0 ..< c.seq_len {
+					for d in 0 ..< c.head_dim {
+						m_off := l * layer_bytes +
+							(h_idx * c.seq_len * c.head_dim + p * c.head_dim + d) * 2
+						cpu_off := layer_off + p * kv_dim + h_idx * c.head_dim + d
+						s.key_cache[cpu_off] = f32(transmute(f16)(u16(kv_k[m_off]) | (u16(kv_k[m_off + 1]) << 8)))
+						s.value_cache[cpu_off] = f32(transmute(f16)(u16(kv_v[m_off]) | (u16(kv_v[m_off + 1]) << 8)))
+					}
+				}
+			}
+		}
+	}
+	copy((cast([^]u8)raw_data(s.conv_states))[:len(s.conv_states) * 4], conv)
+	copy((cast([^]u8)raw_data(s.recurrent_states))[:len(s.recurrent_states) * 4], rec)
 }
 
 // Speculative decoding support

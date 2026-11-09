@@ -148,3 +148,114 @@ l2norm_unit :: proc(t: ^testing.T) {
 	approx(t, o[0], 0.6, 1e-5, "o[0]")
 	approx(t, o[1], 0.8, 1e-5, "o[1]")
 }
+
+// ---------- Q8_0 KV cache block math (kv_q8.odin) ----------
+
+@(test)
+q8_block_unit_scale_roundtrip :: proc(t: ^testing.T) {
+	// amax = 127 -> d = 1.0 exactly, so q = round(v) and integer values
+	// round-trip exactly.
+	src := make([]f32, QK8_0)
+	defer delete(src)
+	for j in 0 ..< QK8_0 {
+		src[j] = f32(j) - 16.0 // all integers
+	}
+	src[7] = 127.0
+	src[21] = -127.0
+	blk := make([]u8, Q8_0_BLOCK_BYTES)
+	defer delete(blk)
+	out := make([]f32, QK8_0)
+	defer delete(out)
+	quantize_q8_block(src, blk)
+	dequantize_q8_block(blk, out)
+	for j in 0 ..< QK8_0 {
+		approx(t, out[j], src[j], 1e-6, fmt.tprintf("q8 exact roundtrip [%d]", j))
+	}
+	// .5 ties round half away from zero (matches MSL round()/llama.cpp roundf)
+	src2 := make([]f32, QK8_0)
+	defer delete(src2)
+	src2[0] = 9.5
+	src2[1] = -9.5
+	src2[2] = 127.0
+	quantize_q8_block(src2, blk)
+	dequantize_q8_block(blk, out)
+	approx(t, out[0], 10.0, 1e-6, "q8 +9.5 rounds to +10")
+	approx(t, out[1], -10.0, 1e-6, "q8 -9.5 rounds to -10")
+}
+
+@(test)
+q8_block_zero_block :: proc(t: ^testing.T) {
+	// All-zero block: d = 0, q = 0, dequant stays zero (matches llama.cpp
+	// id = d ? 1/d : 0 and the MSL store_kv_q8 kernel).
+	src := make([]f32, QK8_0)
+	defer delete(src)
+	blk := make([]u8, Q8_0_BLOCK_BYTES)
+	defer delete(blk)
+	out := make([]f32, QK8_0)
+	defer delete(out)
+	quantize_q8_block(src, blk)
+	dequantize_q8_block(blk, out)
+	for j in 0 ..< QK8_0 {
+		approx(t, out[j], 0.0, 1e-12, fmt.tprintf("q8 zero [%d]", j))
+	}
+}
+
+@(test)
+q8_block_quantization_error_bound :: proc(t: ^testing.T) {
+	// Error per element is < d/2 (round-to-nearest), and d = amax/127.
+	src := make([]f32, QK8_0)
+	defer delete(src)
+	amax: f32 = 0
+	for j in 0 ..< QK8_0 {
+		src[j] = math.sin(f32(j) * 0.7) * 3.7 + f32(j) * 0.01
+		a := math.abs(src[j])
+		if a > amax { amax = a }
+	}
+	blk := make([]u8, Q8_0_BLOCK_BYTES)
+	defer delete(blk)
+	out := make([]f32, QK8_0)
+	defer delete(out)
+	quantize_q8_block(src, blk)
+	dequantize_q8_block(blk, out)
+	// |q - v/d| <= 0.5 and |d' - d| <= d*2^-11 (f16), so |out - src| <=
+	// d*(0.5 + 127*2^-11) < d*0.5621.
+	bound := (amax / 127.0) * 0.5621
+	for j in 0 ..< QK8_0 {
+		testing.expect(t, math.abs(out[j] - src[j]) <= bound, fmt.tprintf("q8 err [%d]: |%f-%f| > %f", j, out[j], src[j], bound))
+	}
+}
+
+@(test)
+q8_kv_byte_math :: proc(t: ^testing.T) {
+	testing.expect(t, kv_pos_bytes(1024) == (1024 / 32) * 34, "kv_pos_bytes(1024)")
+	testing.expect(t, kv_pos_bytes(512) == (512 / 32) * 34, "kv_pos_bytes(512)")
+	testing.expect(t, kv_layer_bytes_q8(4096, 1024) == 4096 * 32 * 34, "kv_layer_bytes_q8")
+	testing.expect(t, kv_total_bytes_q8(16, 32768, 1024) == 16 * 32768 * 32 * 34, "kv_total_bytes_q8(27B@32k)")
+	// 27B fp32 KV @ 32k = 2*16*32768*1024*4 = 4.295 GB; Q8 = 1.141 GB -> 3.76x smaller.
+	testing.expect(t, f64(2 * 16 * 32768 * 1024 * 4) / f64(kv_total_bytes_q8(16, 32768, 1024)) > 3.7, "q8 vs fp32 ratio")
+}
+
+@(test)
+q8_kv_row_roundtrip :: proc(t: ^testing.T) {
+	// Full-row (kv_dim=512) quantize/dequantize roundtrip through the row helpers.
+	row := make([]f32, 512)
+	defer delete(row)
+	for j in 0 ..< len(row) {
+		row[j] = math.cos(f32(j) * 0.13) * 5.0
+	}
+	blk := make([]u8, kv_pos_bytes(512))
+	defer delete(blk)
+	out := make([]f32, 512)
+	defer delete(out)
+	quantize_kv_row_q8(row, blk)
+	dequantize_kv_row_q8(blk, out)
+	amax: f32 = 0
+	for j in 0 ..< len(row) {
+		a := math.abs(row[j])
+		if a > amax { amax = a }
+	}
+	bound := (amax / 127.0) * 0.5621
+	for j in 0 ..< len(row) {
+		testing.expect(t, math.abs(out[j] - row[j]) <= bound, fmt.tprintf("q8 row err [%d]", j))
+	}
+}

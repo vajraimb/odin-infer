@@ -520,6 +520,7 @@ free_run_state :: proc(s: ^Run_State) {
 }
 
 build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int, skip_cpu_state: bool = false) {
+	kv_q8_init() // KV_Q8=0 -> legacy f16 Metal KV (A/B switch); read once per engine
 	ggml.parse_gguf(checkpoint_path, &t.gguf)
 	load_config(t)
 
@@ -556,12 +557,27 @@ build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int
 
 	conv_dim := t.config.lin_n_k_heads * t.config.lin_head_k_dim * 2 + t.config.lin_n_v_heads * t.config.lin_head_v_dim
 	value_dim := t.config.lin_n_v_heads * t.config.lin_head_v_dim
-	kv_bytes := 2 * t.config.n_full * t.config.seq_len * t.config.n_kv_heads * t.config.head_dim * 4
+	// KV footprint of the engine that will actually run: with Metal the buffers
+	// are Q8_0 (34 B/32 elems) or legacy f16 (2 B/elem); the CPU Run_State stays
+	// fp32 (4 B/elem) in both modes (Q8 conversion happens at the snapshot
+	// boundary only — see kv_q8.odin).
+	kv_bytes: int
+	kv_fmt: string
+	if skip_cpu_state {
+		// Metal KV: separate K and V buffers (Q8_0 or legacy f16).
+		kv_fmt = g_kv_q8 ? "Q8_0" : "f16"
+		kv_bytes = g_kv_q8 ? 2 * kv_total_bytes_q8(t.config.n_full, t.config.seq_len, t.config.n_kv_heads * t.config.head_dim) : 2 * t.config.n_full * t.config.seq_len * t.config.n_kv_heads * t.config.head_dim * 2
+	} else {
+		// CPU Run_State KV stays fp32 in both modes (Q8 conversion happens at
+		// the snapshot boundary only — see kv_q8.odin).
+		kv_fmt = "f32"
+		kv_bytes = 2 * t.config.n_full * t.config.seq_len * t.config.n_kv_heads * t.config.head_dim * 4
+	}
 	lin_bytes :=
 		t.config.n_linear * conv_dim * (t.config.lin_conv_kernel - 1) * 4 +
 		t.config.n_linear * t.config.lin_n_v_heads * t.config.lin_head_k_dim * t.config.lin_head_v_dim * 4
 	fmt.eprintf(
-		"qwen3_5: dim=%d layers=%d (full=%d linear=%d) heads=%d/%d head_dim=%d hidden=%d vocab=%d ctx=%d/%d  rotary=%d  conv_dim=%d value_dim=%d  KV=%.0f MB  lin=%.0f MB\n",
+		"qwen3_5: dim=%d layers=%d (full=%d linear=%d) heads=%d/%d head_dim=%d hidden=%d vocab=%d ctx=%d/%d  rotary=%d  conv_dim=%d value_dim=%d  KV=%.0f MB (%s)  lin=%.0f MB\n",
 		t.config.dim,
 		t.config.n_layers,
 		t.config.n_full,
@@ -577,6 +593,7 @@ build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int
 		conv_dim,
 		value_dim,
 		f64(kv_bytes) / (1024 * 1024),
+		kv_fmt,
 		f64(lin_bytes) / (1024 * 1024),
 	)
 }

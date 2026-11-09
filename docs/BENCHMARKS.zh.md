@@ -29,9 +29,10 @@ Odinfer 端到端可跑：
 | GPU 解码 | 0.2–1.3 s/tok（M3；热态实测 223ms/tok，满载 1.3s/tok） |
 | CPU 解码 | 15–50 s/tok（满载机器） |
 | GPU 批量 prefill | ~227 ms/tok（30-token prompt）vs 逐 token ~420 ms/tok |
-| CPU vs Metal logits | max_abs 1.4e-3（2 token），0 个 >1e-2 |
+| CPU vs Metal logits | f16 KV（KV_Q8=0）时 max_abs 1.4e-3；默认 Q8_0 KV 约 1.1e-1——V 缓存有离群值（amax≈85），Q8 每元素误差 ±0.34；两种格式 argmax 都一致、对话质量无影响 |
 | 批量 vs 逐 token prefill | max_abs 5.7e-3，解码步 6.6e-3，0 个 >1e-2 |
-| ctx 8192 | kv 1.07GB，16GB 机器总占用 8.5GB（49%） |
+| ctx 8192 | kv 0.27GB（Q8_0），16GB 机器总占用 7.7GB |
+| ctx 32768 | kv 1.14GB（Q8_0），总占用 8.56GB（50%）——256K 需 ~9GB KV，适配 32GB 机器 |
 | 质量说明 | 2-bit：短答连贯；上下文消歧有限（"transformer"答成电气变压器） |
 
 ## MoE（0.8B-MoE，社区 qwen35moe 变体）
