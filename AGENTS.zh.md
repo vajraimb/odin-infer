@@ -114,13 +114,14 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 - CPU + Metal 双路径已支持。Metal MoE：GPU router（moe_gemv_f32 +
   moe_softmax_topk，每层一次同步）、专家 GEMV 复用生产内核（张量基址+专家
   偏移）、moe_combine 加权求和；共享专家经 F32 上传走 moe_gemv_f32。
-  MOE_CPU=1 强制走 CPU。engine_forward_batch 对 MoE 模型走
-  forward_gpu_batch_moe：批量 router + top-k、每层一次同步，以及（Q4_K
-  up/gate + Q8_0/Q5_0 down 时）分组 GEMM——moe_up_mm_id_q4（每 (行,专家槽,
-  token) 一线程）、批量 swiglu、moe_down_mm_id_q80/q50（down+加权合并+门控
-  共享专家单内核）。每层 ~6 个 dispatch 替代 T*used*4；与逐 token 逐位一致
-  （max_abs 0.000000）。墙钟收益被机器后台负载掩盖，需单引擎驻留实测。
-  其他量化种类回退逐 token 分派。
+  MOE_CPU=1 强制走 CPU。MoE 批量 prefill（forward_gpu_batch_moe，分组
+  GEMM）在真 Metal 上与逐 token 发散（见"已知问题"），当前默认逐 token
+  Metal，MOE_BATCH=1 启用批量路径。
+- Metal IQ/k-quant GEMV 内核：gemv_q2_k/q3_k/q5_k/q8_k + 9 个 IQ 内核
+  （生产形状，codebook 以 MSL 常量内嵌）。Qwen3.8-27B 可 GPU 解码
+  （~0.4-1.3s/token）；ctx 8192 已验证（kv=1.07GB，总占用 8.5GB/49%）。
+- dense 批量 prefill（enc_mm）仅支持 Q4_K/Q6_K；model_batch_mm_ok 把关，
+  混合量化模型回退逐 token Metal（27B 的 IQ 批量 prefill 记为后续）。
 - 专家张量布局（已对真实 unsloth 35B-A3B 头部验证）：`ffn_gate_inp`
   [dim, n_expert]，`ffn_up_exps`/`ffn_gate_exps` [dim, n_ff_exp, n_expert]，
   `ffn_down_exps` [n_ff_exp, dim, n_expert]——ne0 是收缩维，量化粒度 = 一行
@@ -157,6 +158,11 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   0x10）。
 - 社区 MoE GGUF 逐层混合量化种类（0.8B-MoE 的 down_exps 在 Q8_0/Q5_0 间
   交替）——按张量 kind 分派，不要假设。
+- MSL 保留字：变量名 'half' 会让整个 shader 库编译失败、metal_init 静默回退
+  CPU（所有模型）——发布前必须跑 Metal 冒烟并 grep 'init failed'。
+- 已知问题：MoE 分组 GEMM 批量 prefill 在真 Metal 上与逐 token 发散
+  （max_abs ~9-17，层 0 即现；T%8 补尾修了一部分，注意力残差阶段 la.out
+  投影仍偏 ~30%）——默认禁用，MOE_BATCH=1 可开启调试。
 
 ## 验证清单（改动后自检）
 
