@@ -442,7 +442,11 @@ run_q3 :: proc(
 	path: string, temperature, topp: f32, rng_seed: u64, rep_penalty: f32,
 	think_on, multi_turn, tps, ttft, use_metal: bool, num_threads, max_ctx: int,
 ) {
-	engine, _ := infer.engine_load(path, infer.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
+	engine, load_ok := infer.engine_load(path, infer.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
+	if !load_ok {
+		fmt.eprintln("cli: engine_load failed")
+		os.exit(1)
+	}
 	defer infer.engine_destroy(&engine)
 
 	tok: tokenizer.Tokenizer
@@ -475,7 +479,11 @@ run_q35 :: proc(
 	load_kv_path, save_kv_path: string,
 	json_mode: bool,
 ) {
-	engine, _ := q35.engine_load(path, q35.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
+	engine, load_ok := q35.engine_load(path, q35.Engine_Opts{max_ctx = max_ctx, use_metal = use_metal, num_threads = num_threads})
+	if !load_ok {
+		fmt.eprintln("cli: engine_load failed")
+		os.exit(1)
+	}
 	defer q35.engine_destroy(&engine)
 
 	// Optional KV+SSM state restore.
