@@ -2577,10 +2577,17 @@ m_queue: ^MTL.CommandQueue
 g_fast_math: bool    // shader fast-math (env QFASTMATH=0 to disable for precision debugging)
 @(private = "file")
 g_timing: bool       // print per-prefill GPU ms (env QTIMING=1)
+when #config(ODIN_PROF, false) {
 @(private = "file")
 g_prof_nolin: bool   // ablation: skip linear-layer per-token stateful loop (env QPROF_NOLIN=1; output garbage, GPU time valid)
 @(private = "file")
 g_prof_nofull: bool  // ablation: skip full-attention per-token block (env QPROF_NOFULL=1)
+} else {
+@(private = "file")
+g_prof_nolin := false
+@(private = "file")
+g_prof_nofull := false
+}
 g_gemv3: bool       // use row-split v3 GEMV kernels (env QGEMV3=1)
 g_gemv2r: bool      // use 2-rows-per-lane GEMV kernels (env QGEMV2R=1)
 g_normfuse: bool    // fuse rmsnorm into GEMV dispatches (env QGEMVNORM=1)
@@ -3118,8 +3125,10 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// GPU ms. QPROF_NOLIN=1 -> ablation: skip linear-layer per-token stateful loop.
 	g_fast_math = os.get_env("QFASTMATH", context.temp_allocator) != "0"
 	g_timing = os.get_env("QTIMING", context.temp_allocator) == "1"
-	g_prof_nolin = os.get_env("QPROF_NOLIN", context.temp_allocator) == "1"
-	g_prof_nofull = os.get_env("QPROF_NOFULL", context.temp_allocator) == "1"
+	when #config(ODIN_PROF, false) {
+		g_prof_nolin = os.get_env("QPROF_NOLIN", context.temp_allocator) == "1"
+		g_prof_nofull = os.get_env("QPROF_NOFULL", context.temp_allocator) == "1"
+	}
 	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
@@ -4126,19 +4135,29 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 	x_slice := m_b_x->contentsAsSlice([]f32)
 	get_embedding_row(&w.token_embedding, token, dim, x_slice[:dim])
 
-	// ablation switches: read /tmp/qprof_flags per call so they can be toggled
-	// WITHOUT restart (comma-separated: noout, nomlp, nosmall)
-	prof: []u8
-	if data, ferr := os.read_entire_file("/tmp/qprof_flags", context.temp_allocator); ferr == os.ERROR_NONE {
-		prof = data
+	// ablation switches (ODIN_PROF builds only): read /tmp/qprof_flags per
+	// call so they can be toggled WITHOUT restart (comma-separated: noout,
+	// nomlp, nosmall). Release builds compile these to constant false.
+	when #config(ODIN_PROF, false) {
+		prof: []u8
+		if data, ferr := os.read_entire_file("/tmp/qprof_flags", context.temp_allocator); ferr == os.ERROR_NONE {
+			prof = data
+		}
+		prof_s := string(prof)
+		noout := strings.contains(prof_s, "noout")
+		nomlp := strings.contains(prof_s, "nomlp")
+		nosmall := strings.contains(prof_s, "nosmall")
+		nonorm := nosmall || strings.contains(prof_s, "nonorm")
+		noattn := nosmall || strings.contains(prof_s, "noattn")
+		nodelta := nosmall || strings.contains(prof_s, "nodelta")
+	} else {
+		noout := false
+		nomlp := false
+		nosmall := false
+		nonorm := false
+		noattn := false
+		nodelta := false
 	}
-	prof_s := string(prof)
-	noout := strings.contains(prof_s, "noout")
-	nomlp := strings.contains(prof_s, "nomlp")
-	nosmall := strings.contains(prof_s, "nosmall")
-	nonorm := nosmall || strings.contains(prof_s, "nonorm")
-	noattn := nosmall || strings.contains(prof_s, "noattn")
-	nodelta := nosmall || strings.contains(prof_s, "nodelta")
 
 	cmd := m_queue->commandBuffer()
 	enc := cmd->computeCommandEncoder()

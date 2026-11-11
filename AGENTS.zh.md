@@ -99,8 +99,12 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
    sampler/tokenizer），见 build.sh 的 COLLECTIONS。
 5. **内核 A/B 开关**（env，默认全关，均为实测回归项）：`QGEMV3=1`
    （llama.cpp 行切块移植）、`QGEMV2R=1`（2 行/线程）、`QGEMVNORM=1`
-   （norm 融合）。消融开关：写 `/tmp/qprof_flags`（noout/nomlp/nosmall/
-   nonorm/noattn/nodelta），每 token 读一次，免重启。
+   （norm 融合）。
+6. **Profiling/消融构建**（`when #config(ODIN_PROF, false)`）：QPROF_NOLIN/
+   QPROF_NOFULL 环境开关与 `/tmp/qprof_flags` 免重启切换文件（noout/nomlp/
+   nosmall/nonorm/noattn/nodelta，每 token 读一次）只存在于
+   `-define:ODIN_PROF=true` 构建——发布二进制零消融代码（strings 已验证）。
+   测性能时用 profiling 构建；不要依赖这些开关在发布版生效。
 6. **调优缓存**：`~/.odin-infer/<model>.tune`（`ODIN_TUNE_DIR` 覆盖，
    `ODIN_TUNE=0` 关闭）；改了内核性能特征后删除缓存强制重测。
 7. **KV 持久化**：`KV_PERSIST=0` 关闭，`KV_PERSIST_DIR` 改目录；跨 max-ctx
