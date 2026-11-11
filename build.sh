@@ -21,6 +21,15 @@ echo "== unit tests: packages/qwen3_5 =="
 echo "== unit tests: packages/tokenizer =="
 ( cd packages/tokenizer && odin test . -define:ODIN_TEST_THREADS=1 )
 
+# Metal shader smoke test (no model needed): compile the MSL library, build a
+# pipeline for every kernel, check every make_pso() name resolves. Catches the
+# v0.2.0-class bug where the shader library failed to compile and every model
+# silently ran on CPU. Skip with SKIP_METAL_SMOKE=1 (e.g. headless non-Metal hosts).
+if [[ "$(uname -s)" == "Darwin" && "${SKIP_METAL_SMOKE:-0}" != "1" ]]; then
+  echo "== metal_smoke: packages/qwen3_5 shaders =="
+  odin run tools/metal_smoke.odin -file -out:/tmp/odinfer-metal-smoke "${COLLECTIONS[@]}"
+fi
+
 echo ""
 # MoE (qwen35moe) end-to-end validation: synthetic GGUF + Python reference
 if command -v python3 >/dev/null 2>&1; then
