@@ -118,7 +118,9 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   GEMM）自 v0.3.0 起为默认 Metal 路径（三处叠加 bug 已修，与逐 token
   max_abs 8e-4），MOE_BATCH=0 退回逐 token 做 A/B。
 - Metal IQ/k-quant GEMV 内核：gemv_q2_k/q3_k/q5_k/q8_k + 9 个 IQ 内核
-  （生产形状，codebook 以 MSL 常量内嵌）。Qwen3.8-27B 可 GPU 解码
+  （生产形状）。codebook 表在 packages/qwen3_5/msl_tables.odin，由
+  tools/gen_msl_tables.py 从 packages/ggml/tables.odin 生成（唯一事实源）；
+  build.sh 自动重生成，CI 用 --check 防漂移。不要手改 msl_tables.odin。Qwen3.8-27B 可 GPU 解码
   （~0.4-1.3s/token）；ctx 8192 已验证（Q8_0 KV 0.27GB，总占用 7.7GB），
   ctx 32768 kv 1.14GB（总占用 8.56GB）。
 - KV 缓存默认 Q8_0 量化（KV_Q8=0 退回旧 f16 Metal 路径）。对称量化
