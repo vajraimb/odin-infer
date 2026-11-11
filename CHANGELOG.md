@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Load-time Metal shader specialization: per-model constants baked into the
+  MSL prelude (QCONST=0 for legacy A/B). 27B decode −0.8% (best −2.5%);
+  9B flat (MLP-bound). QPROF ablation switches now compile-time only
+  (#config ODIN_PROF) — release binaries contain zero profiling code.
+- MSL codebook tables generated from tables.odin (gen_msl_tables.py;
+  CI --check).
 - Q8_0 KV cache is now the default (~1.88x smaller than f16, 3.76x vs f32):
   Qwen3.8-27B ctx 8192 KV 0.27 GB, ctx 32768 1.14 GB. `.oikv` bumped to v2
   (on-disk body stays f32; v1 files are refused). KV_Q8=0 restores f16 KV.

@@ -2566,7 +2566,471 @@ kernel void moe_softmax_topk_b(device const float *logits [[buffer(0)]],
     if (wsum < 6.103515625e-5) wsum = 6.103515625e-5;
     for (uint i = 0; i < k; i++) weights[(ulong)t * k + i] /= wsum;
 }
+
+// ============ Tier 3 load-time-specialized kernels (QCONST_ON) ============
+// Per-model constants come from the prelude generated at metal_init; the GPU
+// compiler fully unrolls the size-bounded loops and folds bounds branches.
+// Legacy runtime-param kernels above stay for QCONST=0 A/B.
+#ifdef QCONST_ON
+
+kernel void rmsnorm_c(device const float *inp [[buffer(0)]], device float *outp [[buffer(1)]],
+    device const float *w [[buffer(2)]],
+    uint grp [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    device const float *xi = inp + (ulong)grp * DIM; device float *oi = outp + (ulong)grp * DIM;
+    float ss = 0.0; for (uint j = tid; j < DIM; j += 32) ss += xi[j] * xi[j];
+    ss = simd_sum(ss); ss = ss / (float)DIM + RMS_EPS; ss = rsqrt(ss);
+    for (uint j = tid; j < DIM; j += 32) oi[j] = w[j] * (ss * xi[j]);
+}
+
+// Per-kv-head contiguous rmsnorm (k_norm): same as rmsnorm_c but sized HEAD_DIM.
+kernel void rmsnorm_hd_c(device const float *inp [[buffer(0)]], device float *outp [[buffer(1)]],
+    device const float *w [[buffer(2)]],
+    uint grp [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    device const float *xi = inp + (ulong)grp * HEAD_DIM; device float *oi = outp + (ulong)grp * HEAD_DIM;
+    float ss = 0.0; for (uint j = tid; j < HEAD_DIM; j += 32) ss += xi[j] * xi[j];
+    ss = simd_sum(ss); ss = ss / (float)HEAD_DIM + RMS_EPS; ss = rsqrt(ss);
+    for (uint j = tid; j < HEAD_DIM; j += 32) oi[j] = w[j] * (ss * xi[j]);
+}
+
+// Partial-rotary MRoPE with baked HEAD_DIM/ROTARY_DIM/ROPE_FREQ; pos stays runtime.
+kernel void rope_partial_c(device float *vec [[buffer(0)]], constant uint &pos [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint half_r = ROTARY_DIM / 2; uint h = gid / half_r; uint i = gid % half_r;
+    device float *q = vec + (ulong)h * HEAD_DIM;
+    float freq = 1.0 / pow(ROPE_FREQ, (float)i / (float)half_r);
+    float c = cos((float)pos * freq), s = sin((float)pos * freq);
+    float x0 = q[i], y0 = q[i + half_r];
+    q[i] = x0 * c - y0 * s; q[i + half_r] = x0 * s + y0 * c;
+}
+
+// Extract q (first HEAD_DIM of each HEAD_DIM*2 block of qproj) and per-head RMSNorm it.
+kernel void qnorm_extract_c(device const float *qproj [[buffer(0)]], device float *q [[buffer(1)]],
+    device const float *qn [[buffer(2)]],
+    uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint n = HEAD_DIM; device const float *src = qproj + (ulong)h * (2 * n); device float *dst = q + (ulong)h * n;
+    float ss = 0.0; for (uint j = tid; j < n; j += 32) ss += src[j] * src[j];
+    ss = simd_sum(ss); ss = ss / (float)n + RMS_EPS; ss = rsqrt(ss);
+    for (uint j = tid; j < n; j += 32) dst[j] = qn[j] * (ss * src[j]);
+}
+
+// Norm-fused GEMVs: eps is the per-model RMS_EPS; n/d stay runtime (per-tensor).
+kernel void gemv_q4_k_norm_c(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    device const float *wn [[buffer(4)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float red[256];
+    float ss = 0.0;
+    for (uint j = tid; j < dim.n; j += 256) { float v = x[j]; ss += v * v; }
+    red[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint sh = 128; sh > 0; sh >>= 1) {
+        if (tid < sh) { red[tid] += red[tid + sh]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms = rsqrt(red[0] / (float)dim.n + RMS_EPS);
+
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 144;
+        float slo = 0.0, shi = 0.0;
+        for (uint sb = lane; sb < nsb; sb += GEMV_SG) { device const uchar *blk = wr + sb * 144;
+            float dall = (float)(*(device const half*)blk); float dmin = (float)(*(device const half*)(blk + 2));
+            device const uchar *scales = blk + 4; device const uchar *qs = blk + 16; uint ybase = sb * 256; int is = 0; uint qoff = 0;
+            for (uint j = 0; j < 256; j += 64) { uchar sc, m; get_scale_min_k4(is + 0, scales, sc, m); float d1 = dall * sc, m1 = dmin * m;
+                get_scale_min_k4(is + 1, scales, sc, m); float d2 = dall * sc, m2 = dmin * m;
+                for (uint l = 0; l < 32; l += 4) {
+                    float4 wl = float4((float)(qs[qoff+l]&0xF),(float)(qs[qoff+l+1]&0xF),(float)(qs[qoff+l+2]&0xF),(float)(qs[qoff+l+3]&0xF));
+                    float4 wh = float4((float)(qs[qoff+l]>>4),(float)(qs[qoff+l+1]>>4),(float)(qs[qoff+l+2]>>4),(float)(qs[qoff+l+3]>>4));
+                    float4 xl = float4(x[ybase+j+l]*wn[ybase+j+l]*rms, x[ybase+j+l+1]*wn[ybase+j+l+1]*rms, x[ybase+j+l+2]*wn[ybase+j+l+2]*rms, x[ybase+j+l+3]*wn[ybase+j+l+3]*rms);
+                    float4 xh = float4(x[ybase+j+32+l]*wn[ybase+j+32+l]*rms, x[ybase+j+32+l+1]*wn[ybase+j+32+l+1]*rms, x[ybase+j+32+l+2]*wn[ybase+j+32+l+2]*rms, x[ybase+j+32+l+3]*wn[ybase+j+32+l+3]*rms);
+                    slo += dot(wl * d1 - m1, xl);
+                    shi += dot(wh * d2 - m2, xh);
+                }
+                qoff += 32; is += 2; } }
+        sum = slo + shi; }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+kernel void gemv_q6_k_norm_c(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],
+    device float *out [[buffer(2)]], constant Dims &dim [[buffer(3)]],
+    device const float *wn [[buffer(4)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float red[256];
+    float ss = 0.0;
+    for (uint j = tid; j < dim.n; j += 256) { float v = x[j]; ss += v * v; }
+    red[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint sh = 128; sh > 0; sh >>= 1) {
+        if (tid < sh) { red[tid] += red[tid + sh]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms = rsqrt(red[0] / (float)dim.n + RMS_EPS);
+
+    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    if (row < dim.d) { uint nsb = dim.n / 256; device const uchar *wr = wb + (ulong)row * nsb * 210;
+        for (uint sb = lane; sb < nsb; sb += GEMV_SG) {
+            float2 acc = dot_q6_superblock2n(wr + sb * 210, x, wn, rms, sb * 256);
+            sum += acc.x + acc.y; } }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0 && row < dim.d) out[row] = sum;
+}
+
+struct StorePC { uint seq_len; uint pos; };
+kernel void store_kv_c(device const float *ktmp [[buffer(0)]], device const float *vtmp [[buffer(1)]],
+    device half *kc [[buffer(2)]], device half *vc [[buffer(3)]], constant StorePC &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint kvh = gid / HEAD_DIM, i = gid % HEAD_DIM;
+    ulong dst = ((ulong)kvh * P.seq_len + P.pos) * HEAD_DIM + i;
+    kc[dst] = (half)ktmp[gid]; vc[dst] = (half)vtmp[gid];
+}
+
+struct AttnPC { uint seq_len; uint pos; };
+kernel void attention_c(device const float *q [[buffer(0)]], device const half *kc [[buffer(1)]],
+    device const half *vc [[buffer(2)]], device float *xb3 [[buffer(3)]], constant AttnPC &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    device const float *qh = q + (ulong)h * HEAD_DIM; uint kvh = h / KV_MUL;
+    device const half *kbase = kc + (ulong)kvh * P.seq_len * HEAD_DIM;
+    device const half *vbase = vc + (ulong)kvh * P.seq_len * HEAD_DIM;
+    float scale = rsqrt((float)HEAD_DIM); uint n = P.pos + 1;
+    for (uint t = tid; t < n; t += NT) { device const half *k = kbase + (ulong)t * HEAD_DIM;
+        float s = 0.0; for (uint i = 0; i < HEAD_DIM; ++i) s += qh[i] * (float)k[i]; scores[t] = s * scale; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint t = tid; t < n; t += NT) lm = max(lm, scores[t]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint t = tid; t < n; t += NT) { float e = exp(scores[t] - m); scores[t] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < HEAD_DIM; i += NT) { float acc = 0.0;
+        for (uint t = 0; t < n; ++t) acc += scores[t] * (float)vbase[(ulong)t * HEAD_DIM + i];
+        xb3[(ulong)h * HEAD_DIM + i] = acc * inv; }
+}
+
+struct Q8StorePC { uint pos; };
+kernel void store_kv_q8_c(device const float *ktmp [[buffer(0)]], device const float *vtmp [[buffer(1)]],
+    device uchar *kc [[buffer(2)]], device uchar *vc [[buffer(3)]], constant Q8StorePC &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    device const float *k32 = ktmp + (ulong)gid * 32;
+    device const float *v32 = vtmp + (ulong)gid * 32;
+    float kamax = 0.0, vamax = 0.0;
+    for (uint j = 0; j < 32; ++j) {
+        kamax = max(kamax, fabs(k32[j]));
+        vamax = max(vamax, fabs(v32[j]));
+    }
+    float kd = kamax / 127.0, vd = vamax / 127.0;
+    float kid = kd != 0.0 ? 1.0/kd : 0.0, vid = vd != 0.0 ? 1.0/vd : 0.0;
+    device uchar *kb = kc + (ulong)P.pos * KV_POS_BYTES + (ulong)gid * 34;
+    device uchar *vb = vc + (ulong)P.pos * KV_POS_BYTES + (ulong)gid * 34;
+    *(device half*)(kb) = (half)kd;
+    *(device half*)(vb) = (half)vd;
+    device char *kq = (device char*)(kb + 2);
+    device char *vq = (device char*)(vb + 2);
+    for (uint j = 0; j < 32; ++j) {
+        kq[j] = (char)round(k32[j] * kid);
+        vq[j] = (char)round(v32[j] * vid);
+    }
+}
+
+struct Q8AttnPC { uint pos; };
+kernel void attention_q8_c(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+    device const uchar *vc [[buffer(2)]], device float *xb3 [[buffer(3)]], constant Q8AttnPC &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    uint nb = HEAD_DIM / 32;          // 32-element blocks per head
+    uint kvh = h / KV_MUL;
+    uint hb = kvh * nb;               // first block index of head kvh within a position
+    device const float *qh = q + (ulong)h * HEAD_DIM;
+    float scale = rsqrt((float)HEAD_DIM); uint n = P.pos + 1;
+    for (uint t = tid; t < n; t += NT) {
+        device const uchar *kb = kc + (ulong)t * KV_POS_BYTES + (ulong)hb * 34;
+        float s = 0.0;
+        for (uint b = 0; b < nb; ++b) {
+            device const uchar *bb = kb + (ulong)b * 34;
+            float d = (float)(*(device const half*)bb);
+            device const char *qs = (device const char*)(bb + 2);
+            for (uint j = 0; j < 32; ++j) s += qh[b*32+j] * (d * (float)qs[j]);
+        }
+        scores[t] = s * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint t = tid; t < n; t += NT) lm = max(lm, scores[t]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint t = tid; t < n; t += NT) { float e = exp(scores[t] - m); scores[t] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < HEAD_DIM; i += NT) {
+        uint bb = (kvh * HEAD_DIM + i) / 32;
+        uint jj = (kvh * HEAD_DIM + i) - bb * 32;
+        float acc = 0.0;
+        for (uint t = 0; t < n; ++t) {
+            device const uchar *vb = vc + (ulong)t * KV_POS_BYTES + (ulong)bb * 34;
+            float d = (float)(*(device const half*)vb);
+            device const char *qs = (device const char*)(vb + 2);
+            acc += scores[t] * (d * (float)qs[jj]);
+        }
+        xb3[(ulong)h * HEAD_DIM + i] = acc * inv;
+    }
+}
+
+kernel void attn_gate_c(device float *xb3 [[buffer(0)]], device const float *qproj [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint n = HEAD_DIM; uint h = gid / n, i = gid % n;
+    float g = qproj[(ulong)h * (2 * n) + n + i];
+    g = 1.0 / (1.0 + exp(-g));
+    xb3[(ulong)h * n + i] *= g;
+}
+
+// Depthwise causal conv1d single-token update + silu with baked CONV_KERNEL.
+kernel void conv1d_step_silu_c(device float *qkv_out [[buffer(0)]], device const float *qkv_in [[buffer(1)]],
+    device float *conv_state [[buffer(2)]], device const float *weight [[buffer(3)]],
+    uint c [[thread_position_in_grid]]) {
+    uint k = CONV_KERNEL, km1 = k - 1;
+    float acc = weight[c * k + km1] * qkv_in[c];
+    for (uint i = 0; i < km1; ++i) acc += weight[c * k + i] * conv_state[c * km1 + i];
+    qkv_out[c] = acc / (1.0 + exp(-acc));
+    for (uint i = 0; i + 1 < km1; ++i) conv_state[c * km1 + i] = conv_state[c * km1 + i + 1];
+    conv_state[c * km1 + km1 - 1] = qkv_in[c];
+}
+
+// Batched depthwise causal conv1d + silu over T tokens (T stays runtime).
+kernel void conv1d_batch_silu_c(
+    device const float * x [[buffer(0)]], device float * out [[buffer(1)]],
+    device const float * conv_state [[buffer(2)]], device const float * weight [[buffer(3)]],
+    constant uint & T [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    uint k = CONV_KERNEL, km1 = k - 1;
+    if (gid >= T * CONV_DIM) return;
+    uint t = gid / CONV_DIM, c = gid - t * CONV_DIM;
+    device const float * wc = weight + c * k;
+    // Match conv1d_step_silu's summation order EXACTLY (current tap first, then
+    // history oldest->newest) so the batched output is bit-identical to per-token.
+    float acc = wc[km1] * x[t * CONV_DIM + c];          // i = km1 (current input)
+    for (uint i = 0; i < km1; i++) {                      // i = 0..km1-1 (history, oldest->newest)
+        int si = int(t) - int(km1) + int(i);
+        float xv = (si < 0) ? conv_state[(uint)c * km1 + uint(si + int(km1))] : x[uint(si) * CONV_DIM + c];
+        acc += wc[i] * xv;
+    }
+    out[gid] = acc / (1.0f + exp(-acc));
+}
+
+kernel void conv1d_update_state_c(
+    device const float * x [[buffer(0)]], device float * conv_state [[buffer(1)]],
+    constant uint & T [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    uint km1 = CONV_KERNEL - 1;
+    if (gid >= CONV_DIM * km1) return;
+    uint c = gid / km1, i = gid - c * km1;
+    conv_state[gid] = x[(T - km1 + i) * CONV_DIM + c];
+}
+
+// Per key-head l2norm + scale with baked HEAD_K_DIM / L2_SCALE.
+kernel void l2norm_scale_c(device float *q_out [[buffer(0)]], device float *k_out [[buffer(1)]],
+    device const float *q_in [[buffer(2)]], device const float *k_in [[buffer(3)]],
+    uint kh [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint n = HEAD_K_DIM;
+    device const float *qi = q_in + (ulong)kh * n; device const float *ki = k_in + (ulong)kh * n;
+    device float *qo = q_out + (ulong)kh * n; device float *ko = k_out + (ulong)kh * n;
+    float sq = 0.0, sk = 0.0;
+    for (uint j = tid; j < n; j += 32) { sq += qi[j] * qi[j]; sk += ki[j] * ki[j]; }
+    sq = simd_sum(sq); sk = simd_sum(sk);
+    float iq = 1.0 / max(sqrt(sq), 1e-6f), ik = 1.0 / max(sqrt(sk), 1e-6f);
+    for (uint j = tid; j < n; j += 32) { qo[j] = qi[j] * iq * L2_SCALE; ko[j] = ki[j] * ik; }
+}
+
+// Gated delta-rule recurrent step with baked HEAD_K_DIM / HEAD_V_DIM / N_KH.
+kernel void delta_recurrent_c(device float *out [[buffer(0)]], device float *state_all [[buffer(1)]],
+    device const float *q_lin [[buffer(2)]], device const float *k_lin [[buffer(3)]],
+    device const float *v_vec [[buffer(4)]], device const float *b_vec [[buffer(5)]],
+    device const float *a_vec [[buffer(6)]], device const float *a_decay [[buffer(7)]],
+    device const float *dt_bias [[buffer(8)]],
+    uint vh [[threadgroup_position_in_grid]], uint j [[thread_position_in_threadgroup]]) {
+    uint hkd = HEAD_K_DIM, hvd = HEAD_V_DIM;
+    uint kh = vh % N_KH;
+    device float *state = state_all + (ulong)vh * hkd * hvd;
+    device const float *qt = q_lin + (ulong)kh * hkd;
+    device const float *kt = k_lin + (ulong)kh * hkd;
+    device const float *vt = v_vec + (ulong)vh * hvd;
+    // per-head scalars (identical across the threadgroup)
+    float bv = b_vec[vh], av = a_vec[vh], a_dec = a_decay[vh], dtb = dt_bias[vh];
+    float beta = 1.0 / (1.0 + exp(-bv));
+    float sp = av + dtb;
+    float softplus = sp > 20.0 ? sp : (sp < -20.0 ? 0.0 : log(1.0 + exp(sp)));
+    float g_decay = exp(a_dec * softplus); // a_dec = -exp(A_log)
+    if (j >= hvd) return;
+    // decay
+    for (uint i = 0; i < hkd; ++i) state[(ulong)i * hvd + j] *= g_decay;
+    // kv_mem + delta
+    float kv_mem = 0.0; for (uint i = 0; i < hkd; ++i) kv_mem += state[(ulong)i * hvd + j] * kt[i];
+    float delta = (vt[j] - kv_mem) * beta;
+    // state update
+    for (uint i = 0; i < hkd; ++i) state[(ulong)i * hvd + j] += kt[i] * delta;
+    // output readout
+    float o = 0.0; for (uint i = 0; i < hkd; ++i) o += state[(ulong)i * hvd + j] * qt[i];
+    out[(ulong)vh * hvd + j] = o;
+}
+
+// RMSNormGated with baked HEAD_V_DIM / RMS_EPS.
+kernel void rmsnorm_gated_c(device float *out [[buffer(0)]], device const float *inp [[buffer(1)]],
+    device const float *weight [[buffer(2)]], device const float *gate [[buffer(3)]],
+    uint vh [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint n = HEAD_V_DIM;
+    device const float *xi = inp + (ulong)vh * n; device float *oi = out + (ulong)vh * n;
+    device const float *zi = gate + (ulong)vh * n;
+    float ss = 0.0; for (uint j = tid; j < n; j += 32) ss += xi[j] * xi[j];
+    ss = simd_sum(ss); ss = ss / (float)n + RMS_EPS; ss = rsqrt(ss);
+    for (uint j = tid; j < n; j += 32) {
+        float normed = weight[j] * (ss * xi[j]);
+        float gz = zi[j] * (1.0 / (1.0 + exp(-zi[j]))); // silu(z) = z*sigmoid(z)
+        oi[j] = normed * gz;
+    }
+}
+
+// Batched l2norm+scale over [T tokens x N_KH key-heads] with baked dims.
+kernel void l2norm_scale_batch_c(
+    device float * q_out [[buffer(0)]], device float * k_out [[buffer(1)]],
+    device const float * qkv [[buffer(2)]],
+    uint g [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint hkd = HEAD_K_DIM;
+    uint kh = g % N_KH;
+    uint tok = g / N_KH;
+    device const float *qi = qkv + (ulong)tok * CONV_DIM + (ulong)kh * hkd;
+    device const float *ki = qkv + (ulong)tok * CONV_DIM + (ulong)KEY_DIM + (ulong)kh * hkd;
+    device float *qo = q_out + (ulong)tok * KEY_DIM + (ulong)kh * hkd;
+    device float *ko = k_out + (ulong)tok * KEY_DIM + (ulong)kh * hkd;
+    float sq = 0.0, sk = 0.0;
+    for (uint j = tid; j < hkd; j += 32) { sq += qi[j]*qi[j]; sk += ki[j]*ki[j]; }
+    sq = simd_sum(sq); sk = simd_sum(sk);
+    float iq = 1.0/max(sqrt(sq), 1e-6f)*L2_SCALE, ik = 1.0/max(sqrt(sk), 1e-6f);
+    for (uint j = tid; j < hkd; j += 32) { qo[j] = qi[j]*iq; ko[j] = ki[j]*ik; }
+}
+
+// Batched RMSNormGated over [T tokens x N_VH value-heads] with baked dims.
+kernel void rmsnorm_gated_batch_c(
+    device float * out [[buffer(0)]], device const float * inp [[buffer(1)]],
+    device const float * weight [[buffer(2)]], device const float * gate [[buffer(3)]],
+    uint g [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    uint n = HEAD_V_DIM;
+    device const float *xi = inp + (ulong)g * n; device float *oi = out + (ulong)g * n;
+    device const float *zi = gate + (ulong)g * n;
+    float ss = 0.0; for (uint j = tid; j < n; j += 32) ss += xi[j]*xi[j];
+    ss = simd_sum(ss); ss = ss/(float)n + RMS_EPS; ss = rsqrt(ss);
+    for (uint j = tid; j < n; j += 32) {
+        float normed = weight[j]*(ss*xi[j]);
+        float gz = zi[j]*(1.0/(1.0+exp(-zi[j])));
+        oi[j] = normed*gz;
+    }
+}
+
+// Engine chunked gated-delta with baked HKD/HVD/KEY_DIM/CONV_DIM/VALUE_DIM/N_VH/N_KH;
+// C, chunk_start and slot stay runtime.
+struct ChunkPC { uint C; uint chunk_start; uint slot; };
+kernel void chunked_delta_c(
+    device const float * qlin [[buffer(0)]], device const float * klin [[buffer(1)]],
+    device const float * qkv2 [[buffer(2)]], device const float * bt [[buffer(3)]],
+    device const float * at [[buffer(4)]], device const float * a_decay [[buffer(5)]],
+    device const float * dt_bias [[buffer(6)]], device float * rec_states [[buffer(7)]],
+    device float * lout [[buffer(8)]], constant ChunkPC & P [[buffer(9)]],
+    uint vh [[threadgroup_position_in_grid]], uint vc [[thread_position_in_threadgroup]]) {
+    const uint hkd=HEAD_K_DIM, hvd=HEAD_V_DIM, C=P.C;
+    const uint kh = vh % N_KH, cs = P.chunk_start;
+    device float * S = rec_states + (ulong)P.slot * N_VH * hkd * hvd + (ulong)vh * hkd * hvd;
+    threadgroup float KKT[256]; threadgroup float KQT[256];
+    for (uint idx = vc; idx < C*C; idx += hvd) {
+        uint t = idx/C, i = idx - t*C;
+        device const float * ki = klin + (ulong)(cs+i)*KEY_DIM + (ulong)kh*hkd;
+        device const float * kt = klin + (ulong)(cs+t)*KEY_DIM + (ulong)kh*hkd;
+        device const float * qt = qlin + (ulong)(cs+t)*KEY_DIM + (ulong)kh*hkd;
+        float dk=0, dq=0;
+        for (uint a=0;a<hkd;a++){ dk+=ki[a]*kt[a]; dq+=ki[a]*qt[a]; }
+        KKT[idx]=dk; KQT[idx]=dq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (vc >= hvd) return;
+    float beta[16], cp[16];
+    float a_dec = a_decay[vh], dtb = dt_bias[vh];
+    for (uint t=0;t<C;t++) {
+        float bv = bt[(ulong)(cs+t)*N_VH + vh];
+        float av = at[(ulong)(cs+t)*N_VH + vh];
+        beta[t] = 1.0f/(1.0f+exp(-bv));
+        float sp = av + dtb;
+        float softplus = sp > 20.0f ? sp : (sp < -20.0f ? 0.0f : log(1.0f+exp(sp)));
+        cp[t] = (t==0) ? exp(a_dec*softplus) : cp[t-1]*exp(a_dec*softplus);
+    }
+    float delta[16];
+    for (uint t=0;t<C;t++) {
+        device const float * kt = klin + (ulong)(cs+t)*KEY_DIM + (ulong)kh*hkd;
+        float sik=0; for (uint a=0;a<hkd;a++) sik += S[a*hvd+vc]*kt[a];
+        float vval = qkv2[(ulong)(cs+t)*CONV_DIM + 2ull*KEY_DIM + (ulong)vh*hvd + vc];
+        float d = beta[t]*vval - beta[t]*cp[t]*sik;
+        for (uint i=0;i<t;i++){ float L = beta[t]*(cp[t]/cp[i])*KKT[t*C+i]; d -= L*delta[i]; }
+        delta[t]=d;
+        device const float * qt = qlin + (ulong)(cs+t)*KEY_DIM + (ulong)kh*hkd;
+        float siq=0; for (uint a=0;a<hkd;a++) siq += S[a*hvd+vc]*qt[a];
+        float o = cp[t]*siq;
+        for (uint i=0;i<=t;i++){ float pfac = (i<t)?cp[t]/cp[i]:1.0f; o += pfac*KQT[t*C+i]*delta[i]; }
+        lout[(ulong)(cs+t)*VALUE_DIM + (ulong)vh*hvd + vc] = o;
+    }
+    float cpC = cp[C-1];
+    for (uint a=0;a<hkd;a++){
+        float s = cpC*S[a*hvd+vc];
+        for (uint i=0;i<C;i++) s += (cpC/cp[i])*klin[(ulong)(cs+i)*KEY_DIM+(ulong)kh*hkd+a]*delta[i];
+        S[a*hvd+vc] = s;
+    }
+}
+
+#endif // QCONST_ON
 `
+
+// msl_prelude generates per-model `constant` declarations baked into the MSL
+// source at library-compile time (Tier 3 load-time specialization). The Metal
+// library is compiled once per model load, so per-model values become compile-
+// time constants: the GPU compiler can fully unroll the size-bounded loops and
+// fold bounds branches. QCONST=0 skips this prelude and builds the plain
+// MSL_SRC (legacy runtime-param kernels; the specialized *_c kernels are
+// compiled out via #ifdef QCONST_ON) for A/B.
+msl_prelude :: proc(c: Config) -> string {
+	kv_dim := c.n_kv_heads * c.head_dim
+	key_dim := c.lin_n_k_heads * c.lin_head_k_dim
+	value_dim := c.lin_n_v_heads * c.lin_head_v_dim
+	conv_dim := key_dim * 2 + value_dim
+	kv_mul := c.n_heads / c.n_kv_heads
+	kv_pos_bytes := (kv_dim / QK8_0) * Q8_0_BLOCK_BYTES
+	l2_scale: f32 = 1.0 / math.sqrt_f32(f32(c.lin_head_k_dim))
+	return strings.concatenate([]string{
+		"// ---- Tier 3 per-model constants (generated at metal_init; QCONST=0 omits this) ----\n",
+		"#define QCONST_ON 1\n",
+		fmt.tprintf("constant uint DIM = {};\n", c.dim),
+		fmt.tprintf("constant uint HIDDEN_DIM = {};\n", c.hidden_dim),
+		fmt.tprintf("constant uint N_LAYERS = {};\n", c.n_layers),
+		fmt.tprintf("constant uint N_HEADS = {};\n", c.n_heads),
+		fmt.tprintf("constant uint KV_HEADS = {};\n", c.n_kv_heads),
+		fmt.tprintf("constant uint KV_MUL = {};\n", kv_mul),
+		fmt.tprintf("constant uint KV_DIM = {};\n", kv_dim),
+		fmt.tprintf("constant uint HEAD_DIM = {};\n", c.head_dim),
+		fmt.tprintf("constant uint ROTARY_DIM = {};\n", c.rotary_dim),
+		fmt.tprintf("constant float ROPE_FREQ = {}f;\n", c.rope_theta),
+		fmt.tprintf("constant float RMS_EPS = {}f;\n", c.rms_eps),
+		fmt.tprintf("constant uint KEY_DIM = {};\n", key_dim),
+		fmt.tprintf("constant uint VALUE_DIM = {};\n", value_dim),
+		fmt.tprintf("constant uint CONV_DIM = {};\n", conv_dim),
+		fmt.tprintf("constant uint N_VH = {};\n", c.lin_n_v_heads),
+		fmt.tprintf("constant uint N_KH = {};\n", c.lin_n_k_heads),
+		fmt.tprintf("constant uint HEAD_K_DIM = {};\n", c.lin_head_k_dim),
+		fmt.tprintf("constant uint HEAD_V_DIM = {};\n", c.lin_head_v_dim),
+		fmt.tprintf("constant uint CONV_KERNEL = {};\n", c.lin_conv_kernel),
+		fmt.tprintf("constant float L2_SCALE = {}f;\n", l2_scale),
+		fmt.tprintf("constant uint KV_POS_BYTES = {};\n", kv_pos_bytes),
+	}, context.temp_allocator)
+}
 
 // ---------- metal state ----------
 @(private = "file")
@@ -2591,6 +3055,11 @@ g_prof_nofull := false
 g_gemv3: bool       // use row-split v3 GEMV kernels (env QGEMV3=1)
 g_gemv2r: bool      // use 2-rows-per-lane GEMV kernels (env QGEMV2R=1)
 g_normfuse: bool    // fuse rmsnorm into GEMV dispatches (env QGEMVNORM=1)
+g_qconst: bool      // Tier 3 per-model constants in MSL (env QCONST=0 for legacy A/B)
+g_qc_a, g_qc_b, g_qc_c, g_qc_d: bool // which kernel groups are specialized (QCONST=1 -> all; QCONST=a/ab/abc -> staged)
+// config values mirrored for the Tier 3 dispatch (fail-fast size checks)
+@(private = "file")
+g_cdim, g_chead_dim: int
 
 // ---- first-run GEMV kernel autotuning (ODIN_TUNE=0 disables) ----
 Tune_Cand :: enum { Prod, R2, V3, O }
@@ -2635,6 +3104,20 @@ m_pso_iq3xxs_mm, m_pso_iq3s_mm, m_pso_iq4xs_mm, m_pso_q2k_mm, m_pso_q3k_mm, m_ps
 m_pso_conv_batch, m_pso_conv_update: ^MTL.ComputePipelineState // Stage 2 batched conv1d
 @(private = "file")
 m_pso_l2norm_batch, m_pso_rmsgated_batch, m_pso_chunked_delta: ^MTL.ComputePipelineState // Stage 2 chunked delta
+
+// ---- Tier 3 load-time-specialized PSOs (QCONST_ON kernels; nil in QCONST=0) ----
+@(private = "file")
+m_pso_rmsnorm_c, m_pso_rmsnorm_hd_c, m_pso_rope_c, m_pso_qnorm_c: ^MTL.ComputePipelineState
+@(private = "file")
+m_pso_q4_knorm_c, m_pso_q6_knorm_c: ^MTL.ComputePipelineState
+@(private = "file")
+m_pso_store_kv_c, m_pso_attn_c, m_pso_attn_gate_c, m_pso_store_kv_q8_c, m_pso_attn_q8_c: ^MTL.ComputePipelineState
+@(private = "file")
+m_pso_conv_c, m_pso_l2norm_c, m_pso_delta_c, m_pso_rmsgated_c: ^MTL.ComputePipelineState
+@(private = "file")
+m_pso_conv_batch_c, m_pso_conv_update_c: ^MTL.ComputePipelineState
+@(private = "file")
+m_pso_l2norm_batch_c, m_pso_rmsgated_batch_c, m_pso_chunked_delta_c: ^MTL.ComputePipelineState
 
 // activation buffers
 @(private = "file")
@@ -3060,24 +3543,40 @@ metal_shader_selftest :: proc(allocator := context.allocator) -> (names: []strin
 
 	out := make([dynamic]string, 0, 128, allocator)
 	ok = true
+	// Tier 3: compile BOTH sources — the specialized build (QCONST=1) and the
+	// legacy build (QCONST=0, plain MSL_SRC). No model file is available here,
+	// so the specialized build uses a representative Qwen3.5-class config; a
+	// broken constant kills one of the two builds.
+	scfg := Config{
+		dim = 4096, hidden_dim = 12288, n_layers = 32,
+		n_heads = 16, n_kv_heads = 4, head_dim = 256,
+		rotary_dim = 64, rope_theta = 10_000_000,
+		rms_eps = 1e-6,
+		lin_n_k_heads = 16, lin_n_v_heads = 32,
+		lin_head_k_dim = 128, lin_head_v_dim = 128,
+		lin_conv_kernel = 4,
+	}
+	sources := [2]string{strings.concatenate({msl_prelude(scfg), MSL_SRC}, allocator), MSL_SRC}
+	qconst_tags := [2]string{"1", "0"}
 	fast_math_modes := [2]bool{true, false}
+	for si in 0 ..< 2 {
 	for fast_math in fast_math_modes {
-		src := NS.String.alloc()->initWithOdinString(MSL_SRC)
+		src := NS.String.alloc()->initWithOdinString(sources[si])
 		defer src->release()
 		opts := MTL.CompileOptions.alloc()->init()
 		defer opts->release()
 		opts->setFastMathEnabled(fast_math)
 		lib, err := dev->newLibraryWithSource(src, opts)
 		if err != nil {
-			fmt.eprintfln("metal selftest: shader compile failed (fastMath=%v): %s",
-				fast_math, err->localizedDescription()->odinString())
+			fmt.eprintfln("metal selftest: shader compile failed (qconst=%s, fastMath=%v): %s",
+				qconst_tags[si], fast_math, err->localizedDescription()->odinString())
 			return out[:], false
 		}
 		defer lib->release()
 
 		fn_names := lib->functionNames()
 		n := int(fn_names->count())
-		if n == 0 { fmt.eprintln("metal selftest: library has no functions"); return out[:], false }
+		if n == 0 { fmt.eprintfln("metal selftest: library (qconst=%s) has no functions", qconst_tags[si]); return out[:], false }
 		n_ok := 0
 		for i in 0 ..< n {
 			ns_name := fn_names->objectAs(NS.UInteger(i), ^NS.String)
@@ -3087,16 +3586,17 @@ metal_shader_selftest :: proc(allocator := context.allocator) -> (names: []strin
 			pso, perr := dev->newComputePipelineStateWithFunction(fn)
 			fn->release()
 			if perr != nil {
-				fmt.eprintfln("metal selftest: pipeline '%s' (fastMath=%v) failed: %s",
-					name, fast_math, perr->localizedDescription()->odinString())
+				fmt.eprintfln("metal selftest: pipeline '%s' (qconst=%s, fastMath=%v) failed: %s",
+					name, qconst_tags[si], fast_math, perr->localizedDescription()->odinString())
 				ok = false
 				continue
 			}
 			pso->release()
 			n_ok += 1
-			if fast_math { append(&out, strings.clone(name, allocator)) }
+			if si == 0 && fast_math { append(&out, strings.clone(name, allocator)) }
 		}
-		fmt.eprintfln("metal selftest: fastMath=%v  %d/%d pipelines OK", fast_math, n_ok, n)
+		fmt.eprintfln("metal selftest: qconst=%s fastMath=%v  %d/%d pipelines OK", qconst_tags[si], fast_math, n_ok, n)
+	}
 	}
 	return out[:], ok
 }
@@ -3132,11 +3632,25 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
+	qconst_val := os.get_env("QCONST", context.temp_allocator)
+	g_qconst = qconst_val != "0"
+	g_qc_all := qconst_val == "1" || qconst_val == ""
+	g_qc_a = g_qc_all || strings.contains(qconst_val, "a")
+	g_qc_b = g_qc_all || strings.contains(qconst_val, "b")
+	g_qc_c = g_qc_all || strings.contains(qconst_val, "c")
+	g_qc_d = g_qc_all || strings.contains(qconst_val, "d")
+	g_cdim = c.dim
+	g_chead_dim = c.head_dim
 	g_tune_enabled = os.get_env("ODIN_TUNE", context.temp_allocator) != "0"
 	fmt.eprintfln("metal: shader fastMath={} (QFASTMATH=0 to disable)", g_fast_math)
+	fmt.eprintfln("metal: Tier 3 per-model constants {} (QCONST=0 for legacy A/B)", g_qconst ? "ON" : "OFF")
 	fmt.eprintfln("metal: maxThreadgroupMemoryLength={} bytes", m_device->maxThreadgroupMemoryLength())
 
-	src := NS.String.alloc()->initWithOdinString(MSL_SRC)
+	src_str := MSL_SRC
+	if g_qconst {
+		src_str = strings.concatenate({msl_prelude(c), MSL_SRC}, context.temp_allocator)
+	}
+	src := NS.String.alloc()->initWithOdinString(src_str)
 	defer src->release()
 	opts := MTL.CompileOptions.alloc()->init()
 	defer opts->release()
@@ -3190,6 +3704,30 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_l2norm_batch = make_pso(lib, "l2norm_scale_batch")
 	m_pso_rmsgated_batch = make_pso(lib, "rmsnorm_gated_batch")
 	m_pso_chunked_delta = make_pso(lib, "chunked_delta")
+
+	// Tier 3 load-time-specialized variants (only compiled with the QCONST=1 prelude).
+	// Groups: a = rope/rmsnorm/norm-fused, b = full-attention, c = delta family,
+	// d = Q8-KV store / attn gate. QCONST=a|ab|abc registers a subset for staged A/B.
+	if g_qc_a {
+		m_pso_rmsnorm_c = make_pso(lib, "rmsnorm_c"); m_pso_rmsnorm_hd_c = make_pso(lib, "rmsnorm_hd_c")
+		m_pso_rope_c = make_pso(lib, "rope_partial_c"); m_pso_qnorm_c = make_pso(lib, "qnorm_extract_c")
+		m_pso_q4_knorm_c = make_pso(lib, "gemv_q4_k_norm_c"); m_pso_q6_knorm_c = make_pso(lib, "gemv_q6_k_norm_c")
+	}
+	if g_qc_b {
+		m_pso_store_kv_c = make_pso(lib, "store_kv_c"); m_pso_attn_c = make_pso(lib, "attention_c")
+		m_pso_attn_q8_c = make_pso(lib, "attention_q8_c")
+	}
+	if g_qc_c {
+		m_pso_conv_c = make_pso(lib, "conv1d_step_silu_c"); m_pso_l2norm_c = make_pso(lib, "l2norm_scale_c")
+		m_pso_delta_c = make_pso(lib, "delta_recurrent_c"); m_pso_rmsgated_c = make_pso(lib, "rmsnorm_gated_c")
+		m_pso_conv_batch_c = make_pso(lib, "conv1d_batch_silu_c"); m_pso_conv_update_c = make_pso(lib, "conv1d_update_state_c")
+		m_pso_l2norm_batch_c = make_pso(lib, "l2norm_scale_batch_c"); m_pso_rmsgated_batch_c = make_pso(lib, "rmsnorm_gated_batch_c")
+		m_pso_chunked_delta_c = make_pso(lib, "chunked_delta_c")
+	}
+	if g_qc_d {
+		m_pso_store_kv_q8_c = make_pso(lib, "store_kv_q8_c")
+		m_pso_attn_gate_c = make_pso(lib, "attn_gate_c")
+	}
 
 	base := raw_data(g.mmap)
 	m_mmap_base = uintptr(base)
@@ -3853,23 +4391,42 @@ enc_gemv_norm :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_o
 	xb: ^MTL.Buffer, x_off: NS.UInteger, ob: ^MTL.Buffer, o_off: NS.UInteger, n, d: int, eps: f32) {
 	pso := m_pso_q4_knorm
 	if kind == .Q6_K { pso = m_pso_q6_knorm }
+	if g_qc_a {
+		// Tier 3: eps is the baked RMS_EPS (identical across the whole model).
+		if kind == .Q6_K { pso = m_pso_q6_knorm_c } else { pso = m_pso_q4_knorm_c }
+	}
 	enc->setComputePipelineState(pso)
 	enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
 	dims := [2]u32{u32(n), u32(d)}
 	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
 	enc->setBuffer(m_weights, wn_off, 4)
-	eps_local := eps
-	enc->setBytes(bytes_of(&eps_local, size_of(eps_local)), 5)
+	if !g_qc_a {
+		eps_local := eps
+		enc->setBytes(bytes_of(&eps_local, size_of(eps_local)), 5)
+	}
 	tg_x := (d + GEMV_ROWS - 1) / GEMV_ROWS
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(tg_x), 1, 1}, MTL.Size{GEMV_TG, 1, 1})
 }
 
 @(private = "file")
 enc_rmsnorm :: proc(enc: ^MTL.ComputeCommandEncoder, inp, outp: ^MTL.Buffer, w: rawptr, size, count: int, eps: f32) {
-	enc->setComputePipelineState(m_pso_rmsnorm)
+	if g_qc_a {
+		// Tier 3: size is either DIM (most sites) or HEAD_DIM (per-kv-head
+		// k_norm); both are baked constants. Fail fast on anything else.
+		if size == g_cdim {
+			enc->setComputePipelineState(m_pso_rmsnorm_c)
+		} else if size == g_chead_dim {
+			enc->setComputePipelineState(m_pso_rmsnorm_hd_c)
+		} else {
+			fmt.eprintfln("metal: enc_rmsnorm size={} matches no baked constant (dim={}, head_dim={})", size, g_cdim, g_chead_dim)
+			os.exit(1)
+		}
+	} else {
+		enc->setComputePipelineState(m_pso_rmsnorm)
+		P := struct { size: u32, eps: f32 }{u32(size), eps}
+		enc->setBytes(bytes_of(&P, size_of(P)), 3)
+	}
 	enc->setBuffer(inp, 0, 0); enc->setBuffer(outp, 0, 1); enc->setBuffer(m_weights, woff(w), 2)
-	P := struct { size: u32, eps: f32 }{u32(size), eps}
-	enc->setBytes(bytes_of(&P, size_of(P)), 3)
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(count), 1, 1}, MTL.Size{32, 1, 1})
 }
 
@@ -3984,11 +4541,17 @@ enc_proj_fwd :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: r
 // Batched depthwise causal conv1d + silu (Stage 2). x/out token-major [T x conv_dim].
 @(private = "file")
 enc_conv1d_batch :: proc(enc: ^MTL.ComputeCommandEncoder, x, out: ^MTL.Buffer, conv_state: ^MTL.Buffer, conv_state_off: NS.UInteger, weight: rawptr, conv_dim, T, kernel: int) {
-	enc->setComputePipelineState(m_pso_conv_batch)
 	enc->setBuffer(x, 0, 0); enc->setBuffer(out, 0, 1)
 	enc->setBuffer(conv_state, conv_state_off, 2); enc->setBuffer(m_weights, woff(weight), 3)
-	P := [4]u32{u32(conv_dim), u32(T), u32(kernel), u32(kernel - 1)}
-	enc->setBytes(bytes_of(&P, size_of(P)), 4)
+	if g_qc_c {
+		enc->setComputePipelineState(m_pso_conv_batch_c)
+		Tu := u32(T)
+		enc->setBytes(bytes_of(&Tu, size_of(Tu)), 4)
+	} else {
+		enc->setComputePipelineState(m_pso_conv_batch)
+		P := [4]u32{u32(conv_dim), u32(T), u32(kernel), u32(kernel - 1)}
+		enc->setBytes(bytes_of(&P, size_of(P)), 4)
+	}
 	n := T * conv_dim; tg := min(n, 256)
 	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
 }
@@ -3999,10 +4562,16 @@ enc_conv1d_batch :: proc(enc: ^MTL.ComputeCommandEncoder, x, out: ^MTL.Buffer, c
 // poison the next chunk's / next decode token's conv history).
 @(private = "file")
 enc_conv1d_update :: proc(enc: ^MTL.ComputeCommandEncoder, x, conv_state: ^MTL.Buffer, conv_state_off: NS.UInteger, conv_dim, n_real, kernel: int) {
-	enc->setComputePipelineState(m_pso_conv_update)
 	enc->setBuffer(x, 0, 0); enc->setBuffer(conv_state, conv_state_off, 1)
-	P := [4]u32{u32(conv_dim), u32(n_real), u32(kernel), u32(kernel - 1)}
-	enc->setBytes(bytes_of(&P, size_of(P)), 2)
+	if g_qc_c {
+		enc->setComputePipelineState(m_pso_conv_update_c)
+		Tu := u32(n_real)
+		enc->setBytes(bytes_of(&Tu, size_of(Tu)), 2)
+	} else {
+		enc->setComputePipelineState(m_pso_conv_update)
+		P := [4]u32{u32(conv_dim), u32(n_real), u32(kernel), u32(kernel - 1)}
+		enc->setBytes(bytes_of(&P, size_of(P)), 2)
+	}
 	n := conv_dim * (kernel - 1); tg := min(n, 256)
 	enc->dispatchThreads(MTL.Size{NS.Integer(n), 1, 1}, MTL.Size{NS.Integer(tg), 1, 1})
 }
@@ -4010,20 +4579,28 @@ enc_conv1d_update :: proc(enc: ^MTL.ComputeCommandEncoder, x, conv_state: ^MTL.B
 // Stage 2: batched l2norm+scale over [T x n_kh] (q,k slices of conv output)
 @(private = "file")
 enc_l2norm_batch :: proc(enc: ^MTL.ComputeCommandEncoder, qkv, q_out, k_out: ^MTL.Buffer, hkd, key_dim, conv_dim, T, n_kh: int, scale: f32) {
-	enc->setComputePipelineState(m_pso_l2norm_batch)
+	if g_qc_c {
+		enc->setComputePipelineState(m_pso_l2norm_batch_c)
+	} else {
+		enc->setComputePipelineState(m_pso_l2norm_batch)
+		P := struct { hkd: u32, key_dim: u32, conv_dim: u32, eps: f32, scale: f32 }{u32(hkd), u32(key_dim), u32(conv_dim), 1e-6, scale}
+		enc->setBytes(bytes_of(&P, size_of(P)), 3)
+	}
 	enc->setBuffer(q_out, 0, 0); enc->setBuffer(k_out, 0, 1); enc->setBuffer(qkv, 0, 2)
-	P := struct { hkd: u32, key_dim: u32, conv_dim: u32, eps: f32, scale: f32 }{u32(hkd), u32(key_dim), u32(conv_dim), 1e-6, scale}
-	enc->setBytes(bytes_of(&P, size_of(P)), 3)
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(T * n_kh), 1, 1}, MTL.Size{32, 1, 1})
 }
 
 // Stage 2: batched gated-rmsnorm over [T x n_vh]
 @(private = "file")
 enc_rmsgated_batch :: proc(enc: ^MTL.ComputeCommandEncoder, outp, inp: ^MTL.Buffer, weight: rawptr, gate: ^MTL.Buffer, head_v_dim, n_vh, T: int, eps: f32) {
-	enc->setComputePipelineState(m_pso_rmsgated_batch)
+	if g_qc_c {
+		enc->setComputePipelineState(m_pso_rmsgated_batch_c)
+	} else {
+		enc->setComputePipelineState(m_pso_rmsgated_batch)
+		P := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
+		enc->setBytes(bytes_of(&P, size_of(P)), 4)
+	}
 	enc->setBuffer(outp, 0, 0); enc->setBuffer(inp, 0, 1); enc->setBuffer(m_weights, woff(weight), 2); enc->setBuffer(gate, 0, 3)
-	P := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
-	enc->setBytes(bytes_of(&P, size_of(P)), 4)
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(T * n_vh), 1, 1}, MTL.Size{32, 1, 1})
 }
 
@@ -4032,15 +4609,21 @@ enc_rmsgated_batch :: proc(enc: ^MTL.ComputeCommandEncoder, outp, inp: ^MTL.Buff
 enc_chunked_delta :: proc(enc: ^MTL.ComputeCommandEncoder,
 	qlin, klin, qkv2, bt, at: ^MTL.Buffer, a_decay, dt_bias: rawptr, rec_states, lout: ^MTL.Buffer,
 	hkd, hvd, C, key_dim, conv_dim, value_dim, n_vh, n_kh, chunk_start, slot: int) {
-	enc->setComputePipelineState(m_pso_chunked_delta)
 	enc->setBuffer(qlin, 0, 0); enc->setBuffer(klin, 0, 1); enc->setBuffer(qkv2, 0, 2)
 	enc->setBuffer(bt, 0, 3); enc->setBuffer(at, 0, 4)
 	enc->setBuffer(m_weights, woff(a_decay), 5); enc->setBuffer(m_weights, woff(dt_bias), 6)
 	enc->setBuffer(rec_states, 0, 7); enc->setBuffer(lout, 0, 8)
-	P := struct {
-		hkd: u32, hvd: u32, C: u32, key_dim: u32, conv_dim: u32, value_dim: u32, n_vh: u32, n_kh: u32, chunk_start: u32, slot: u32,
-	}{u32(hkd), u32(hvd), u32(C), u32(key_dim), u32(conv_dim), u32(value_dim), u32(n_vh), u32(n_kh), u32(chunk_start), u32(slot)}
-	enc->setBytes(bytes_of(&P, size_of(P)), 9)
+	if g_qc_c {
+		enc->setComputePipelineState(m_pso_chunked_delta_c)
+		P := struct { C: u32, chunk_start: u32, slot: u32 }{u32(C), u32(chunk_start), u32(slot)}
+		enc->setBytes(bytes_of(&P, size_of(P)), 9)
+	} else {
+		enc->setComputePipelineState(m_pso_chunked_delta)
+		P := struct {
+			hkd: u32, hvd: u32, C: u32, key_dim: u32, conv_dim: u32, value_dim: u32, n_vh: u32, n_kh: u32, chunk_start: u32, slot: u32,
+		}{u32(hkd), u32(hvd), u32(C), u32(key_dim), u32(conv_dim), u32(value_dim), u32(n_vh), u32(n_kh), u32(chunk_start), u32(slot)}
+		enc->setBytes(bytes_of(&P, size_of(P)), 9)
+	}
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(hvd), 1, 1})
 }
 
@@ -4071,42 +4654,70 @@ enc_store_attn_gate :: proc(enc: ^MTL.ComputeCommandEncoder, slot: int, pos, hea
 	if g_kv_q8 {
 		kv_layer_bytes := kv_layer_bytes_q8(seq_len, kv_dim)
 		kv_loff := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes)
-		enc->setComputePipelineState(m_pso_store_kv_q8)
 		enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
 		enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
-		q8sp := struct { kv_pos_bytes: u32, pos: u32 }{u32(kv_pos_bytes(kv_dim)), u32(pos)}
-		enc->setBytes(bytes_of(&q8sp, size_of(q8sp)), 4)
+		if g_qc_d {
+			enc->setComputePipelineState(m_pso_store_kv_q8_c)
+			q8sp := struct { pos: u32 }{u32(pos)}
+			enc->setBytes(bytes_of(&q8sp, size_of(q8sp)), 4)
+		} else {
+			enc->setComputePipelineState(m_pso_store_kv_q8)
+			q8sp := struct { kv_pos_bytes: u32, pos: u32 }{u32(kv_pos_bytes(kv_dim)), u32(pos)}
+			enc->setBytes(bytes_of(&q8sp, size_of(q8sp)), 4)
+		}
 		nb := kv_dim / QK8_0
 		enc->dispatchThreads(MTL.Size{NS.Integer(nb), 1, 1}, MTL.Size{NS.Integer(min(nb, 256)), 1, 1})
-		enc->setComputePipelineState(m_pso_attn_q8)
 		enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
-		q8ap := struct { head_dim: u32, kv_pos_bytes: u32, kv_mul: u32, pos: u32 }{
-			u32(head_dim), u32(kv_pos_bytes(kv_dim)), u32(kv_mul), u32(pos),
+		if g_qc_b {
+			enc->setComputePipelineState(m_pso_attn_q8_c)
+			q8ap := struct { pos: u32 }{u32(pos)}
+			enc->setBytes(bytes_of(&q8ap, size_of(q8ap)), 4)
+		} else {
+			enc->setComputePipelineState(m_pso_attn_q8)
+			q8ap := struct { head_dim: u32, kv_pos_bytes: u32, kv_mul: u32, pos: u32 }{
+				u32(head_dim), u32(kv_pos_bytes(kv_dim)), u32(kv_mul), u32(pos),
+			}
+			enc->setBytes(bytes_of(&q8ap, size_of(q8ap)), 4)
 		}
-		enc->setBytes(bytes_of(&q8ap, size_of(q8ap)), 4)
 		enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
 		enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
 	} else {
 		kv_layer_bytes := seq_len * kv_dim * 2 // legacy f16 KV
 		kv_loff := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes)
-		enc->setComputePipelineState(m_pso_store_kv)
 		enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
 		enc->setBuffer(m_b_kc, kv_loff, 2); enc->setBuffer(m_b_vc, kv_loff, 3)
-		store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
-		enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
+		if g_qc_b {
+			enc->setComputePipelineState(m_pso_store_kv_c)
+			store_p := struct { seq_len: u32, pos: u32 }{u32(seq_len), u32(pos)}
+			enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
+		} else {
+			enc->setComputePipelineState(m_pso_store_kv)
+			store_p := struct { head_dim: u32, seq_len: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(pos)}
+			enc->setBytes(bytes_of(&store_p, size_of(store_p)), 4)
+		}
 		enc->dispatchThreads(MTL.Size{NS.Integer(kv_dim), 1, 1}, MTL.Size{NS.Integer(min(kv_dim, 256)), 1, 1})
-		enc->setComputePipelineState(m_pso_attn)
 		enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, kv_loff, 1); enc->setBuffer(m_b_vc, kv_loff, 2); enc->setBuffer(m_b_xb3, 0, 3)
-		attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
-		enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
+		if g_qc_b {
+			enc->setComputePipelineState(m_pso_attn_c)
+			attn_p := struct { seq_len: u32, pos: u32 }{u32(seq_len), u32(pos)}
+			enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
+		} else {
+			enc->setComputePipelineState(m_pso_attn)
+			attn_p := struct { head_dim: u32, seq_len: u32, kv_mul: u32, pos: u32 }{u32(head_dim), u32(seq_len), u32(kv_mul), u32(pos)}
+			enc->setBytes(bytes_of(&attn_p, size_of(attn_p)), 4)
+		}
 		enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
 		enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
 	}
 	// attention output gate: o_h *= sigmoid(gate_h), gate = second half of each qproj head
-	enc->setComputePipelineState(m_pso_attn_gate)
 	enc->setBuffer(m_b_xb3, 0, 0); enc->setBuffer(m_b_qproj, 0, 1)
-	hd_u32 := u32(head_dim)
-	enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
+	if g_qc_d {
+		enc->setComputePipelineState(m_pso_attn_gate_c)
+	} else {
+		enc->setComputePipelineState(m_pso_attn_gate)
+		hd_u32 := u32(head_dim)
+		enc->setBytes(bytes_of(&hd_u32, size_of(hd_u32)), 2)
+	}
 	enc->dispatchThreads(MTL.Size{NS.Integer(att_head_dim), 1, 1}, MTL.Size{NS.Integer(min(att_head_dim, 256)), 1, 1})
 }
 
@@ -4186,20 +4797,39 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			}
 			// extract + norm q (per head, strided in qproj); norm k (contiguous per kv head)
 			if !noattn {
-			enc->setComputePipelineState(m_pso_qnorm)
 			enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
-			qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
-			enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+			if g_qc_a {
+				enc->setComputePipelineState(m_pso_qnorm_c)
+			} else {
+				enc->setComputePipelineState(m_pso_qnorm)
+				qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
+				enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+			}
 			enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
 			enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
 			// partial-rotary MRoPE on q and k
-			rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
 			half_r := rotary_dim / 2
-			enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_q, 0, 0)
-			enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+			enc->setBuffer(m_b_q, 0, 0)
+			if g_qc_a {
+				enc->setComputePipelineState(m_pso_rope_c)
+				pos_u := u32(pos)
+				enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+			} else {
+				enc->setComputePipelineState(m_pso_rope)
+				rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+			}
 			enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-			enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
-			enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+			enc->setBuffer(m_b_ktmp, 0, 0)
+			if g_qc_a {
+				enc->setComputePipelineState(m_pso_rope_c)
+				pos_u := u32(pos)
+				enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+			} else {
+				enc->setComputePipelineState(m_pso_rope)
+				rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+			}
 			enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
 			// store K/V (Q8_0 or legacy f16), attention, output gate
 			enc_store_attn_gate(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
@@ -4225,36 +4855,52 @@ forward_gpu :: proc(transformer: ^Transformer, token: int, pos: int) -> []f32 {
 			}
 			// conv1d step + silu (weight is F32 in mmap)
 			if !nodelta {
-			enc->setComputePipelineState(m_pso_conv)
 			enc->setBuffer(m_b_qkv2, 0, 0); enc->setBuffer(m_b_qkv, 0, 1)
 			enc->setBuffer(m_b_conv_states, conv_off, 2); enc->setBuffer(m_weights, woff(raw_data(la.conv.data)), 3)
-			cp := [2]u32{u32(kernel), 0}
-			enc->setBytes(bytes_of(&cp, size_of(cp)), 4)
+			if g_qc_c {
+				enc->setComputePipelineState(m_pso_conv_c)
+			} else {
+				enc->setComputePipelineState(m_pso_conv)
+				cp := [2]u32{u32(kernel), 0}
+				enc->setBytes(bytes_of(&cp, size_of(cp)), 4)
+			}
 			enc->dispatchThreads(MTL.Size{NS.Integer(conv_dim), 1, 1}, MTL.Size{NS.Integer(min(conv_dim, 256)), 1, 1})
 			// l2norm q,k (q_raw at qkv2[0:key_dim], k_raw at qkv2[key_dim:2*key_dim])
-			enc->setComputePipelineState(m_pso_l2norm)
 			enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
 			enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
-			l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
-			enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+			if g_qc_c {
+				enc->setComputePipelineState(m_pso_l2norm_c)
+			} else {
+				enc->setComputePipelineState(m_pso_l2norm)
+				l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
+				enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+			}
 			enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
 			// delta recurrent (v = qkv2[2*key_dim:])
-			enc->setComputePipelineState(m_pso_delta)
 			enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
 			enc->setBuffer(m_b_qlin, 0, 2); enc->setBuffer(m_b_klin, 0, 3)
 			enc->setBuffer(m_b_qkv2, NS.UInteger(2 * key_dim * 4), 4)
 			enc->setBuffer(m_b_b, 0, 5); enc->setBuffer(m_b_a, 0, 6)
 			enc->setBuffer(m_weights, woff(raw_data(la.a_decay)), 7)
 			enc->setBuffer(m_weights, woff(raw_data(la.dt_bias)), 8)
-			dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
-			enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+			if g_qc_c {
+				enc->setComputePipelineState(m_pso_delta_c)
+			} else {
+				enc->setComputePipelineState(m_pso_delta)
+				dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
+				enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+			}
 			enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
 			// gated rmsnorm (out = rmsnorm(lout) * silu(z))
-			enc->setComputePipelineState(m_pso_rmsgated)
 			enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_lout, 0, 1)
 			enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_z, 0, 3)
-			ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
-			enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+			if g_qc_c {
+				enc->setComputePipelineState(m_pso_rmsgated_c)
+			} else {
+				enc->setComputePipelineState(m_pso_rmsgated)
+				ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
+				enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+			}
 			enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 			} // !nosmall
 			enc_gemv(enc, la.out.kind, woff(raw_data(la.out.data)), m_b_lout, 0, m_b_xb2, 0, value_dim, dim)
@@ -4396,19 +5042,38 @@ switch lw.layer_type {
 				enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
 				enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
 				enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
-				enc->setComputePipelineState(m_pso_qnorm)
 				enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
-				qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
-				enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+				if g_qc_a {
+					enc->setComputePipelineState(m_pso_qnorm_c)
+				} else {
+					enc->setComputePipelineState(m_pso_qnorm)
+					qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
+					enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
 				enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
-				rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
 				half_r := rotary_dim / 2
-				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_q, 0, 0)
-				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->setBuffer(m_b_q, 0, 0)
+				if g_qc_a {
+					enc->setComputePipelineState(m_pso_rope_c)
+					pos_u := u32(pos)
+					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+				} else {
+					enc->setComputePipelineState(m_pso_rope)
+					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				}
 				enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
-				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->setBuffer(m_b_ktmp, 0, 0)
+				if g_qc_a {
+					enc->setComputePipelineState(m_pso_rope_c)
+					pos_u := u32(pos)
+					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+				} else {
+					enc->setComputePipelineState(m_pso_rope)
+					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				}
 				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
 				enc_store_attn_gate(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
 				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
@@ -4464,27 +5129,39 @@ switch lw.layer_type {
 				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
 				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
 				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
-				enc->setComputePipelineState(m_pso_l2norm)
 				enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
 				enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
-				l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
-				enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+				if g_qc_c {
+					enc->setComputePipelineState(m_pso_l2norm_c)
+				} else {
+					enc->setComputePipelineState(m_pso_l2norm)
+					l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
+					enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
-				enc->setComputePipelineState(m_pso_delta)
 				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
 				enc->setBuffer(m_b_qlin, 0, 2); enc->setBuffer(m_b_klin, 0, 3)
 				enc->setBuffer(m_b_qkv2, NS.UInteger(2 * key_dim * 4), 4)
 				enc->setBuffer(m_b_b, 0, 5); enc->setBuffer(m_b_a, 0, 6)
 				enc->setBuffer(m_weights, woff(raw_data(la.a_decay)), 7)
 				enc->setBuffer(m_weights, woff(raw_data(la.dt_bias)), 8)
-				dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
-				enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+				if g_qc_c {
+					enc->setComputePipelineState(m_pso_delta_c)
+				} else {
+					enc->setComputePipelineState(m_pso_delta)
+					dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
+					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
-				enc->setComputePipelineState(m_pso_rmsgated)
 				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_lout, 0, 1)
 				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_z, 0, 3)
-				ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
-				enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+				if g_qc_c {
+					enc->setComputePipelineState(m_pso_rmsgated_c)
+				} else {
+					enc->setComputePipelineState(m_pso_rmsgated)
+					ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
+					enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
@@ -4694,19 +5371,38 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc_copy(enc, m_b_qproj_t, oq, m_b_qproj, 0, qproj_dim)
 				enc_copy(enc, m_b_kt, okv, m_b_ktmp, 0, kv_dim)
 				enc_copy(enc, m_b_vt, okv, m_b_vtmp, 0, kv_dim)
-				enc->setComputePipelineState(m_pso_qnorm)
 				enc->setBuffer(m_b_qproj, 0, 0); enc->setBuffer(m_b_q, 0, 1); enc->setBuffer(m_weights, woff(raw_data(fa.q_norm)), 2)
-				qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
-				enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+				if g_qc_a {
+					enc->setComputePipelineState(m_pso_qnorm_c)
+				} else {
+					enc->setComputePipelineState(m_pso_qnorm)
+					qnp := struct { size: u32, eps: f32 }{u32(head_dim), eps}
+					enc->setBytes(bytes_of(&qnp, size_of(qnp)), 3)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{32, 1, 1})
 				enc_rmsnorm(enc, m_b_ktmp, m_b_ktmp, raw_data(fa.k_norm), head_dim, n_kv_heads, eps)
-				rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
 				half_r := rotary_dim / 2
-				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_q, 0, 0)
-				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->setBuffer(m_b_q, 0, 0)
+				if g_qc_a {
+					enc->setComputePipelineState(m_pso_rope_c)
+					pos_u := u32(pos)
+					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+				} else {
+					enc->setComputePipelineState(m_pso_rope)
+					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				}
 				enc->dispatchThreads(MTL.Size{NS.Integer(n_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
-				enc->setComputePipelineState(m_pso_rope); enc->setBuffer(m_b_ktmp, 0, 0)
-				enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				enc->setBuffer(m_b_ktmp, 0, 0)
+				if g_qc_a {
+					enc->setComputePipelineState(m_pso_rope_c)
+					pos_u := u32(pos)
+					enc->setBytes(bytes_of(&pos_u, size_of(pos_u)), 1)
+				} else {
+					enc->setComputePipelineState(m_pso_rope)
+					rope_p := struct { head_dim: u32, pos: u32, rope_freq: f32, rotary_dim: u32 }{u32(head_dim), u32(pos), p.rope_theta, u32(rotary_dim)}
+					enc->setBytes(bytes_of(&rope_p, size_of(rope_p)), 1)
+				}
 				enc->dispatchThreads(MTL.Size{NS.Integer(n_kv_heads * half_r), 1, 1}, MTL.Size{NS.Integer(min(half_r, 64)), 1, 1})
 				enc_store_attn_gate(enc, slot, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim)
 				enc_copy(enc, m_b_xb3, 0, m_b_xb3t, oxb3, att_head_dim)
@@ -4760,27 +5456,39 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 				enc_copy(enc, m_b_zt, oz, m_b_z, 0, value_dim)
 				enc_copy(enc, m_b_bt, oba, m_b_b, 0, n_vh)
 				enc_copy(enc, m_b_at, oba, m_b_a, 0, n_vh)
-				enc->setComputePipelineState(m_pso_l2norm)
 				enc->setBuffer(m_b_qlin, 0, 0); enc->setBuffer(m_b_klin, 0, 1)
 				enc->setBuffer(m_b_qkv2, 0, 2); enc->setBuffer(m_b_qkv2, NS.UInteger(key_dim * 4), 3)
-				l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
-				enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+				if g_qc_c {
+					enc->setComputePipelineState(m_pso_l2norm_c)
+				} else {
+					enc->setComputePipelineState(m_pso_l2norm)
+					l2p := struct { head_k_dim: u32, eps: f32, scale: f32 }{u32(head_k_dim), 1e-6, l2_scale}
+					enc->setBytes(bytes_of(&l2p, size_of(l2p)), 4)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_kh), 1, 1}, MTL.Size{32, 1, 1})
-				enc->setComputePipelineState(m_pso_delta)
 				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_rec_states, rec_off, 1)
 				enc->setBuffer(m_b_qlin, 0, 2); enc->setBuffer(m_b_klin, 0, 3)
 				enc->setBuffer(m_b_qkv2, NS.UInteger(2 * key_dim * 4), 4)
 				enc->setBuffer(m_b_b, 0, 5); enc->setBuffer(m_b_a, 0, 6)
 				enc->setBuffer(m_weights, woff(raw_data(la.a_decay)), 7)
 				enc->setBuffer(m_weights, woff(raw_data(la.dt_bias)), 8)
-				dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
-				enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+				if g_qc_c {
+					enc->setComputePipelineState(m_pso_delta_c)
+				} else {
+					enc->setComputePipelineState(m_pso_delta)
+					dp := struct { head_k_dim: u32, head_v_dim: u32, n_k_heads: u32 }{u32(head_k_dim), u32(head_v_dim), u32(n_kh)}
+					enc->setBytes(bytes_of(&dp, size_of(dp)), 9)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{NS.Integer(head_v_dim), 1, 1})
-				enc->setComputePipelineState(m_pso_rmsgated)
 				enc->setBuffer(m_b_lout, 0, 0); enc->setBuffer(m_b_lout, 0, 1)
 				enc->setBuffer(m_weights, woff(raw_data(la.norm_w)), 2); enc->setBuffer(m_b_z, 0, 3)
-				ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
-				enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+				if g_qc_c {
+					enc->setComputePipelineState(m_pso_rmsgated_c)
+				} else {
+					enc->setComputePipelineState(m_pso_rmsgated)
+					ngp := struct { size: u32, eps: f32 }{u32(head_v_dim), eps}
+					enc->setBytes(bytes_of(&ngp, size_of(ngp)), 4)
+				}
 				enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_vh), 1, 1}, MTL.Size{32, 1, 1})
 				enc_copy(enc, m_b_lout, 0, m_b_loutt, olout, value_dim)
 			}
