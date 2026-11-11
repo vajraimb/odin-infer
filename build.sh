@@ -9,6 +9,9 @@ COLLECTIONS=(-collection:ggml=packages -collection:infer=packages \
   -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
   -collection:sampler=packages -collection:tokenizer=packages)
 
+echo "== gen MSL tables =="
+python3 tools/gen_msl_tables.py
+
 echo "== build odin-serve =="
 # Release flags: -o:speed -no-bounds-check -disable-assert for BOTH binaries.
 # Deliberately NO -microarch:native: the CI runner compiles on newer Apple

@@ -30,6 +30,8 @@ jobs:
           /tmp/venv/bin/pip install -q numpy
           echo "/tmp/venv/bin" >> "$GITHUB_PATH"
 
+      - name: Check generated MSL tables are in sync
+        run: python3 tools/gen_msl_tables.py --check
       - name: Build + unit tests
         run: ./build.sh
 
