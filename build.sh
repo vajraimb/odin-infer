@@ -10,10 +10,14 @@ COLLECTIONS=(-collection:ggml=packages -collection:infer=packages \
   -collection:sampler=packages -collection:tokenizer=packages)
 
 echo "== build odin-serve =="
-odin build server/serve_harness/serve.odin -file -out:bin/odin-serve -o:speed "${COLLECTIONS[@]}"
+# Release flags: -o:speed -no-bounds-check -disable-assert for BOTH binaries.
+# Deliberately NO -microarch:native: the CI runner compiles on newer Apple
+# silicon and native emits ARMv8.6 matrix instructions (fmul.4s) that SIGILL
+# on M1/M2. Baseline arm64 runs on all M1-M4.
+odin build server/serve_harness/serve.odin -file -out:bin/odin-serve -o:speed -no-bounds-check -disable-assert "${COLLECTIONS[@]}"
 
 echo "== build odin-cli =="
-odin build cli -out:bin/odin-cli -o:speed -no-bounds-check -disable-assert -microarch:native "${COLLECTIONS[@]}"
+odin build cli -out:bin/odin-cli -o:speed -no-bounds-check -disable-assert "${COLLECTIONS[@]}"
 
 echo "== unit tests: packages/qwen3_5 =="
 ( cd packages/qwen3_5 && ./build.sh )
