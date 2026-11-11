@@ -1,5 +1,24 @@
 # Changelog · 更新日志
 
+## Unreleased
+
+- Q8_0 KV cache is now the default (~1.88x smaller than f16, 3.76x vs f32):
+  Qwen3.8-27B ctx 8192 KV 0.27 GB, ctx 32768 1.14 GB. `.oikv` bumped to v2
+  (on-disk body stays f32; v1 files are refused). KV_Q8=0 restores f16 KV.
+  Known cost: on the 27B, CPU-vs-Metal logits max_abs grows from 1.4e-3 (f16)
+  to ~1.1e-1 because of V-cache outliers (amax ~85); argmax agrees.
+- Metal init failure is now a hard error when `--metal` / `-g 1` is requested
+  (previously: silent CPU fallback, which hid the v0.2.0 shader-compile bug for
+  a whole release). METAL_FALLBACK=1 restores the old fallback. odin-cli now
+  checks engine_load's result.
+- build.sh runs `tools/metal_smoke.odin` on macOS (incl. the release CI
+  runner): compiles the MSL library with fastMath on/off, builds a pipeline for
+  every kernel and checks that every `make_pso` name exists. No model needed.
+- Docs: KV_CACHE/ENVIRONMENT/GRAMMAR synced to odin-cli + Q8 KV v2; AGENTS
+  MoE batch-prefill notes updated (default since v0.3.0); README scope line
+  fixed (EN/ZH mismatch).
+- Repo: stop tracking `.tmp-cache/` CI log zips (already gitignored).
+
 ## v0.4.0 — 2026-11-09
 
 - Batched MMQ for IQ/k-quant types (11 new kernels): Qwen3.8-27B Dynamic

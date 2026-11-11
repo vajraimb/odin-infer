@@ -81,7 +81,7 @@ M3 / 16GB，DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic（Q4_K_M），单引�
   sigmoid 门控共享专家；Metal 输出与 CPU 一致（~3e-3，fastMath），0.8B-MoE
   上 ~45× CPU 速度（37ms/token）。HF 上的社区小变体今天就能跑——包括
   llama.cpp 本身会拒绝的层数配置。
-- 不支持 MoE / 多模态 / 其他模型家族——窄定位是特性不是缺陷。
+- 不回退支持 Qwen3.5 之前的旧架构、不支持多模态、不支持其他模型家族——窄定位是特性不是缺陷。
 
 ## 产品形态
 

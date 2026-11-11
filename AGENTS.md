@@ -124,8 +124,9 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   moe_softmax_topk, one sync per layer), expert GEMVs reuse the production
   kernels via tensor-base + expert offsets, moe_combine does the weighted sum;
   shared expert runs via moe_gemv_f32 on F32 uploads. MOE_CPU=1 forces CPU.
-  engine_forward_batch falls back to per-token prefill for MoE models (the
-  batched MLP MMQ is dense-only).
+  MoE batched prefill (forward_gpu_batch_moe, grouped GEMM) is the default
+  Metal path since v0.3.0 (max_abs 8e-4 vs per-token); MOE_BATCH=0 switches
+  back to per-token prefill for A/B.
 - Expert tensor layout (verified against the real unsloth 35B-A3B GGUF header):
   `ffn_gate_inp` [dim, n_expert], `ffn_up_exps`/`ffn_gate_exps`
   [dim, n_ff_exp, n_expert], `ffn_down_exps` [n_ff_exp, dim, n_expert] —
@@ -167,6 +168,12 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   (CPU dequant masks 0x10 after >>(j+12)). / Q5_0 高比特：元素 j+16 用的是 qh 的第 j+16 位。
 - Community MoE GGUFs mix per-layer quant kinds (0.8B-MoE: down_exps alternates
   Q8_0/Q5_0) — dispatch by tensor kind, never assume. / 社区 MoE GGUF 逐层混合量化种类，按张量 kind 分派。
+
+- A failed Metal init used to silently fall back to CPU (v0.2.0 shipped a
+  shader library that never compiled — every model ran on CPU). Now
+  `--metal`/`-g 1` + failed init is a hard error (METAL_FALLBACK=1 restores
+  the old behaviour), and build.sh runs tools/metal_smoke.odin on macOS to
+  compile every kernel. / Metal 初始化失败现为硬错误，build.sh 在 macOS 上跑 shader 冒烟。
 
 ## Post-change self-check
 

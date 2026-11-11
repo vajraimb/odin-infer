@@ -28,6 +28,8 @@ Metal backend (`infer/metal.odin`) currently has no env-var knobs.
 | `QTIMING`      | off     | Set `=1` to print per-prefill GPU ms                                  |
 | `QPROF_NOLIN`  | off     | Ablation: skip linear-layer per-token stateful loop (output garbage)  |
 | `QPROF_NOFULL` | off     | Ablation: skip full-attention per-token block                          |
+| `KV_Q8`        | `ON`    | Q8_0 KV cache. Set `=0` for the legacy f16 Metal KV (A/B, precision)   |
+| `METAL_FALLBACK` | off   | Set `=1` to let a failed Metal init fall back to CPU. Default: `--metal`/`-g 1` + failed init = hard error |
 
 `QPROF_*` are GPU-kernel timing ablations — they produce wrong output but let
 you isolate per-stage GPU time. Never enable in production.
@@ -51,7 +53,7 @@ These are baked at build time; changing them requires a rebuild.
 
 ## CLI flags (not env, but worth documenting here)
 
-`odin-infer-mac <model.gguf> [flags]`:
+`odin-cli <model.gguf> [flags]`:
 
 | Flag | Meaning                                  | Default                |
 |------|------------------------------------------|------------------------|

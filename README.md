@@ -83,7 +83,7 @@ residency, cooled machine:
   (fastMath) at ~45× CPU speed on the 0.8B-MoE (37 ms/tok). Small community
   qwen35moe variants work today, including layer counts that llama.cpp itself
   rejects.
-- No MoE-free fallback to older architectures, no multimodal, no other model
+- No fallback to pre-Qwen3.5 architectures, no multimodal, no other model
   families — a narrow scope, on purpose.
 
 ## Product forms
