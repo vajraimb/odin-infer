@@ -115,8 +115,8 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   moe_softmax_topk，每层一次同步）、专家 GEMV 复用生产内核（张量基址+专家
   偏移）、moe_combine 加权求和；共享专家经 F32 上传走 moe_gemv_f32。
   MOE_CPU=1 强制走 CPU。MoE 批量 prefill（forward_gpu_batch_moe，分组
-  GEMM）在真 Metal 上与逐 token 发散（见"已知问题"），当前默认逐 token
-  Metal，MOE_BATCH=1 启用批量路径。
+  GEMM）自 v0.3.0 起为默认 Metal 路径（三处叠加 bug 已修，与逐 token
+  max_abs 8e-4），MOE_BATCH=0 退回逐 token 做 A/B。
 - Metal IQ/k-quant GEMV 内核：gemv_q2_k/q3_k/q5_k/q8_k + 9 个 IQ 内核
   （生产形状，codebook 以 MSL 常量内嵌）。Qwen3.8-27B 可 GPU 解码
   （~0.4-1.3s/token）；ctx 8192 已验证（Q8_0 KV 0.27GB，总占用 7.7GB），
@@ -177,11 +177,13 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   0x10）。
 - 社区 MoE GGUF 逐层混合量化种类（0.8B-MoE 的 down_exps 在 Q8_0/Q5_0 间
   交替）——按张量 kind 分派，不要假设。
-- MSL 保留字：变量名 'half' 会让整个 shader 库编译失败、metal_init 静默回退
-  CPU（所有模型）——发布前必须跑 Metal 冒烟并 grep 'init failed'。
-- 已知问题：MoE 分组 GEMM 批量 prefill 在真 Metal 上与逐 token 发散
-  （max_abs ~9-17，层 0 即现；T%8 补尾修了一部分，注意力残差阶段 la.out
-  投影仍偏 ~30%）——默认禁用，MOE_BATCH=1 可开启调试。
+- MSL 保留字：变量名 'half' 会让整个 shader 库编译失败。过去 metal_init 失败
+  会静默回退 CPU（所有模型）；现在 --metal / -g 1 下初始化失败直接报错退出
+  （METAL_FALLBACK=1 恢复旧回退行为），build.sh 在 macOS 上自动跑
+  tools/metal_smoke.odin：编译全部 kernel、逐个建 pipeline、核对 make_pso 名字。
+- 已解决（v0.3.0）：MoE 分组 GEMM 批量 prefill 曾与逐 token 发散，根因是三处
+  叠加 bug（M=16 ssm 张量 MMQ 零网格、top-k 跨 token 线程组竞争、MMQ 顺序
+  放大误差），现已默认开启。
 
 ## 验证清单（改动后自检）
 

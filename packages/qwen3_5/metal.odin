@@ -3671,6 +3671,61 @@ make_pso :: proc(lib: ^MTL.Library, name: string) -> ^MTL.ComputePipelineState {
 	return pso
 }
 
+// metal_shader_selftest compiles MSL_SRC (fastMath on and off) and builds a
+// compute pipeline for every kernel in the resulting library. It needs no model
+// file, so CI can run it on any Apple Silicon runner. Returns the kernel names
+// found in the fastMath=true library (caller owns the slice and its strings).
+// This exists because v0.2.0 shipped a shader library that never compiled and
+// nothing caught it: engine init quietly fell back to CPU.
+metal_shader_selftest :: proc(allocator := context.allocator) -> (names: []string, ok: bool) {
+	dev := MTL.CreateSystemDefaultDevice()
+	if dev == nil { fmt.eprintln("metal selftest: no Metal device"); return nil, false }
+	defer dev->release()
+	fmt.eprintfln("metal selftest: device %s", dev->name()->odinString())
+
+	out := make([dynamic]string, 0, 128, allocator)
+	ok = true
+	fast_math_modes := [2]bool{true, false}
+	for fast_math in fast_math_modes {
+		src := NS.String.alloc()->initWithOdinString(MSL_SRC)
+		defer src->release()
+		opts := MTL.CompileOptions.alloc()->init()
+		defer opts->release()
+		opts->setFastMathEnabled(fast_math)
+		lib, err := dev->newLibraryWithSource(src, opts)
+		if err != nil {
+			fmt.eprintfln("metal selftest: shader compile failed (fastMath=%v): %s",
+				fast_math, err->localizedDescription()->odinString())
+			return out[:], false
+		}
+		defer lib->release()
+
+		fn_names := lib->functionNames()
+		n := int(fn_names->count())
+		if n == 0 { fmt.eprintln("metal selftest: library has no functions"); return out[:], false }
+		n_ok := 0
+		for i in 0 ..< n {
+			ns_name := fn_names->objectAs(NS.UInteger(i), ^NS.String)
+			name := ns_name->odinString()
+			fn := lib->newFunctionWithName(ns_name)
+			if fn == nil { fmt.eprintfln("metal selftest: '%s' listed but not loadable", name); ok = false; continue }
+			pso, perr := dev->newComputePipelineStateWithFunction(fn)
+			fn->release()
+			if perr != nil {
+				fmt.eprintfln("metal selftest: pipeline '%s' (fastMath=%v) failed: %s",
+					name, fast_math, perr->localizedDescription()->odinString())
+				ok = false
+				continue
+			}
+			pso->release()
+			n_ok += 1
+			if fast_math { append(&out, strings.clone(name, allocator)) }
+		}
+		fmt.eprintfln("metal selftest: fastMath=%v  %d/%d pipelines OK", fast_math, n_ok, n)
+	}
+	return out[:], ok
+}
+
 @(private = "file")
 new_shared :: proc(n_floats: int) -> ^MTL.Buffer {
 	return m_device->newBufferWithLength(NS.UInteger(n_floats * size_of(f32)), MTL.ResourceStorageModeShared)

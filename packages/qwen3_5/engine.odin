@@ -34,15 +34,24 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 	}
 
 	if use_metal {
+		// Metal was explicitly requested. A failed init is a hard error by
+		// default: v0.2.0 shipped a shader library that never compiled and every
+		// model silently ran on CPU for a whole release. METAL_FALLBACK=1 opts
+		// back into the old "warn and use CPU" behaviour.
+		allow_fallback := os.get_env("METAL_FALLBACK", context.temp_allocator) == "1"
 		when ODIN_OS == .Darwin {
 			e.metal_ready = metal_init(&e.transformer, path)
-			if !e.metal_ready {
-				fmt.eprintln("metal: init failed, falling back to CPU")
-				// Metal failed → allocate CPU Run_State for the CPU forward path
-				malloc_run_state(&e.transformer.state, e.transformer.config)
-			}
 		} else {
-			fmt.eprintln("metal: only supported on macOS; using CPU")
+			fmt.eprintln("metal: only supported on macOS")
+			e.metal_ready = false
+		}
+		if !e.metal_ready {
+			if !allow_fallback {
+				fmt.eprintln("metal: init failed and --metal was requested; refusing to fall back to CPU (set METAL_FALLBACK=1 to allow)")
+				return e, false
+			}
+			fmt.eprintln("metal: init failed, METAL_FALLBACK=1 -> using CPU")
+			// Metal failed → allocate CPU Run_State for the CPU forward path
 			malloc_run_state(&e.transformer.state, e.transformer.config)
 		}
 	}

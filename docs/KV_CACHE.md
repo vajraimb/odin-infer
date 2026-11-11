@@ -19,7 +19,7 @@ Four state buffers, all position-evolving:
 
 | Buffer             | Layers           | Shape (per layer)                  | Notes                                         |
 |--------------------|------------------|------------------------------------|-----------------------------------------------|
-| `key_cache`        | full-attention   | `[seq_len, kv_dim]` (trimmed)      | f16 head-major on Metal, f32 layer-major on CPU |
+| `key_cache`        | full-attention   | `[seq_len, kv_dim]` (trimmed)      | Q8_0 position-major on Metal (`KV_Q8=0`: legacy f16 head-major), f32 layer-major on CPU |
 | `value_cache`      | full-attention   | `[seq_len, kv_dim]` (trimmed)      | same as K                                     |
 | `conv_states`      | linear-attention | `[conv_dim, kernel-1]`             | causal conv1d state                            |
 | `recurrent_states` | linear-attention | `[v_heads, head_k_dim, head_v_dim]`| gated-delta recurrent state                   |
@@ -36,7 +36,7 @@ at save/load time. A round-trip is bit-exact (verified by `kv_smoke.odin`).
 
 ```
 magic            : u32 = 0x4F494B56   ('OIKV')
-version          : u32 = 1
+version          : u32 = 2            (v2: Q8_0 in-engine KV; v1 files are refused)
 arch             : u32 = 2            (qwen3_5)
 fingerprint      : u64                FNV-1a of identifying Config fields
 n_valid_pos      : u32                positions actually populated
@@ -63,17 +63,17 @@ would cost.
 
 ## CLI usage
 
-Two new flags on `odin-infer-mac`:
+Two flags on `odin-cli` (the old `odin-infer-mac` CLI was merged into `cli/`):
 
 ```sh
 # Save state on exit:
-./odin-infer-mac ornith-1.0-9b-Q4_K_M.gguf -g 1 -S /path/to/chat.oikv
+./odin-cli ornith-1.0-9b-Q4_K_M.gguf -g 1 -S /path/to/chat.oikv
 
 # Resume from saved state:
-./odin-infer-mac ornith-1.0-9b-Q4_K_M.gguf -g 1 -L /path/to/chat.oikv
+./odin-cli ornith-1.0-9b-Q4_K_M.gguf -g 1 -L /path/to/chat.oikv
 
 # Both (resume, then save updated state on exit):
-./odin-infer-mac ornith-1.0-9b-Q4_K_M.gguf -g 1 \
+./odin-cli ornith-1.0-9b-Q4_K_M.gguf -g 1 \
   -L /path/to/chat.oikv -S /path/to/chat.oikv
 ```
 
@@ -108,7 +108,9 @@ pos, ok := q35.engine_load_kv(&engine, "chat.oikv")
 ```
 
 Both dispatch internally to the right backend (CPU f32 standard layout vs
-Metal f16 head-major with conversion).
+Metal Q8_0 position-major — or legacy f16 head-major with `KV_Q8=0` — with
+conversion). The on-disk body is canonical f32 either way; see
+`packages/qwen3_5/kv_q8.odin` and `kv_persist.odin` for the exact layout.
 
 ## Verification
 

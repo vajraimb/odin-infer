@@ -39,7 +39,7 @@ Simplifications vs strict RFC 8259:
 ## Usage
 
 ```sh
-./odin-infer-mac ornith-1.0-9b-Q4_K_M.gguf -g 1 -c 2048 -t 0.7 -J 1
+./odin-cli ornith-1.0-9b-Q4_K_M.gguf -g 1 -c 2048 -t 0.7 -J 1
 ```
 
 Then prompt the model normally:
