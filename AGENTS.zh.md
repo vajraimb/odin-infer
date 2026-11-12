@@ -183,6 +183,19 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   0x10）。
 - 社区 MoE GGUF 逐层混合量化种类（0.8B-MoE 的 down_exps 在 Q8_0/Q5_0 间
   交替）——按张量 kind 分派，不要假设。
+- Tier 2 热路径纪律：每 token 每层的分派零模式分支——enc_store_attn_gate
+  拆成四个具体 proc（sag_f16/f16c/q8/q8c）+ 预选 g_gate_pso/g_gate_needs_hd；
+  metal_init 在 kv_dim 校验后一次性选 g_sag。新增 KV 格式或 QCONST 组相关
+  分派时，放进初始化期选择，不要写热分支。
+- 加载期特化：metal_init 生成 MSL prelude，把模型常量（DIM/HEAD_DIM/KV_DIM/
+  KEY_DIM/VALUE_DIM/CONV_DIM/rotary/ROPE_FREQ/RMS_EPS/N_VH/N_KH/CONV_KERNEL/
+  L2_SCALE/KV_POS_BYTES）写成 constant；特化内核为 *_c 变体（#ifdef
+  QCONST_ON）。QCONST=0 编译旧运行时参数内核（smoke 76/76 vs 96/96，双
+  fastMath）。实测：27B 解码 −0.8%（最佳 −2.5%，a 组），9B 持平（解码 97%
+  是 MLP GEMV）。GEMV 的 Dims n/d 保持运行时（逐张量）。
+- 对拍门禁与 KV 格式相关：紧门禁（moe_smoke --compare ~3e-3、q38
+  --compare ~1.4e-3）须用 KV_Q8=0 跑；默认 Q8 KV 时 Metal 腿相对 CPU fp32
+  腿带 ~1e-1 量化噪声（MoE 0.177、27B 1.1e-1）——预期行为，不是 bug。
 - MSL 保留字：变量名 'half' 会让整个 shader 库编译失败。过去 metal_init 失败
   会静默回退 CPU（所有模型）；现在 --metal / -g 1 下初始化失败直接报错退出
   （METAL_FALLBACK=1 恢复旧回退行为），build.sh 在 macOS 上自动跑
