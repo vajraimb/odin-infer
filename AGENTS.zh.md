@@ -183,6 +183,12 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   0x10）。
 - 社区 MoE GGUF 逐层混合量化种类（0.8B-MoE 的 down_exps 在 Q8_0/Q5_0 间
   交替）——按张量 kind 分派，不要假设。
+- GEMV 形状特化（Tier 3.5）：collect_gemv_shapes 扫描 GEMV 分派张量，
+  保留 Q4_K/Q6_K 且 n%256==0 && d%256==0 的形状（上限 16），msl_gemv_spec
+  生成逐形状 constexpr n/d 内核（去行守卫、nsb 编译期）。默认开，
+  QGEMVSPEC=0 关。9B 实测解码 +5.6%（交错 A/B 各 8 轮）；特化内核是逐位
+  一致的替换（贪婪输出与 prod 逐字节相同）。selftest 额外编译 spec 构建
+  （103/103）。MoE 模型不收集形状（惰性）。
 - Tier 2 热路径纪律：每 token 每层的分派零模式分支——enc_store_attn_gate
   拆成四个具体 proc（sag_f16/f16c/q8/q8c）+ 预选 g_gate_pso/g_gate_needs_hd；
   metal_init 在 kv_dim 校验后一次性选 g_sag。新增 KV 格式或 QCONST 组相关
