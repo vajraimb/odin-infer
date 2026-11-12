@@ -3055,6 +3055,7 @@ g_prof_nofull := false
 g_gemv3: bool       // use row-split v3 GEMV kernels (env QGEMV3=1)
 g_gemv2r: bool      // use 2-rows-per-lane GEMV kernels (env QGEMV2R=1)
 g_normfuse: bool    // fuse rmsnorm into GEMV dispatches (env QGEMVNORM=1)
+g_gemv_spec: bool   // Tier 3.5: per-tensor GEMV shape-specialized kernels (default ON; QGEMVSPEC=0 disables)
 g_qconst: bool      // Tier 3 per-model constants in MSL (env QCONST=0 for legacy A/B)
 g_qc_a, g_qc_b, g_qc_c, g_qc_d: bool // which kernel groups are specialized (QCONST=1 -> all; QCONST=a/ab/abc -> staged)
 // config values mirrored for the Tier 3 dispatch (fail-fast size checks)
@@ -3066,6 +3067,24 @@ Tune_Cand :: enum { Prod, R2, V3, O }
 Tune_Entry :: struct { kind: ggml.GGML_Type, d, n: int, cand: Tune_Cand }
 g_tune: [dynamic]Tune_Entry
 g_tune_enabled: bool
+
+// ---- Tier 3.5: per-tensor GEMV shape specialization (QGEMVSPEC=1) ----
+// One constexpr-n/d kernel per (kind, n, d) GEMV shape, generated at init from
+// the model's real weights. The body is the production gemv_q4_k / gemv_q6_k
+// body with dim.n/dim.d baked, the row guard dropped (d is an exact multiple
+// of GEMV_ROWS) and nsb constexpr. Q4_K/Q6_K only; other kinds keep the
+// generic kernels. MoE models return no shapes (expert GEMVs use per-expert
+// offsets, no single shape), so the path is inert there.
+GEMV_SPEC_MAX :: 16 // cap on generated kernels (compile time); sorted by n*d*count
+Gemv_Shape :: struct { kind: ggml.GGML_Type, n, d, count: int }
+// Spec_Pick is the runtime dispatch entry: {kind, n, d} -> pso. No strings.
+Spec_Pick :: struct { kind: ggml.GGML_Type, n, d: int, pso: ^MTL.ComputePipelineState }
+// Spec_Entry is init-time only (kernel name lives in the temp allocator).
+Spec_Entry :: struct { kind: ggml.GGML_Type, n, d, count: int, name: string }
+@(private = "file")
+g_spec_entries: [dynamic]Spec_Entry // generated kernel names (init-time only)
+@(private = "file")
+g_spec_list: [dynamic]Spec_Pick     // dispatch table: {kind, n, d} -> pso
 @(private = "file")
 m_weights: ^MTL.Buffer
 @(private = "file")
@@ -3556,10 +3575,27 @@ metal_shader_selftest :: proc(allocator := context.allocator) -> (names: []strin
 		lin_head_k_dim = 128, lin_head_v_dim = 128,
 		lin_conv_kernel = 4,
 	}
-	sources := [2]string{strings.concatenate({msl_prelude(scfg), MSL_SRC}, allocator), MSL_SRC}
-	qconst_tags := [2]string{"1", "0"}
+	// Tier 3.5: also compile a build with representative per-tensor GEMV spec
+	// kernels (the 9B heretic's Q4_K/Q6_K shapes) so a typo in the generated
+	// spec MSL fails here instead of at first model load with QGEMVSPEC=1.
+	spec_samples := [?]Gemv_Shape{
+		{.Q4_K, 4096, 12288, 66},
+		{.Q6_K, 12288, 4096, 16},
+		{.Q4_K, 4096, 8192, 20},
+		{.Q6_K, 4096, 8192, 12},
+		{.Q4_K, 4096, 4096, 56},
+		{.Q4_K, 4096, 2048, 48},
+		{.Q4_K, 4096, 1024, 16},
+	}
+	spec_msl, _ := msl_gemv_spec(spec_samples[:], allocator)
+	sources := [3]string{
+		strings.concatenate({msl_prelude(scfg), MSL_SRC}, allocator),
+		MSL_SRC,
+		strings.concatenate({msl_prelude(scfg), MSL_SRC, spec_msl}, allocator),
+	}
+	qconst_tags := [3]string{"1", "0", "spec"}
 	fast_math_modes := [2]bool{true, false}
-	for si in 0 ..< 2 {
+	for si in 0 ..< 3 {
 	for fast_math in fast_math_modes {
 		src := NS.String.alloc()->initWithOdinString(sources[si])
 		defer src->release()
@@ -3632,6 +3668,9 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
+	// Tier 3.5 is ON by default (interleaved A/B on the 9B: +5.6% decode tps,
+	// see commit message); QGEMVSPEC=0 restores the generic-kernel path.
+	g_gemv_spec = os.get_env("QGEMVSPEC", context.temp_allocator) != "0"
 	qconst_val := os.get_env("QCONST", context.temp_allocator)
 	g_qconst = qconst_val != "0"
 	g_qc_all := qconst_val == "1" || qconst_val == ""
@@ -3649,6 +3688,25 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	src_str := MSL_SRC
 	if g_qconst {
 		src_str = strings.concatenate({msl_prelude(c), MSL_SRC}, context.temp_allocator)
+	}
+	// Tier 3.5: append the per-tensor GEMV spec kernels when enabled (default
+	// ON; QGEMVSPEC=0 disables). The spec section goes AFTER MSL_SRC so the
+	// kernels can reference the GEMV_ROWS/GEMV_SG constants and helper
+	// functions defined there.
+	spec_shapes := make([dynamic]Gemv_Shape)
+	if g_gemv_spec {
+		spec_shapes = collect_gemv_shapes(t)
+		gemv_spec_finalize(&spec_shapes)
+		spec_msl: string
+		spec_msl, g_spec_entries = msl_gemv_spec(spec_shapes[:], context.temp_allocator)
+		if spec_msl != "" {
+			src_str = strings.concatenate({src_str, spec_msl}, context.temp_allocator)
+		}
+		if len(g_spec_entries) > 0 {
+			fmt.eprintfln("metal: gemv spec (Tier 3.5, QGEMVSPEC=0 disables): {} per-tensor Q4_K/Q6_K kernels", len(g_spec_entries))
+		} else {
+			fmt.eprintfln("metal: gemv spec (Tier 3.5, QGEMVSPEC=0 disables): no eligible Q4_K/Q6_K shapes ({} collected)", len(spec_shapes))
+		}
 	}
 	src := NS.String.alloc()->initWithOdinString(src_str)
 	defer src->release()
@@ -3704,6 +3762,18 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_l2norm_batch = make_pso(lib, "l2norm_scale_batch")
 	m_pso_rmsgated_batch = make_pso(lib, "rmsnorm_gated_batch")
 	m_pso_chunked_delta = make_pso(lib, "chunked_delta")
+
+	// Tier 3.5: build the per-shape spec PSOs from the generated kernels.
+	// The dispatch table keeps only {kind, n, d, pso}; kernel names die with
+	// the temp allocator once metal_init returns.
+	clear(&g_spec_list)
+	for e in g_spec_entries {
+		append(&g_spec_list, Spec_Pick{e.kind, e.n, e.d, make_pso(lib, e.name)})
+	}
+	for e in g_spec_entries {
+		tag := e.kind == .Q4_K ? "q4k" : "q6k"
+		fmt.eprintfln("metal: gemv spec {} {}x{} count={} -> {}", tag, e.d, e.n, e.count, e.name)
+	}
 
 	// Tier 3 load-time-specialized variants (only compiled with the QCONST=1 prelude).
 	// Groups: a = rope/rmsnorm/norm-fused, b = full-attention, c = delta family,
@@ -3995,6 +4065,155 @@ collect_tune_shapes :: proc(t: ^Transformer) -> [dynamic]Tune_Shape {
 	}
 	tune_add_shape(&shapes, w.output.kind, raw_data(w.output.data), c.vocab_size, c.dim)
 	return shapes
+}
+
+// ---- Tier 3.5 per-tensor GEMV shape specialization (QGEMVSPEC=1) ----
+// collect_gemv_shapes scans exactly the tensors enc_gemv dispatches in the
+// decode loop (w1/w3/w2 per layer, the attention projections per layer type,
+// the output head), deduped by (kind, n, d) with a call-count weight. MoE
+// expert tensors are GEMV'd with per-expert offsets against arbitrary expert
+// rows, so MoE models return an empty list and the spec path is inert.
+
+@(private = "file")
+gemv_spec_add :: proc(shapes: ^[dynamic]Gemv_Shape, kind: ggml.GGML_Type, n, d: int) {
+	for i in 0 ..< len(shapes) {
+		if shapes[i].kind == kind && shapes[i].n == n && shapes[i].d == d {
+			shapes[i].count += 1
+			return
+		}
+	}
+	append(shapes, Gemv_Shape{kind, n, d, 1})
+}
+
+@(private = "file")
+collect_gemv_shapes :: proc(t: ^Transformer) -> [dynamic]Gemv_Shape {
+	shapes := make([dynamic]Gemv_Shape, 0, 16)
+	if t.config.is_moe { return shapes }
+	c := t.config
+	w := &t.weights
+	att_head_dim := c.n_heads * c.head_dim
+	kv_dim := c.n_kv_heads * c.head_dim
+	key_dim := c.lin_n_k_heads * c.lin_head_k_dim
+	value_dim := c.lin_n_v_heads * c.lin_head_v_dim
+	conv_dim := key_dim * 2 + value_dim
+	for l in 0 ..< c.n_layers {
+		lw := &w.layers[l]
+		gemv_spec_add(&shapes, lw.w1.kind, c.dim, c.hidden_dim)
+		gemv_spec_add(&shapes, lw.w3.kind, c.dim, c.hidden_dim)
+		gemv_spec_add(&shapes, lw.w2.kind, c.hidden_dim, c.dim)
+		switch lw.layer_type {
+		case .Full_Attention:
+			gemv_spec_add(&shapes, lw.full.wq.kind, c.dim, att_head_dim * 2)
+			gemv_spec_add(&shapes, lw.full.wk.kind, c.dim, kv_dim)
+			gemv_spec_add(&shapes, lw.full.wv.kind, c.dim, kv_dim)
+			gemv_spec_add(&shapes, lw.full.wo.kind, att_head_dim, c.dim)
+		case .Linear_Attention:
+			gemv_spec_add(&shapes, lw.linear.in_qkv.kind, c.dim, conv_dim)
+			gemv_spec_add(&shapes, lw.linear.in_z.kind, c.dim, value_dim)
+			gemv_spec_add(&shapes, lw.linear.in_b.kind, c.dim, c.lin_n_v_heads)
+			gemv_spec_add(&shapes, lw.linear.in_a.kind, c.dim, c.lin_n_v_heads)
+			gemv_spec_add(&shapes, lw.linear.out.kind, value_dim, c.dim)
+		}
+	}
+	gemv_spec_add(&shapes, w.output.kind, c.dim, c.vocab_size)
+	return shapes
+}
+
+// Keep Q4_K/Q6_K shapes with clean block math only (n % 256 == 0 so nsb =
+// n/256 is exact, d % 256 == 0 so the guardless row math covers d exactly),
+// sort by per-token FLOP weight (n*d*count) desc, cap at GEMV_SPEC_MAX.
+@(private = "file")
+gemv_spec_finalize :: proc(shapes: ^[dynamic]Gemv_Shape) {
+	kept := make([dynamic]Gemv_Shape, 0, len(shapes))
+	for s in shapes {
+		if s.kind != .Q4_K && s.kind != .Q6_K { continue }
+		if s.n % 256 == 0 && s.d % 256 == 0 {
+			append(&kept, s)
+		}
+	}
+	// insertion sort by n*d*count desc (<= a dozen entries)
+	for i in 1 ..< len(kept) {
+		e := kept[i]
+		j := i
+		for ; j > 0 && kept[j - 1].n * kept[j - 1].d * kept[j - 1].count < e.n * e.d * e.count; j -= 1 {
+			kept[j] = kept[j - 1]
+		}
+		kept[j] = e
+	}
+	if len(kept) > GEMV_SPEC_MAX {
+		resize(&kept, GEMV_SPEC_MAX)
+	}
+	shapes^ = kept
+}
+
+// msl_gemv_spec emits one constexpr-n/d kernel per Q4_K/Q6_K shape. The body
+// is the production gemv_q4_k / gemv_q6_k body verbatim with dim.n/dim.d
+// replaced by the baked n/d, the `row < dim.d` guards dropped, and nsb
+// constexpr. The section is APPENDED AFTER MSL_SRC (not between prelude and
+// MSL_SRC as a first cut would suggest) so the kernels can use the
+// GEMV_ROWS/GEMV_SG constants and helper functions (get_scale_min_k4,
+// dot_q6_superblock2) defined in MSL_SRC without forward declarations.
+@(private = "file")
+msl_gemv_spec :: proc(shapes: []Gemv_Shape, allocator := context.allocator) -> (msl: string, entries: [dynamic]Spec_Entry) {
+	entries = make([dynamic]Spec_Entry, 0, len(shapes))
+	parts := make([dynamic]string, 0, len(shapes) * 3 + 1, allocator)
+	append(&parts, "\n// ---- Tier 3.5 per-tensor GEMV shape-specialized kernels (QGEMVSPEC=1, generated at metal_init) ----\n")
+	for s, i in shapes {
+		tag: string
+		#partial switch s.kind {
+		case .Q4_K: tag = "q4k"
+		case .Q6_K: tag = "q6k"
+		case: continue
+		}
+		name := fmt.tprintf("gemv_spec_{}_{}", tag, i)
+		append(&entries, Spec_Entry{s.kind, s.n, s.d, s.count, name})
+		append(&parts, fmt.tprintf("// {} {}x{} count={}\n", tag, s.d, s.n, s.count))
+		append(&parts, fmt.tprintf("kernel void {}(device const uchar *wb [[buffer(0)]], device const float *x [[buffer(1)]],\n", name))
+		append(&parts, `    device float *out [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+`)
+		append(&parts, fmt.tprintf("    constexpr uint n = {};\n    constexpr uint d = {};\n", s.n, s.d))
+		if s.kind == .Q4_K {
+			append(&parts, `    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    constexpr uint nsb = n / 256; device const uchar *wr = wb + (ulong)row * nsb * 144;
+    float slo = 0.0, shi = 0.0;
+    for (uint sb = lane; sb < nsb; sb += GEMV_SG) { device const uchar *blk = wr + sb * 144;
+        float dall = (float)(*(device const half*)blk); float dmin = (float)(*(device const half*)(blk + 2));
+        device const uchar *scales = blk + 4; device const uchar *qs = blk + 16; uint ybase = sb * 256; int is = 0; uint qoff = 0;
+        for (uint j = 0; j < 256; j += 64) { uchar sc, m; get_scale_min_k4(is + 0, scales, sc, m); float d1 = dall * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m); float d2 = dall * sc, m2 = dmin * m;
+            for (uint l = 0; l < 32; l += 4) {
+                float4 wl = float4((float)(qs[qoff+l]&0xF),(float)(qs[qoff+l+1]&0xF),(float)(qs[qoff+l+2]&0xF),(float)(qs[qoff+l+3]&0xF));
+                float4 wh = float4((float)(qs[qoff+l]>>4),(float)(qs[qoff+l+1]>>4),(float)(qs[qoff+l+2]>>4),(float)(qs[qoff+l+3]>>4));
+                float4 xl = float4(x[ybase+j+l],x[ybase+j+l+1],x[ybase+j+l+2],x[ybase+j+l+3]);
+                float4 xh = float4(x[ybase+j+32+l],x[ybase+j+32+l+1],x[ybase+j+32+l+2],x[ybase+j+32+l+3]);
+                slo += dot(wl * d1 - m1, xl);
+                shi += dot(wh * d2 - m2, xh);
+            }
+            qoff += 32; is += 2; } }
+    sum = slo + shi;
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0) out[row] = sum;
+}
+`)
+		} else {
+			append(&parts, `    uint row = tg * GEMV_ROWS + tid / GEMV_SG; uint lane = tid % GEMV_SG; float sum = 0.0;
+    constexpr uint nsb = n / 256; device const uchar *wr = wb + (ulong)row * nsb * 210;
+    for (uint sb = lane; sb < nsb; sb += GEMV_SG) {
+        float2 acc = dot_q6_superblock2(wr + sb * 210, x, sb * 256);
+        sum += acc.x + acc.y; }
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 1);
+    if (lane % 8 == 0) out[row] = sum;
+}
+`)
+		}
+	}
+	msl = strings.concatenate(parts[:], allocator)
+	return
 }
 
 tune_time_ms :: proc() -> i64 { return time.to_unix_nanoseconds(time.now()) / 1_000_000 }
@@ -4385,8 +4604,22 @@ enc_gemv :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w_off: N
 	pso := pso_for(kind)
 	rows_tg := GEMV_ROWS
 	// Kernel selection order: env overrides (QGEMV3/QGEMV2R, handled inside
-	// pso_for) > first-run autotune table > production default. The autotune
-	// table is per (kind, rows, cols) and adapts to the GPU generation.
+	// pso_for) > Tier 3.5 per-tensor spec (default ON; QGEMVSPEC=0 disables) >
+	// first-run autotune table > production default. The spec check runs BEFORE
+	// the tune table so a spec hit always wins for its exact (kind, n, d); the
+	// tune table keeps applying to non-spec shapes. The spec kernel ignores the
+	// Dims buffer, so the spec path skips setBytes but keeps the dispatch shape.
+	if len(g_spec_list) > 0 {
+		for e in g_spec_list {
+			if e.kind == kind && e.n == n && e.d == d {
+				enc->setComputePipelineState(e.pso)
+				enc->setBuffer(m_weights, w_off, 0); enc->setBuffer(xb, x_off, 1); enc->setBuffer(ob, o_off, 2)
+				// d % 256 == 0 (collect filter), so d/GEMV_ROWS is exact.
+				enc->dispatchThreadgroups(MTL.Size{NS.Integer(d / GEMV_ROWS), 1, 1}, MTL.Size{GEMV_TG, 1, 1})
+				return
+			}
+		}
+	}
 	if (kind == .Q4_K || kind == .Q6_K) && !g_gemv3 && !g_gemv2r && len(g_tune) > 0 {
 		for e in g_tune {
 			if e.kind == kind && e.d == d && e.n == n {
