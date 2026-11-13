@@ -49,6 +49,8 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GEMV` | auto | Decode GEMV. Unset: dp4a bandwidth kernel; Q5_0 and Q8_0 under 16 MiB stay on the scalar kernel. `new`: bandwidth kernel for those small shapes too. `old` or `0`: scalar GEMV for everything. |
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K rows per warp. Unset is four. `1` selects the one-row kernel, which was slower on the V100S. |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
+| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K four ways and `atomicAdd`s the partials. `=0` is one K range. |
+| `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256) expands each quant block to fp16 once, then WMMA. `=0` uses the scalar-dequant tile. |
 | `ODINFER_CUDA_GRAPH` | on | Dense `T==1` decode is one CUDA graph. `=0` runs eager. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. A graph replay prints the captured count. |

@@ -867,6 +867,38 @@ extern "C" __global__ void delta_recurrent(float* out, float* state_all, const f
     }
 }
 
+/* One launch for a whole prefill chunk. Token t depends on the state left
+   by token t-1, so the T loop stays inside the block. Heads stay parallel. */
+extern "C" __global__ void delta_recurrent_chunk(float* out, float* state_all, const float* q_lin, const float* k_lin,
+                                                 const float* v_vec, const float* b_vec, const float* a_vec,
+                                                 const float* a_decay, const float* dt_bias,
+                                                 int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int T,
+                                                 int q_stride, int v_stride) {
+    int vh = (int)blockIdx.x;
+    int hkd = head_k_dim, hvd = head_v_dim;
+    int kh = vh % n_k_heads;
+    float* state = state_all + (size_t)vh * (size_t)hkd * (size_t)hvd;
+    for (int t = 0; t < T; ++t) {
+        const float* qt = q_lin + (size_t)t * (size_t)q_stride + (size_t)kh * (size_t)hkd;
+        const float* kt = k_lin + (size_t)t * (size_t)q_stride + (size_t)kh * (size_t)hkd;
+        const float* vt = v_vec + (size_t)t * (size_t)v_stride + (size_t)vh * (size_t)hvd;
+        float beta = sigmoid_stable(b_vec[(size_t)t * (size_t)n_v_heads + vh]);
+        float g_decay = expf(a_decay[vh] * softplus_stable(a_vec[(size_t)t * (size_t)n_v_heads + vh] + dt_bias[vh]));
+        float* oout = out + ((size_t)t * (size_t)n_v_heads + (size_t)vh) * (size_t)hvd;
+        for (int j = (int)threadIdx.x; j < hvd; j += (int)blockDim.x) {
+            for (int i = 0; i < hkd; ++i) state[(size_t)i * (size_t)hvd + j] *= g_decay;
+            float kv_mem = 0.f;
+            for (int i = 0; i < hkd; ++i) kv_mem += state[(size_t)i * (size_t)hvd + j] * kt[i];
+            float delta = (vt[j] - kv_mem) * beta;
+            for (int i = 0; i < hkd; ++i) state[(size_t)i * (size_t)hvd + j] += kt[i] * delta;
+            float o = 0.f;
+            for (int i = 0; i < hkd; ++i) o += state[(size_t)i * (size_t)hvd + j] * qt[i];
+            oout[j] = o;
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" __global__ void rmsnorm_gated(float* out, const float* inp, const float* weight, const float* gate, int size, float eps) {
     int vh = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
@@ -1269,6 +1301,138 @@ DEF_TC(q8_k, 12)
 
 #undef DEF_TC
 
+/* Q4_K / Q6_K prefill. One K-block is 256 values, so the tile is 32 tokens
+   by 32 rows by 256 K. The weight block is expanded to fp16 once per row
+   and reused for every WMMA step along that K. The scalar tc_* kernel stays
+   for other kinds and for K that is not a multiple of 256. */
+template<int Q6>
+__device__ void tc2_dequant_row(const unsigned char* blk, int part, unsigned short* dst) {
+    if (Q6 == 0) {
+        int sc, m;
+        scale_min_k4(part, blk + 4, &sc, &m);
+        float ds = ld_f16(blk) * (float)sc;
+        float dm = ld_f16(blk + 2) * (float)m;
+        int p = part >> 1;
+        int hi = part & 1;
+        const unsigned char* qs = blk + 16 + p * 32;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            unsigned char q = qs[j];
+            int qv = hi ? (int)(q >> 4) : (int)(q & 0xF);
+            dst[j] = f32_to_f16((float)qv * ds - dm);
+        }
+        return;
+    }
+    int half = part >> 2;
+    int group = part & 3;
+    float d = ld_f16(blk + 208);
+    const unsigned char* ql = blk + half * 64;
+    const unsigned char* qh = blk + 128 + half * 32;
+    const unsigned char* scb = blk + 192 + half * 8;
+#pragma unroll
+    for (int l = 0; l < 32; ++l) {
+        unsigned char qh1 = qh[l];
+        int is = l >> 4;
+        int qv, sc_i;
+        if (group == 0) {
+            qv = (int)((ql[l] & 0xF) | (((qh1 >> 0) & 3) << 4)) - 32;
+            sc_i = is;
+        } else if (group == 1) {
+            qv = (int)((ql[l + 32] & 0xF) | (((qh1 >> 2) & 3) << 4)) - 32;
+            sc_i = is + 2;
+        } else if (group == 2) {
+            qv = (int)((ql[l] >> 4) | (((qh1 >> 4) & 3) << 4)) - 32;
+            sc_i = is + 4;
+        } else {
+            qv = (int)((ql[l + 32] >> 4) | (((qh1 >> 6) & 3) << 4)) - 32;
+            sc_i = is + 6;
+        }
+        dst[l] = f32_to_f16(d * (float)(signed char)scb[sc_i] * (float)qv);
+    }
+}
+
+template<int Q6>
+__device__ void tc2_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    const int BM = 32;
+    const int BN = 32;
+    const int BK = 256;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int t0 = (int)blockIdx.y * BM;
+    const int n0 = (int)blockIdx.x * BN;
+    if (t0 >= T || n0 >= d) return;
+    int sub = lane >> 3;
+    int part = lane & 7;
+    int row = warp * 4 + sub;
+    int bbytes = Q6 ? 210 : 144;
+    int nb = n >> 8;
+
+    __shared__ __align__(16) unsigned char raw[32 * 256 * 4];
+    unsigned short* Xs = (unsigned short*)raw;
+    unsigned short* Ws = Xs + BM * BK;
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        if (row < BN) {
+            unsigned short* dst = Ws + row * BK + part * 32;
+            if (n0 + row < d) {
+                const unsigned char* blk = wb + ((size_t)(n0 + row) * (size_t)nb + (size_t)(k0 >> 8)) * (size_t)bbytes;
+                tc2_dequant_row<Q6>(blk, part, dst);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 32; ++j) dst[j] = 0;
+            }
+        }
+        for (int i = tid; i < BM * BK; i += 256) {
+            int tr = i >> 8;
+            int kk = i & 255;
+            float v = 0.f;
+            int tt = t0 + tr;
+            int kkabs = k0 + kk;
+            if (tt < T && kkabs < n) v = x[(size_t)tt * (size_t)n + (size_t)kkabs];
+            Xs[i] = f32_to_f16(v);
+        }
+        __syncthreads();
+        if (warp < 4) {
+            int wm = warp >> 1;
+            int wn = warp & 1;
+            for (int kk = 0; kk < BK; kk += 16) {
+                unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+                unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+                wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
+                wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
+                wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+            }
+        }
+        __syncthreads();
+    }
+    if (warp < 4) {
+        float* tile = (float*)raw;
+        wmma_store(tile + warp * 256, 16, c0, c1, c2, c3, c4, c5, c6, c7);
+    }
+    __syncthreads();
+    float* tile = (float*)raw;
+    for (int idx = tid; idx < 4 * 256; idx += 256) {
+        int w = idx >> 8;
+        int e = idx & 255;
+        int i = e >> 4;
+        int j = e & 15;
+        int wm = w >> 1;
+        int wn = w & 1;
+        int t = t0 + wm * 16 + i;
+        int orow = n0 + wn * 16 + j;
+        if (t < T && orow < d) out[(size_t)t * (size_t)d + orow] = tile[idx];
+    }
+}
+
+extern "C" __global__ void tc2_q4_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2_run<0>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void tc2_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2_run<1>(wb, x, out, n, d, T);
+}
+
 /* ---- bandwidth GEMV (T == 1) ------------------------------------------------
    Four rows per warp, eight threads per row. Each of those eight threads
    issues one ld.global.v4 (16 bytes) so a row's quant payload is one
@@ -1392,9 +1556,24 @@ __device__ __forceinline__ int scv_i8(uint4 scv, int idx) {
     return (int)(signed char)((w >> ((idx & 3) * 8)) & 0xffu);
 }
 
+__device__ __forceinline__ void k_range(int nb, int* b0, int* b1) {
+    int splits = (int)gridDim.y;
+    int split = (int)blockIdx.y;
+    if (splits <= 1) {
+        *b0 = 0;
+        *b1 = nb;
+        return;
+    }
+    *b0 = (int)(((long long)nb * split) / splits);
+    *b1 = (int)(((long long)nb * (split + 1)) / splits);
+}
+
 __device__ __forceinline__ void store_row(float* out, int row, int d, int writer, float acc, int accumulate) {
     if (writer && row < d) {
-        if (accumulate) out[row] += acc;
+        /* gridDim.y > 1 is split-K. The caller zeros `out` unless accumulate
+           was already set, and every split adds its partial. */
+        if ((int)gridDim.y > 1) atomicAdd(out + row, acc);
+        else if (accumulate) out[row] += acc;
         else out[row] = acc;
     }
 }
@@ -1510,8 +1689,10 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
     int p = t >> 1;
     int half = t & 1;
     int nb = n >> 8;
+    int b0s, b1s;
+    k_range(nb, &b0s, &b1s);
     float acc = 0.f;
-    for (int b = 0; b < nb; ++b) {
+    for (int b = b0s; b < b1s; ++b) {
         uint4 hdr = make_uint4(0, 0, 0, 0);
         uint4 qv = make_uint4(0, 0, 0, 0);
         if (row < d) {
@@ -1557,8 +1738,10 @@ extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char
     int l0 = (piece & 1) * 16;
     int hi_pair = piece >> 1;
     int nb = n >> 8;
+    int b0s, b1s;
+    k_range(nb, &b0s, &b1s);
     float acc = 0.f;
-    for (int b = 0; b < nb; ++b) {
+    for (int b = b0s; b < b1s; ++b) {
         uint4 ql = make_uint4(0, 0, 0, 0);
         uint4 qh = make_uint4(0, 0, 0, 0);
         uint4 scv = make_uint4(0, 0, 0, 0);

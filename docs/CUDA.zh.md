@@ -125,9 +125,12 @@ ODINFER_CUDA_TC=1 bin/cuda_smoke "$MODEL" 8 2048
 
 Q4_K 和 Q6_K 默认都是四行一个 warp。一行一个 warp 在 V100S 上每个测过的
 形状都更慢（9B 解码 33 tok/s，四行是 62；bench 上 r1 只有峰值的 8%，r4 是
-39%）。`ODINFER_CUDA_GEMV_ROWS=1` 仍可选它。总 warp 数是 `rows / 4`，改每块
-的 warp 数并不改变它，所以没有加 split-K。再发一次 kernel 填不满更多 SM，
-融合的 split 还要原子加。
+39%）。`ODINFER_CUDA_GEMV_ROWS=1` 仍可选它。一段 K 上的总 warp 数是 `rows / 4`。
+行数不超过 8192 的 Q4_K / Q6_K 把这段 K 拆到 `gridDim.y`（默认 4 路，
+`atomicAdd` 汇总）。`ODINFER_CUDA_GEMV_SPLIT=0` 关掉。K 是 256 倍数的
+Q4_K / Q6_K 预填充走 `tc2`：每个量化块展开成 fp16 一次再做 WMMA。
+`ODINFER_CUDA_TC2=0` 回到逐元素反量化。预填充的线性注意力一层一次
+`delta_recurrent_chunk`；解码 `T==1` 仍是原来的单 token 内核。
 
 16 MiB 以下的 Q8_0 和 Q5_0 留在标量内核。2048×2048 上新内核更慢（Q8_0
 118.5 对 121.8 GB/s，Q5_0 49.2 对 69.7）。9B 和 27B 的热权重是 Q4_K 和

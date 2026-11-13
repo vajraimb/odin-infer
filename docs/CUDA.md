@@ -157,10 +157,13 @@ the whole module. Scales stay in registers.
 Four rows per warp is the default for every Q4_K and Q6_K shape. One row
 per warp was slower on the V100S at every size that was timed (9B decode
 33 tok/s versus 62 for four rows; bench r1 was 8% of peak where r4 was
-39%). `ODINFER_CUDA_GEMV_ROWS=1` still selects it. Total warps are
-`rows / 4`. Changing warps per block does not change that, so split-K was
-not added. A second sequential launch would not fill more SMs, and a fused
-split would need atomics.
+39%). `ODINFER_CUDA_GEMV_ROWS=1` still selects it. Total warps of one K range are
+`rows / 4`. Short matrices split that K range across `gridDim.y` instead of
+launching a second kernel.
+
+Q4_K and Q6_K rows of 8192 or fewer split K across four blocks (`ODINFER_CUDA_GEMV_SPLIT=0` leaves them in one block). The partials are `atomicAdd`s, so the output is zeroed first unless the GEMV is accumulating into the residual.
+
+Q4_K and Q6_K prefill with K a multiple of 256 uses `tc2`: each 256-wide quant block is expanded to fp16 once per row, then WMMA walks that tile. The older scalar-dequant WMMA stays for every other kind and for `ODINFER_CUDA_TC2=0`. A prefill linear-attention chunk is one `delta_recurrent_chunk` launch per layer; the tokens stay in order inside the block. Decode (`T==1`) still launches `delta_recurrent` once.
 
 Q8_0 and Q5_0 matrices under 16 MiB stay on the scalar kernel. At
 2048×2048 the new kernel was slower (Q8_0 118.5 vs 121.8 GB/s, Q5_0 49.2
@@ -192,6 +195,8 @@ add with their own kernel. The logits GEMV does not accumulate.
 | `ODINFER_CUDA_GEMV` | auto | `old` or `0`: scalar GEMV. `new`: bandwidth kernel even for small Q5_0 / Q8_0. Unset: bandwidth, except Q5_0 / Q8_0 under 16 MiB |
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Rows per warp for Q4_K and Q6_K. Unset is four. `1` selects the slower one-row kernel |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16) |
+| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K with `rows≤8192` split K four ways. `=0` is one K range |
+| `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill expands each 256-K block to fp16 once. `=0` is the scalar-dequant WMMA tile |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count for each forward |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | Peak used by `--bench-gemv` to print % of HBM |
 | `ODINFER_CUDA_GRAPH` | on | Dense `T==1` is one CUDA graph. `=0` runs every kernel eager. MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
@@ -200,7 +205,7 @@ add with their own kernel. The logits GEMV does not accumulate.
 `cuda_selftest` runs the four-row kernel against the CPU fp32 dot for Q4_K,
 Q6_K, Q8_0, Q5_0, and Q5_K at 64×512 and at 6×256 (the tail that is not a
 multiple of four rows). Q4_K and Q6_K also run the one-row kernel, including
-`accumulate=1` (output starts at 0.25, expect `ref+0.25`). Allowance is
+`accumulate=1` (output starts at 0.25, expect `ref+0.25`). The 64×512 cases also launch split-K with `gridDim.y=2`. `tc2_q4_k` and `tc2_q6_k` run at 64×256×32 and at a partial tile. `delta_recurrent_chunk` runs two tokens and two value heads against `delta_recurrent_step`. Allowance is
 `1 + 0.05*|ref|`. The gap against the CPU is the q8 of `x`; a swapped
 nibble or scale is on the order of `|ref|`.
 

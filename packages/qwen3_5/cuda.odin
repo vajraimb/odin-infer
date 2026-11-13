@@ -129,6 +129,10 @@ g_gemv_force: int // 0 old, 1 auto, 2 always the new kernel
 @(private)
 g_gemv_rows: int // 0 or 4: four rows/warp. 1: one row/warp.
 @(private)
+g_gemv_split: bool // short Q4_K / Q6_K GEMV splits K across grid.y
+@(private)
+g_tc2: bool // Q4_K / Q6_K prefill uses the block-dequant WMMA kernel
+@(private)
 g_gemv_warps: int
 @(private)
 g_launches: int
@@ -171,7 +175,9 @@ k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy: cu.Function
 @(private)
 k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v: cu.Function
 @(private)
-k_conv, k_l2, k_delta, k_rmsgate, k_moe_topk: cu.Function
+k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_moe_topk: cu.Function
+@(private)
+k_tc2_q4, k_tc2_q6: cu.Function
 
 Prof_Bin :: struct {
 	name:  string,
@@ -498,15 +504,34 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	if r1 {
 		rows_per = warps
 	}
+	splits := 1
+	// Short Q4/Q6 rows (wq, wo, w2) do not fill the SMs. Split K so more
+	// blocks are in flight. Tall rows stay one split. Capture keeps one
+	// split: the zeroing memset is not on the capture stream.
+	if g_gemv_split && !g_capturing && !r1 && (kind == .Q4_K || kind == .Q6_K) && d > 0 && d <= 8192 {
+		nb := n / 256
+		if nb >= 4 {
+			splits = 4
+		} else if nb >= 2 {
+			splits = 2
+		}
+	}
+	if splits > 1 && accumulate == 0 {
+		if cu.memset(y, 0, d * 4) != cu.OK {
+			fmt.eprintln("cuda: gemv split memset failed")
+			return false
+		}
+	}
 	gx := u32((d + rows_per - 1) / rows_per)
 	bx := u32(warps * 32)
 	what := gemv_what(kind, r1)
+	gy := u32(splits)
 	if kind == .Q4_K || kind == .Q5_K {
 		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
-		return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], what)
+		return klaunch(fn, gx, gy, 1, bx, 1, 1, args[:], what)
 	}
 	args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
-	return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], what)
+	return klaunch(fn, gx, gy, 1, bx, 1, 1, args[:], what)
 }
 
 launch_gemv :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int) -> bool {
@@ -561,13 +586,24 @@ use_tensor_cores :: proc(tcount: int) -> bool {
 
 @(private)
 launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
+	wb, xx, yy := w, x, y
+	nn, dd, tt := i32(n), i32(d), i32(tcount)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	if g_tc2 && n > 0 && n % 256 == 0 && (kind == .Q4_K || kind == .Q6_K) {
+		fn := k_tc2_q4
+		if kind == .Q6_K {
+			fn = k_tc2_q6
+		}
+		if fn != nil {
+			gx := u32((d + 31) / 32)
+			gy := u32((tcount + 31) / 32)
+			return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "tc2")
+		}
+	}
 	fn := tc_fn[int(kind)]
 	if fn == nil {
 		return false
 	}
-	wb, xx, yy := w, x, y
-	nn, dd, tt := i32(n), i32(d), i32(tcount)
-	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
 	gx := u32((d + 63) / 64)
 	gy := u32((tcount + 63) / 64)
 	return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], "tc")
@@ -751,6 +787,16 @@ launch_delta :: proc(outp, state, q, k, v, b, a, decay, dt: cu.Device_Ptr, hkd, 
 	return klaunch(k_delta, u32(nvh), 1, 1, 128, 1, 1, args[:], "delta")
 }
 
+// q_stride is the token stride of q and k. v_stride is the token stride of v.
+@(private)
+launch_delta_chunk :: proc(outp, state, q, k, v, b, a, decay, dt: cu.Device_Ptr, hkd, hvd, nkh, nvh, T, q_stride, v_stride: int) -> bool {
+	o, st, qq, kk, vv, bb, aa, dec, dtb := outp, state, q, k, v, b, a, decay, dt
+	ik, iv, nk, nv := i32(hkd), i32(hvd), i32(nkh), i32(nvh)
+	tt, qs, vs := i32(T), i32(q_stride), i32(v_stride)
+	args := [?]rawptr{&o, &st, &qq, &kk, &vv, &bb, &aa, &dec, &dtb, &ik, &iv, &nk, &nv, &tt, &qs, &vs}
+	return klaunch(k_delta_chunk, u32(nvh), 1, 1, 128, 1, 1, args[:], "delta_chunk")
+}
+
 @(private)
 launch_gated :: proc(outp, inp, weight, gate: cu.Device_Ptr, n_vh, hvd: int, eps: f32) -> bool {
 	a, b, c, d := outp, inp, weight, gate
@@ -803,6 +849,9 @@ bind_kernels :: proc() -> bool {
 	k_conv = get_fn("conv1d_step")
 	k_l2 = get_fn("l2norm_scale")
 	k_delta = get_fn("delta_recurrent")
+	k_delta_chunk = get_fn("delta_recurrent_chunk")
+	k_tc2_q4 = get_fn("tc2_q4_k")
+	k_tc2_q6 = get_fn("tc2_q6_k")
 	k_rmsgate = get_fn("rmsnorm_gated")
 	k_moe_topk = get_fn("moe_softmax_topk")
 	k_quant = get_fn("quant_q8")
@@ -817,7 +866,8 @@ bind_kernels :: proc() -> bool {
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
 		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v,
-		k_conv, k_l2, k_delta, k_rmsgate, k_moe_topk,
+		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_moe_topk,
+		k_tc2_q4, k_tc2_q6,
 		k_quant, k_rmsnorm_q8, k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
 	}
@@ -1106,6 +1156,8 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_gemv_rows = int(v)
 		}
 	}
+	g_gemv_split = os.get_env("ODINFER_CUDA_GEMV_SPLIT", context.temp_allocator) != "0"
+	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
 	g_count_launches = os.get_env("ODINFER_CUDA_LAUNCHES", context.temp_allocator) == "1"
 	g_profile = os.get_env("ODINFER_CUDA_PROFILE", context.temp_allocator) == "1"
 	g_use_graph = os.get_env("ODINFER_CUDA_GRAPH", context.temp_allocator) != "0"
@@ -1290,6 +1342,12 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		tc_note = "on for T>1 (ODINFER_CUDA_TC=1)"
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
+	if g_tc2 {
+		fmt.eprintln("cuda: tc2 on for Q4_K/Q6_K when K is a multiple of 256 (ODINFER_CUDA_TC2=0 uses the scalar dequant tile)")
+	}
+	if g_gemv_split {
+		fmt.eprintln("cuda: gemv split-K on for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLIT=0 disables it)")
+	}
 	if g_gemv_new {
 		rows_note := "4 rows/warp"
 		if g_gemv_rows == 1 {
@@ -1414,13 +1472,25 @@ cuda_linear :: proc(tr: ^Transformer, l, pos0, T: int) {
 		qout := fp(d_qkv2, ti * convdim)
 		must(launch_conv(qout, qin, cstate, wconv, convdim, p.lin_conv_kernel))
 		must(launch_l2(fp(d_qlin, ti * key), fp(d_klin, ti * key), qout, fp(qout, key), p.lin_n_k_heads, p.lin_head_k_dim, eps, scale))
-		must(launch_delta(
-			fp(d_lout, ti * val), rstate,
-			fp(d_qlin, ti * key), fp(d_klin, ti * key), fp(qout, key * 2),
-			fp(d_b, ti * p.lin_n_v_heads), fp(d_a, ti * p.lin_n_v_heads),
-			dev_f32(la.a_decay), dev_f32(la.dt_bias),
-			p.lin_head_k_dim, p.lin_head_v_dim, p.lin_n_k_heads, p.lin_n_v_heads,
+	}
+	if T > 1 && k_delta_chunk != nil {
+		must(launch_delta_chunk(
+			d_lout, rstate, d_qlin, d_klin, fp(d_qkv2, key * 2),
+			d_b, d_a, dev_f32(la.a_decay), dev_f32(la.dt_bias),
+			p.lin_head_k_dim, p.lin_head_v_dim, p.lin_n_k_heads, p.lin_n_v_heads, T, key, convdim,
 		))
+	} else {
+		for ti in 0 ..< T {
+			must(launch_delta(
+				fp(d_lout, ti * val), rstate,
+				fp(d_qlin, ti * key), fp(d_klin, ti * key), fp(fp(d_qkv2, ti * convdim), key * 2),
+				fp(d_b, ti * p.lin_n_v_heads), fp(d_a, ti * p.lin_n_v_heads),
+				dev_f32(la.a_decay), dev_f32(la.dt_bias),
+				p.lin_head_k_dim, p.lin_head_v_dim, p.lin_n_k_heads, p.lin_n_v_heads,
+			))
+		}
+	}
+	for ti in 0 ..< T {
 		lout := fp(d_lout, ti * val)
 		must(launch_gated(lout, lout, dev_f32(la.norm_w), fp(d_z, ti * val), p.lin_n_v_heads, p.lin_head_v_dim, eps))
 	}

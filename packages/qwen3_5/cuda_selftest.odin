@@ -407,6 +407,33 @@ run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> boo
 		if !s_report(fmt.tprintf("%s accumulate %dx%d", rname, rows, cols), st, atol, rtol) {
 			return false
 		}
+		if cols / 256 >= 2 {
+			if cu.memset(dy, 0, rows * 4) != cu.OK {
+				fmt.eprintln("cuda_selftest: split memset failed")
+				return false
+			}
+			acc = 0
+			launched = false
+			if kind == .Q4_K {
+				args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+				launched = cu.launch(fn, gx, 2, 1, bx, 1, 1, 0, args[:]) == cu.OK
+			} else {
+				args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+				launched = cu.launch(fn, gx, 2, 1, bx, 1, 1, 0, args[:]) == cu.OK
+			}
+			if !launched || cu.sync() != cu.OK {
+				fmt.eprintfln("cuda_selftest: gemv2 split launch failed (%s)", tag)
+				return false
+			}
+			cu.download(raw_data(got), dy, rows * 4)
+			st = {}
+			for r in 0 ..< rows {
+				s_note(&st, fmt.tprintf("gemv2 split %s row %d", tag, r), got[r], ref[r], atol, rtol)
+			}
+			if !s_report(fmt.tprintf("gemv2 split %s %dx%d", tag, rows, cols), st, atol, rtol) {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -509,6 +536,60 @@ run_tc :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> boo
 		s_note(&st, fmt.tprintf("tc %s [%d]", tag, i), got[i], ref[i], atol, rtol)
 	}
 	return s_report(fmt.tprintf("tc %s T=%d rows=%d cols=%d", tag, T, rows, cols), st, atol, rtol)
+}
+
+@(private)
+run_tc2 :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bool {
+	name := "tc2_q4_k"
+	if kind == .Q6_K {
+		name = "tc2_q6_k"
+	}
+	fn := s_fn(name)
+	if fn == nil {
+		fmt.eprintf("cuda_selftest: missing %s\n", name)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref := make([]f32, T * rows)
+	defer delete(ref)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw, x[t * cols:][:cols], rows, cols)
+		copy(ref[t * rows:][:rows], row)
+		delete(row)
+	}
+	dw, _ := cu.alloc(len(raw))
+	dx, _ := cu.alloc(T * cols * 4)
+	dy, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	wb, xx, yy := dw, dx, dy
+	nn, dd, tt := i32(cols), i32(rows), i32(T)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	gx := u32((rows + 31) / 32)
+	gy := u32((T + 31) / 32)
+	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
+		return false
+	}
+	got := make([]f32, T * rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, T * rows * 4)
+	st: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st, fmt.tprintf("%s [%d]", name, i), got[i], ref[i], atol, rtol)
+	}
+	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
 }
 
 @(private)
@@ -891,6 +972,127 @@ run_delta :: proc() -> bool {
 	return s_report("delta state", st_state, 1e-4, 1e-4)
 }
 
+// Two tokens, two value heads, one key head. The chunk kernel must match
+// stepping delta_recurrent_step in token order.
+@(private)
+run_delta_chunk :: proc() -> bool {
+	fn := s_fn("delta_recurrent_chunk")
+	if fn == nil {
+		fmt.eprintln("cuda_selftest: delta_recurrent_chunk missing")
+		return false
+	}
+	hkd, hvd, nkh, nvh, T := 4, 4, 1, 2, 2
+	state := make([]f32, nvh * hkd * hvd)
+	q := make([]f32, T * nkh * hkd)
+	k := make([]f32, T * nkh * hkd)
+	v := make([]f32, T * nvh * hvd)
+	b := make([]f32, T * nvh)
+	a := make([]f32, T * nvh)
+	dec := make([]f32, nvh)
+	dt := make([]f32, nvh)
+	defer delete(state)
+	defer delete(q)
+	defer delete(k)
+	defer delete(v)
+	defer delete(b)
+	defer delete(a)
+	defer delete(dec)
+	defer delete(dt)
+	for i in 0 ..< len(state) {
+		state[i] = (f32(i % 5) - 2) * 0.05
+	}
+	for t in 0 ..< T {
+		for i in 0 ..< nkh * hkd {
+			q[t * nkh * hkd + i] = 0.1 * f32(t + 1) + 0.01 * f32(i)
+			k[t * nkh * hkd + i] = 0.05 * f32(i + 1) - 0.02 * f32(t)
+		}
+		for h in 0 ..< nvh {
+			b[t * nvh + h] = 0.2 * f32(h + 1) + 0.1 * f32(t)
+			a[t * nvh + h] = -0.3 + 0.1 * f32(t + h)
+			for j in 0 ..< hvd {
+				v[(t * nvh + h) * hvd + j] = 0.15 * f32(j + 1) - 0.05 * f32(t)
+			}
+		}
+	}
+	for h in 0 ..< nvh {
+		dec[h] = -0.4 - 0.1 * f32(h)
+		dt[h] = 0.05 * f32(h + 1)
+	}
+	cpu_state := make([]f32, len(state))
+	copy(cpu_state, state)
+	defer delete(cpu_state)
+	cpu_out := make([]f32, T * nvh * hvd)
+	defer delete(cpu_out)
+	scratch := make([]f32, hvd)
+	defer delete(scratch)
+	for t in 0 ..< T {
+		for h in 0 ..< nvh {
+			beta := sigmoid_f32(b[t * nvh + h])
+			g := math.exp_f32(dec[h] * softplus_f32(a[t * nvh + h] + dt[h]))
+			delta_recurrent_step(
+				cpu_out[(t * nvh + h) * hvd:][:hvd],
+				cpu_state[h * hkd * hvd:][:hkd * hvd],
+				q[t * nkh * hkd:][:hkd],
+				k[t * nkh * hkd:][:hkd],
+				v[(t * nvh + h) * hvd:][:hvd],
+				scratch, beta, g, hkd, hvd,
+			)
+		}
+	}
+	ds, _ := cu.alloc(len(state) * 4)
+	dq, _ := cu.alloc(len(q) * 4)
+	dk, _ := cu.alloc(len(k) * 4)
+	dv, _ := cu.alloc(len(v) * 4)
+	db, _ := cu.alloc(len(b) * 4)
+	da, _ := cu.alloc(len(a) * 4)
+	dd, _ := cu.alloc(len(dec) * 4)
+	dtb, _ := cu.alloc(len(dt) * 4)
+	dout, _ := cu.alloc(len(cpu_out) * 4)
+	defer cu.free(ds)
+	defer cu.free(dq)
+	defer cu.free(dk)
+	defer cu.free(dv)
+	defer cu.free(db)
+	defer cu.free(da)
+	defer cu.free(dd)
+	defer cu.free(dtb)
+	defer cu.free(dout)
+	cu.upload(ds, raw_data(state), len(state) * 4)
+	cu.upload(dq, raw_data(q), len(q) * 4)
+	cu.upload(dk, raw_data(k), len(k) * 4)
+	cu.upload(dv, raw_data(v), len(v) * 4)
+	cu.upload(db, raw_data(b), len(b) * 4)
+	cu.upload(da, raw_data(a), len(a) * 4)
+	cu.upload(dd, raw_data(dec), len(dec) * 4)
+	cu.upload(dtb, raw_data(dt), len(dt) * 4)
+	o, stp, qq, kk, vv, bb, aa, decp, dtp := dout, ds, dq, dk, dv, db, da, dd, dtb
+	ik, iv, nk, nv := i32(hkd), i32(hvd), i32(nkh), i32(nvh)
+	tt, qs, vs := i32(T), i32(nkh * hkd), i32(nvh * hvd)
+	args := [?]rawptr{&o, &stp, &qq, &kk, &vv, &bb, &aa, &decp, &dtp, &ik, &iv, &nk, &nv, &tt, &qs, &vs}
+	if cu.launch(fn, u32(nvh), 1, 1, 128, 1, 1, 0, args[:]) != cu.OK || cu.sync() != cu.OK {
+		fmt.eprintln("cuda_selftest: delta chunk launch failed")
+		return false
+	}
+	gout := make([]f32, len(cpu_out))
+	gstate := make([]f32, len(state))
+	defer delete(gout)
+	defer delete(gstate)
+	cu.download(raw_data(gout), dout, len(cpu_out) * 4)
+	cu.download(raw_data(gstate), ds, len(state) * 4)
+	st_out: Case_Err
+	for i in 0 ..< len(cpu_out) {
+		s_note(&st_out, fmt.tprintf("delta chunk out[%d]", i), gout[i], cpu_out[i], 1e-4, 1e-4)
+	}
+	if !s_report("delta chunk out", st_out, 1e-4, 1e-4) {
+		return false
+	}
+	st_state: Case_Err
+	for i in 0 ..< len(state) {
+		s_note(&st_state, fmt.tprintf("delta chunk state[%d]", i), gstate[i], cpu_state[i], 1e-4, 1e-4)
+	}
+	return s_report("delta chunk state", st_state, 1e-4, 1e-4)
+}
+
 cuda_selftest :: proc() -> bool {
 	if !s_open() {
 		return false
@@ -951,6 +1153,15 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_tc(.Q5_0, 40, 64, 20, 5e-2, 5e-2) {
+		ok = false
+	}
+	if !run_tc2(.Q4_K, 64, 256, 32, 5e-2, 5e-2) || !run_tc2(.Q6_K, 64, 256, 32, 5e-2, 5e-2) {
+		ok = false
+	}
+	if !run_tc2(.Q4_K, 40, 256, 20, 5e-2, 5e-2) || !run_tc2(.Q6_K, 40, 512, 20, 5e-2, 5e-2) {
+		ok = false
+	}
+	if !run_delta_chunk() {
 		ok = false
 	}
 	if !run_elem() {
