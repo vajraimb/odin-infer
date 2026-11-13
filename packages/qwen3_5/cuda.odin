@@ -1,6 +1,7 @@
 /* CUDA forward for Qwen3.5. Compiled only with -define:ODINFER_BACKEND="cuda".
    The driver and NVRTC are dlopen'd; nothing here links against libcuda.
-   One warp per GEMV row, fp32 accumulate, sm_70+. The KV layout matches the
+   Decode (T==1) uses a bandwidth GEMV (dp4a, 4 rows/warp); ODINFER_CUDA_GEMV=old
+   restores one warp per row. Prefill uses WMMA when it pays. KV layout matches the
    Metal/CPU snapshot bytes (Q8_0 K, mixed or Q8 V, or legacy f16). */
 
 package qwen3_5
@@ -114,6 +115,26 @@ g_sm_major: int
 @(private)
 g_tc_mode: int // -1 auto, 0 off, 1 on for every T>1
 @(private)
+g_gemv_new: bool
+@(private)
+g_gemv_warps: int
+@(private)
+g_launches: int
+@(private)
+g_count_launches: bool
+@(private)
+d_xq, d_xd, d_xs: cu.Device_Ptr
+@(private)
+g_q8_cap, g_q8_n: int
+@(private)
+g_q8_src: cu.Device_Ptr
+@(private)
+g_q8_valid: bool
+@(private)
+k_quant, k_rmsnorm_q8: cu.Function
+@(private)
+k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
+@(private)
 k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy: cu.Function
 @(private)
 k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v: cu.Function
@@ -134,6 +155,14 @@ ck :: proc(err: cu.Error, what: string) -> bool {
 	}
 	fmt.eprintf("cuda: %s: %s\n", what, cu.error_string(err))
 	return false
+}
+
+@(private)
+klaunch :: proc(fn: cu.Function, gx, gy, gz, bx, by, bz: u32, args: []rawptr, what: string) -> bool {
+	if g_count_launches {
+		g_launches += 1
+	}
+	return ck(cu.launch(fn, gx, gy, gz, bx, by, bz, 0, args), what)
 }
 
 @(private)
@@ -261,10 +290,58 @@ free_live :: proc() {
 }
 
 @(private)
-launch_gemv :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int) -> bool {
-	if d <= 0 || n <= 0 {
+q8_drop :: proc() {
+	g_q8_valid = false
+}
+
+@(private)
+gemv2_for :: proc(kind: ggml.GGML_Type) -> cu.Function {
+	if kind == .Q4_K do return k_gemv2_q4
+	if kind == .Q6_K do return k_gemv2_q6
+	if kind == .Q5_K do return k_gemv2_q5k
+	if kind == .Q8_0 do return k_gemv2_q8
+	if kind == .Q5_0 do return k_gemv2_q50
+	return nil
+}
+
+@(private)
+gemv2_aligned :: proc(kind: ggml.GGML_Type, n: int) -> bool {
+	if n <= 0 || n > g_q8_cap || d_xq == 0 {
+		return false
+	}
+	if kind == .Q4_K || kind == .Q6_K || kind == .Q5_K {
+		return n % 256 == 0
+	}
+	if kind == .Q8_0 || kind == .Q5_0 {
+		return n % 32 == 0
+	}
+	return false
+}
+
+@(private)
+q8_ensure :: proc(x: cu.Device_Ptr, n: int) -> bool {
+	if g_q8_valid && g_q8_src == x && g_q8_n == n {
 		return true
 	}
+	if k_quant == nil || n > g_q8_cap || n % 32 != 0 {
+		return false
+	}
+	xx := x
+	qs, sc, sm := d_xq, d_xd, d_xs
+	nn := i32(n)
+	args := [?]rawptr{&xx, &qs, &sc, &sm, &nn}
+	nb := n / 32
+	if !klaunch(k_quant, u32((nb + 127) / 128), 1, 1, 128, 1, 1, args[:], "quant_q8") {
+		return false
+	}
+	g_q8_src = x
+	g_q8_n = n
+	g_q8_valid = true
+	return true
+}
+
+@(private)
+launch_gemv_old :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int) -> bool {
 	fn := gemv_fn[int(kind)]
 	if fn == nil {
 		fmt.eprintf("cuda: no GEMV for %v\n", kind)
@@ -273,7 +350,43 @@ launch_gemv :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int) -> 
 	wb, xx, yy := w, x, y
 	nn, dd := i32(n), i32(d)
 	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd}
-	return ck(cu.launch(fn, u32(d), 1, 1, 32, 1, 1, 0, args[:]), "gemv")
+	return klaunch(fn, u32(d), 1, 1, 32, 1, 1, args[:], "gemv")
+}
+
+@(private)
+launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr, n, d: int) -> bool {
+	warps := g_gemv_warps
+	if warps < 1 {
+		warps = 1
+	}
+	if warps > 16 {
+		warps = 16
+	}
+	wb, yy := w, y
+	qs, sc, sm := d_xq, d_xd, d_xs
+	nn, dd := i32(n), i32(d)
+	rows_per := warps * 4
+	gx := u32((d + rows_per - 1) / rows_per)
+	bx := u32(warps * 32)
+	if kind == .Q4_K || kind == .Q5_K {
+		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd}
+		return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], "gemv2")
+	}
+	args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd}
+	return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], "gemv2")
+}
+
+launch_gemv :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int) -> bool {
+	if d <= 0 || n <= 0 {
+		return true
+	}
+	if g_gemv_new {
+		fn := gemv2_for(kind)
+		if fn != nil && gemv2_aligned(kind, n) && q8_ensure(x, n) {
+			return launch_gemv2(fn, kind, w, y, n, d)
+		}
+	}
+	return launch_gemv_old(kind, w, x, y, n, d)
 }
 
 @(private)
@@ -289,7 +402,7 @@ launch_mmq :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: i
 	wb, xx, yy := w, x, y
 	nn, dd, tt := i32(n), i32(d), i32(tcount)
 	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
-	return ck(cu.launch(fn, u32(d), 1, 1, 32, 1, 1, 0, args[:]), "mmq")
+	return klaunch(fn, u32(d), 1, 1, 32, 1, 1, args[:], "mmq")
 }
 
 @(private)
@@ -314,7 +427,7 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
 	gx := u32((d + 63) / 64)
 	gy := u32((tcount + 63) / 64)
-	return ck(cu.launch(fn, gx, gy, 1, 512, 1, 1, 0, args[:]), "tc")
+	return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], "tc")
 }
 
 @(private)
@@ -334,11 +447,28 @@ launch_rmsnorm :: proc(inp, outp, weight: cu.Device_Ptr, rows, size: int, eps: f
 	if rows <= 0 || size <= 0 {
 		return true
 	}
+	// Decode (one row): RMSNorm and the q8 activation quant share one pass.
+	// The following GEMVs of this vector then skip the quant kernel.
+	if g_gemv_new && rows == 1 && size % 32 == 0 && size <= g_q8_cap && k_rmsnorm_q8 != nil && d_xq != 0 {
+		a, b, c := inp, outp, weight
+		qs, sc, sm := d_xq, d_xd, d_xs
+		sz := i32(size)
+		ep := eps
+		args := [?]rawptr{&a, &b, &c, &qs, &sc, &sm, &sz, &ep}
+		if !klaunch(k_rmsnorm_q8, 1, 1, 1, 128, 1, 1, args[:], "rmsnorm_q8") {
+			return false
+		}
+		g_q8_src = outp
+		g_q8_n = size
+		g_q8_valid = true
+		return true
+	}
+	q8_drop()
 	a, b, c := inp, outp, weight
 	sz := i32(size)
 	ep := eps
 	args := [?]rawptr{&a, &b, &c, &sz, &ep}
-	return ck(cu.launch(k_rmsnorm, u32(rows), 1, 1, 128, 1, 1, 0, args[:]), "rmsnorm")
+	return klaunch(k_rmsnorm, u32(rows), 1, 1, 128, 1, 1, args[:], "rmsnorm")
 }
 
 @(private)
@@ -347,7 +477,7 @@ launch_qnorm :: proc(qproj, q, qn: cu.Device_Ptr, nheads, head: int, eps: f32) -
 	n := i32(head)
 	ep := eps
 	args := [?]rawptr{&a, &b, &c, &n, &ep}
-	return ck(cu.launch(k_qnorm, u32(nheads), 1, 1, 128, 1, 1, 0, args[:]), "qnorm")
+	return klaunch(k_qnorm, u32(nheads), 1, 1, 128, 1, 1, args[:], "qnorm")
 }
 
 @(private)
@@ -361,7 +491,7 @@ launch_rope :: proc(vec: cu.Device_Ptr, head_dim, pos: int, theta: f32, rotary, 
 	hd, ps, rd, nh := i32(head_dim), i32(pos), i32(rotary), i32(nheads)
 	th := theta
 	args := [?]rawptr{&v, &hd, &ps, &th, &rd, &nh}
-	return ck(cu.launch(k_rope, grid_n(total, 128), 1, 1, 128, 1, 1, 0, args[:]), "rope")
+	return klaunch(k_rope, grid_n(total, 128), 1, 1, 128, 1, 1, args[:], "rope")
 }
 
 @(private)
@@ -370,15 +500,16 @@ launch_gate :: proc(xb3, qproj: cu.Device_Ptr, head_dim, nheads: int) -> bool {
 	hd, nh := i32(head_dim), i32(nheads)
 	args := [?]rawptr{&a, &b, &hd, &nh}
 	n := nheads * head_dim
-	return ck(cu.launch(k_gate, grid_n(n, 256), 1, 1, 256, 1, 1, 0, args[:]), "attn_gate")
+	return klaunch(k_gate, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "attn_gate")
 }
 
 @(private)
 launch_swiglu :: proc(hb, hb2: cu.Device_Ptr, n: int) -> bool {
+	q8_drop()
 	a, b := hb, hb2
 	nn := i32(n)
 	args := [?]rawptr{&a, &b, &nn}
-	return ck(cu.launch(k_swiglu, grid_n(n, 256), 1, 1, 256, 1, 1, 0, args[:]), "swiglu")
+	return klaunch(k_swiglu, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "swiglu")
 }
 
 @(private)
@@ -386,7 +517,7 @@ launch_residual :: proc(x, y: cu.Device_Ptr, n: int) -> bool {
 	a, b := x, y
 	nn := i32(n)
 	args := [?]rawptr{&a, &b, &nn}
-	return ck(cu.launch(k_residual, grid_n(n, 256), 1, 1, 256, 1, 1, 0, args[:]), "residual")
+	return klaunch(k_residual, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "residual")
 }
 
 @(private)
@@ -395,7 +526,7 @@ launch_axpy :: proc(y, x: cu.Device_Ptr, a: f32, n: int) -> bool {
 	aa := a
 	nn := i32(n)
 	args := [?]rawptr{&yy, &xx, &aa, &nn}
-	return ck(cu.launch(k_axpy, grid_n(n, 256), 1, 1, 256, 1, 1, 0, args[:]), "axpy")
+	return klaunch(k_axpy, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "axpy")
 }
 
 @(private)
@@ -404,7 +535,7 @@ store_f16_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	hd, sl, ps, nk := i32(g_head), i32(g_seq), i32(pos), i32(g_kv_heads)
 	args := [?]rawptr{&a, &b, &c, &d, &hd, &sl, &ps, &nk}
 	n := g_kv_heads * g_head
-	return ck(cu.launch(k_store_f16, grid_n(n, 128), 1, 1, 128, 1, 1, 0, args[:]), "store_f16")
+	return klaunch(k_store_f16, grid_n(n, 128), 1, 1, 128, 1, 1, args[:], "store_f16")
 }
 
 @(private)
@@ -413,7 +544,7 @@ attn_f16_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	sc := d_scores
 	hd, sl, mul, ps := i32(g_head), i32(g_seq), i32(g_heads / g_kv_heads), i32(pos)
 	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &sl, &mul, &ps}
-	return ck(cu.launch(k_attn_f16, u32(g_heads), 1, 1, 128, 1, 1, 0, args[:]), "attn_f16")
+	return klaunch(k_attn_f16, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_f16")
 }
 
 @(private)
@@ -421,7 +552,7 @@ store_q8_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
 	nb, pb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(pos)
 	args := [?]rawptr{&a, &b, &c, &d, &nb, &pb, &ps}
-	return ck(cu.launch(k_store_q8, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, 0, args[:]), "store_q8")
+	return klaunch(k_store_q8, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, args[:], "store_q8")
 }
 
 @(private)
@@ -430,7 +561,7 @@ attn_q8_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	sc := d_scores
 	hd, pb, mul, ps, sl := i32(g_head), i32(g_k_pos), i32(g_heads / g_kv_heads), i32(pos), i32(g_seq)
 	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &pb, &mul, &ps, &sl}
-	return ck(cu.launch(k_attn_q8, u32(g_heads), 1, 1, 128, 1, 1, 0, args[:]), "attn_q8")
+	return klaunch(k_attn_q8, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8")
 }
 
 @(private)
@@ -438,7 +569,7 @@ store_q8v_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
 	nb, kb, vb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(g_v_pos), i32(pos)
 	args := [?]rawptr{&a, &b, &c, &d, &nb, &kb, &vb, &ps}
-	return ck(cu.launch(k_store_q8v, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, 0, args[:]), "store_q8v")
+	return klaunch(k_store_q8v, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, args[:], "store_q8v")
 }
 
 @(private)
@@ -449,7 +580,7 @@ attn_q8v_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	kb, vb := i32(g_k_pos), i32(g_v_pos)
 	mul, ps, sl := i32(g_heads / g_kv_heads), i32(pos), i32(g_seq)
 	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &kb, &vb, &mul, &ps, &sl}
-	return ck(cu.launch(k_attn_q8v, u32(g_heads), 1, 1, 128, 1, 1, 0, args[:]), "attn_q8v")
+	return klaunch(k_attn_q8v, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8v")
 }
 
 @(private)
@@ -457,7 +588,7 @@ launch_conv :: proc(outp, inp, state, weight: cu.Device_Ptr, conv_dim, kernel: i
 	a, b, c, d := outp, inp, state, weight
 	cd, k := i32(conv_dim), i32(kernel)
 	args := [?]rawptr{&a, &b, &c, &d, &cd, &k}
-	return ck(cu.launch(k_conv, grid_n(conv_dim, 128), 1, 1, 128, 1, 1, 0, args[:]), "conv")
+	return klaunch(k_conv, grid_n(conv_dim, 128), 1, 1, 128, 1, 1, args[:], "conv")
 }
 
 @(private)
@@ -466,7 +597,7 @@ launch_l2 :: proc(q_out, k_out, q_in, k_in: cu.Device_Ptr, n_kh, head_k: int, ep
 	hk := i32(head_k)
 	ep, sc := eps, scale
 	args := [?]rawptr{&a, &b, &c, &d, &hk, &ep, &sc}
-	return ck(cu.launch(k_l2, u32(n_kh), 1, 1, 128, 1, 1, 0, args[:]), "l2norm")
+	return klaunch(k_l2, u32(n_kh), 1, 1, 128, 1, 1, args[:], "l2norm")
 }
 
 @(private)
@@ -474,7 +605,7 @@ launch_delta :: proc(outp, state, q, k, v, b, a, decay, dt: cu.Device_Ptr, hkd, 
 	o, st, qq, kk, vv, bb, aa, dec, dtb := outp, state, q, k, v, b, a, decay, dt
 	ik, iv, nk := i32(hkd), i32(hvd), i32(nkh)
 	args := [?]rawptr{&o, &st, &qq, &kk, &vv, &bb, &aa, &dec, &dtb, &ik, &iv, &nk}
-	return ck(cu.launch(k_delta, u32(nvh), 1, 1, 128, 1, 1, 0, args[:]), "delta")
+	return klaunch(k_delta, u32(nvh), 1, 1, 128, 1, 1, args[:], "delta")
 }
 
 @(private)
@@ -483,7 +614,7 @@ launch_gated :: proc(outp, inp, weight, gate: cu.Device_Ptr, n_vh, hvd: int, eps
 	sz := i32(hvd)
 	ep := eps
 	args := [?]rawptr{&a, &b, &c, &d, &sz, &ep}
-	return ck(cu.launch(k_rmsgate, u32(n_vh), 1, 1, 128, 1, 1, 0, args[:]), "rmsnorm_gated")
+	return klaunch(k_rmsgate, u32(n_vh), 1, 1, 128, 1, 1, args[:], "rmsnorm_gated")
 }
 
 @(private)
@@ -492,7 +623,7 @@ launch_topk :: proc(n, k: int, clamp_v, scale: f32) -> bool {
 	nn, kk := i32(n), i32(k)
 	cl, sc := clamp_v, scale
 	args := [?]rawptr{&logits, &sel, &wt, &nn, &kk, &cl, &sc}
-	return ck(cu.launch(k_moe_topk, 1, 1, 1, 1, 1, 1, 0, args[:]), "moe_topk")
+	return klaunch(k_moe_topk, 1, 1, 1, 1, 1, 1, args[:], "moe_topk")
 }
 
 @(private)
@@ -531,10 +662,18 @@ bind_kernels :: proc() -> bool {
 	k_delta = get_fn("delta_recurrent")
 	k_rmsgate = get_fn("rmsnorm_gated")
 	k_moe_topk = get_fn("moe_softmax_topk")
+	k_quant = get_fn("quant_q8")
+	k_rmsnorm_q8 = get_fn("rmsnorm_quant_q8")
+	k_gemv2_q4 = get_fn("gemv2_q4_k")
+	k_gemv2_q6 = get_fn("gemv2_q6_k")
+	k_gemv2_q5k = get_fn("gemv2_q5_k")
+	k_gemv2_q8 = get_fn("gemv2_q8_0")
+	k_gemv2_q50 = get_fn("gemv2_q5_0")
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
 		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v,
 		k_conv, k_l2, k_delta, k_rmsgate, k_moe_topk,
+		k_quant, k_rmsnorm_q8, k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 	}
 	for h in handles {
 		if h == nil {
@@ -648,6 +787,23 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 		d_scores, ok = alloc_bytes(p.n_heads * p.seq_len * 4); if !ok do return false
 	}
 	d_partial, ok = alloc_bytes(dim * 4); if !ok do return false
+	max_k := dim
+	max_k = max(max_k, hidden)
+	max_k = max(max_k, qdim)
+	max_k = max(max_k, attdim)
+	max_k = max(max_k, convdim)
+	max_k = max(max_k, valdim)
+	max_k = max(max_k, nff)
+	if max_k < 32 {
+		max_k = 32
+	}
+	if max_k % 32 != 0 {
+		max_k = ((max_k + 31) / 32) * 32
+	}
+	g_q8_cap = max_k
+	d_xq, ok = alloc_bytes(max_k); if !ok do return false
+	d_xd, ok = alloc_bytes((max_k / 32) * 4); if !ok do return false
+	d_xs, ok = alloc_bytes((max_k / 32) * 8); if !ok do return false
 	if p.is_moe {
 		d_moe_logits, ok = alloc_bytes(nexp * 4); if !ok do return false
 		d_moe_wt, ok = alloc_bytes(nexp * 4); if !ok do return false
@@ -705,6 +861,9 @@ cuda_destroy :: proc() {
 		cu.drv.DevicePrimaryCtxRelease_v2(g_dev)
 		g_ctx_held = false
 	}
+	d_xq, d_xd, d_xs = 0, 0, 0
+	g_q8_valid = false
+	g_q8_cap = 0
 	delete(h_logits); h_logits = nil
 	delete(h_embed); h_embed = nil
 	delete(h_wt); h_wt = nil
@@ -751,6 +910,17 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	} else {
 		g_tc_mode = -1
 	}
+	gemv_env := os.get_env("ODINFER_CUDA_GEMV", context.temp_allocator)
+	g_gemv_new = gemv_env != "old" && gemv_env != "0"
+	g_gemv_warps = 8
+	if s := os.get_env("ODINFER_CUDA_GEMV_WARPS", context.temp_allocator); s != "" {
+		if v, ok := strconv.parse_int(s); ok && v >= 1 && v <= 16 {
+			g_gemv_warps = int(v)
+		}
+	}
+	g_count_launches = os.get_env("ODINFER_CUDA_LAUNCHES", context.temp_allocator) == "1"
+	g_launches = 0
+	g_q8_valid = false
 	mem_bytes: c.size_t
 	cu.drv.DeviceTotalMem_v2(&mem_bytes, g_dev)
 	ctx: cu.Context
@@ -916,6 +1086,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		tc_note = "on for T>1 (ODINFER_CUDA_TC=1)"
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
+	if g_gemv_new {
+		fmt.eprintfln("cuda: gemv dp4a  warps={}  4 rows/warp  q8 act  (ODINFER_CUDA_GEMV=old for the scalar kernel)", g_gemv_warps)
+	} else {
+		fmt.eprintln("cuda: gemv old (ODINFER_CUDA_GEMV=old)")
+	}
 	return true
 }
 
@@ -1088,6 +1263,9 @@ cuda_forward_chunk :: proc(tr: ^Transformer, tokens: []int, pos0: int) -> []f32 
 	if g_timing {
 		t0 = time.tick_now()
 	}
+	if g_count_launches {
+		g_launches = 0
+	}
 	for ti in 0 ..< T {
 		tok := tokens[ti]
 		if tok < 0 || tok >= p.vocab_size {
@@ -1121,6 +1299,9 @@ cuda_forward_chunk :: proc(tr: ^Transformer, tokens: []int, pos0: int) -> []f32 
 	if g_timing {
 		ms := time.duration_milliseconds(time.tick_diff(t0, time.tick_now()))
 		fmt.eprintfln("[timing] cuda_forward T={} pos={} wall={:.2f} ms ({:.2f} ms/tok)", T, pos0, ms, ms / f64(T))
+	}
+	if g_count_launches {
+		fmt.eprintfln("cuda: launches {} this forward (T={} pos={})", g_launches, T, pos0)
 	}
 	return h_logits[:p.vocab_size]
 }

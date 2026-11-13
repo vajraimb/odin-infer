@@ -5,7 +5,8 @@
 Qwen3.5 引擎的 Linux x86_64 后端。目标是 **sm_70 及以上**（按 Tesla V100S、
 计算能力 7.0、驱动 CUDA 13.0 来写）。累加是 fp32，没有 bf16。预填充 GEMM
 （`T>1`）可以用 Volta tensor core（WMMA 16×16×16，fp16 乘、fp32 累加）。
-解码（`T==1`）仍走 GEMV。不依赖 dp4a。
+解码（`T==1`）走带宽 GEMV：128 位加载、每个 warp 四行、`dp4a`，激活每条向量
+只量化成 q8 一次。`ODINFER_CUDA_GEMV=old` 回到原来的一行一个 warp。
 
 macOS 构建不变，默认仍是 Metal。同一个二进制不会同时带上两条热路径。
 
@@ -109,6 +110,67 @@ ODINFER_CUDA_TC=1 bin/cuda_smoke "$MODEL" 8 2048
 这三次的解码 tok/s 应当一致。初始化日志会写 `tensor cores auto (T>=16)`、
 `off` 或 `on for T>1`。
 
+## 解码 GEMV
+
+`T==1` 是访存 GEMV。标量内核（一行一个 warp、按字节加载）留在
+`ODINFER_CUDA_GEMV=old`。默认内核每个 warp 算四行，每行 8 个线程，每个线程
+一次 `ld.global.v4`，一行的量化数据是一次 128 字节的合并读。点积是
+`dp4a.s32.s32`。Q6_K 和 Q8_0 / Q5_0 的块不是 16 字节对齐的，加载前会看地址，
+sm_70 上不会发出未对齐的 `v4`。
+
+激活按 32 个一组量化成 q8（有符号 int8，scale 是 `amax/127`），每条向量一次。
+Q4_K 和 Q5_K 另外记下每 16 个 float 的精确和，`dmin` 那一项不量化。单行
+RMSNorm 在同一个内核里写出这份 q8；Q、K、V 和两路 FFN up 共用它。SwiGLU
+和多行 norm 会使缓存失效。没有带宽内核的种类（F32、Q2_K、Q3_K、Q8_K、
+Q4_0 这一族）仍走标量 GEMV。K 不是量化块的整数倍时也走标量。
+
+块大小是 `ODINFER_CUDA_GEMV_WARPS` 个 warp（默认 8，范围 1..16）。8 个 warp
+是 256 个线程、每块 32 行。V100S 有 80 个 SM、每个 SM 64 个 warp 槽，32
+线程的块填不满。
+
+| 变量 | 默认 | 作用 |
+|------|------|------|
+| `ODINFER_CUDA_GEMV` | new | `old` 或 `0` 用标量 GEMV |
+| `ODINFER_CUDA_GEMV_WARPS` | `8` | 带宽 GEMV 每块的 warp 数（1..16） |
+| `ODINFER_CUDA_LAUNCHES` | 关 | `=1` 时每次 forward 打印内核启动次数 |
+| `ODINFER_CUDA_PEAK_GBS` | `1134` | `--bench-gemv` 用来算峰值百分比 |
+
+`cuda_selftest` 用 CPU fp32 点积对 Q4_K、Q6_K、Q8_0、Q5_0、Q5_K 做 64×512
+和 6×256（行数不是 4 的倍数）。容差是 `1 + 0.05*|ref|`。和 CPU 的差来自
+`x` 的 q8；半字节或 scale 对调会差到 `|ref|` 这一量级。
+
+```sh
+bin/cuda_kernel_test
+bin/cuda_kernel_test --bench-gemv
+ODINFER_CUDA_GEMV_WARPS=4 bin/cuda_kernel_test --bench-gemv
+```
+
+`--bench` 先打 tensor core 的 TFLOPS，再打同一张 GEMV 表。`--bench-gemv`
+只打 GEMV：毫秒、GB/s、占峰值的百分比，旧内核对比新内核，形状是 `T=1` 的
+9B / 27B（w1、wq、wo、w2、logits）以及 2048 的 Q8_0 / Q5_0 和 5120 的 Q5_K。
+GB/s 只算这一次启动读的权重字节。`x` 的 q8 在计时循环外面，和缓存命中一样。
+两行 logits 大约 1 GB，分配失败会打印并继续其余形状。设备不是 V100S 时用
+`ODINFER_CUDA_PEAK_GBS` 改峰值。
+
+端到端解码，标量内核对比默认。冒烟的 prompt 很短，这是短上下文的数（9B
+上以前是 32.7 tok/s）。990 token 的预填充是另一次测量：那个长度上每个完整
+注意力层的 KV 只有几 MB，权重大小仍然是整个模型。
+
+```sh
+ODINFER_CUDA_GEMV=old bin/cuda_smoke "$MODEL9B" 16 2048
+bin/cuda_smoke "$MODEL9B" 16 2048
+ODINFER_CUDA_GEMV=old bin/cuda_smoke "$MODEL27B" 16 2048
+bin/cuda_smoke "$MODEL27B" 16 2048
+ODINFER_CUDA_LAUNCHES=1 bin/cuda_smoke "$MODEL9B" 8 2048
+```
+
+初始化日志是 `gemv dp4a  warps=8` 或 `gemv old`。
+
+没有用 CUDA graph。稠密 27B 一个 token 大约一千次启动，每次几微秒，一共
+几毫秒。15.8 GB 的 Q4_K_M 测到 5.28 tok/s，大约 190 ms，几乎全是权重流，
+大约是 1134 GB/s 的 7%。驱动绑定里没有 graph API。`ODINFER_CUDA_LAUNCHES=1`
+是给 V100 上核对这个次数的。几千 token 的 KV 注意力搬不了这么多字节。
+
 ## 检查脚本
 
 `scripts/cuda_check.sh` 会编 CUDA 测试和冒烟二进制，把内核源编译成
@@ -170,8 +232,9 @@ CPU sampler（冒烟工具温度是 0）。
 
 ## 已移植
 
-GEMV（解码，一行一个 warp）和 MMQ（预填，最多 8 个 token 一块，任意 `T`，
-输出按 token 主序），fp32 累加：
+GEMV（解码）和 MMQ（预填，最多 8 个 token 一块，任意 `T`，输出按 token
+主序），fp32 累加。默认解码 GEMV 是 Q4_K、Q5_K、Q6_K、Q8_0、Q5_0 的带宽
+内核；每种量化仍保留一行一个 warp 的标量内核：
 
 F32、F16、Q8_0、Q4_0、Q4_1、Q5_0、Q5_1、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q8_K。
 
@@ -189,11 +252,11 @@ delta，RMSNormGated，MoE softmax top-k、逐专家 GEMV，以及可选的共�
 
 IQ1_S、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_NL、IQ4_XS、Q8_1。
 
-也不在这个后端里：Metal 的 norm 融合 GEMV、按形状特化的 GEMV
-（`QGEMVSPEC`）、宽 N 自动调优和 tune 缓存、fast-math、MoE 分组 GEMM
-（`forward_gpu_batch_moe`）、`engine_verify_batch`（投机校验）。MoE 预填的
-注意力投影走 MMQ，专家走逐 token GEMV。稠密预填按 `CUDA_MAX_BATCH`（128，
-激活缓冲分配失败时更小）分块。解码用 GEMV，不用 MMQ。
+也不在这个后端里：Metal 按形状特化的 GEMV（`QGEMVSPEC`）、宽 N 自动调优和
+tune 缓存、fast-math、MoE 分组 GEMM（`forward_gpu_batch_moe`）、CUDA graph、
+`engine_verify_batch`（投机校验）。CUDA 的单行 RMSNorm 会写下一次 GEMV 读的
+q8 缓存。MoE 预填的注意力投影走 MMQ，专家走逐 token GEMV。稠密预填按
+`CUDA_MAX_BATCH`（128，激活缓冲分配失败时更小）分块。解码用 GEMV，不用 MMQ。
 
 权重在初始化时拷上设备一次（GGUF mmap 的 `cuMemcpyHtoD`，再加上主机上已经
 反量化的 MoE router 和共享专家）。5.6 GB 的 Q4_K_M 9B 放得进 32 GB 的

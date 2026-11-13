@@ -46,6 +46,10 @@ you isolate per-stage GPU time. Never enable in production.
 | `NVRTC_DIR` | unset | Directory or soname path searched first when `ODINFER_NVRTC_PATH` is unset. For sm_70 a 13.x library there is skipped and the search continues to pip `libnvrtc.so.12` and the loader. |
 | `CUDA_DEVICE` | `0` | Device ordinal. |
 | `ODINFER_CUDA_TC` | auto | Prefill GEMM. Unset: Volta WMMA when `T≥16`. `1`: WMMA for every `T>1`. `0`: MMQ. Decode (`T==1`) stays GEMV. |
+| `ODINFER_CUDA_GEMV` | new | Decode GEMV. Unset: dp4a bandwidth kernel (Q4_K, Q5_K, Q6_K, Q8_0, Q5_0). `old` or `0`: scalar one-warp-per-row kernel. |
+| `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
+| `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. |
+| `ODINFER_CUDA_PEAK_GBS` | `1134` | HBM peak for `cuda_kernel_test --bench-gemv` (percent of peak). |
 | `QTIMING` | off | `=1` prints per-chunk CUDA wall time on stderr. |
 | `KV_Q8` / `KV_V` | Q8 K + mixed V | Same switches as Metal. The on-disk KV snapshot format is shared. |
 | `METAL_FALLBACK` | off | `=1` lets a failed CUDA init fall back to CPU. `--cuda` / `--metal` / `-g 1` otherwise hard-error. |

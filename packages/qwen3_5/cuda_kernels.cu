@@ -1,10 +1,11 @@
 /* Qwen3.5 CUDA kernels. sm_70+ (Tesla V100). fp32 accumulate. No bf16, no
    cp.async, no ldmatrix (that is sm_75). Prefill GEMM (T>1) can use Volta
-   WMMA 16x16x16: wmma.mma.sync.aligned.m16n16k16, fp16 operands, fp32
-   accumulate. NVRTC does not ship mma.h, so the WMMA ops are inline PTX.
-   Decode stays on GEMV. NVRTC is given an explicit
-   --gpu-architecture=compute_XX (CUDA 13 NVRTC defaults to sm_75 and will
-   not JIT on sm_70).
+   WMMA 16x16x16. Decode GEMV (T==1) has a bandwidth path: 128-bit loads,
+   several rows per warp, dp4a against an activation quantized to q8.
+   The original one-warp GEMV stays compiled for ODINFER_CUDA_GEMV=old.
+   NVRTC does not ship mma.h or cuda_fp16.h, so WMMA and dp4a are inline
+   PTX. NVRTC is given --gpu-architecture=compute_XX (CUDA 13 NVRTC
+   defaults to sm_75 and will not JIT on sm_70).
 
    Quant layouts match packages/ggml/quant.odin. GEMV is one warp per output
    row. MMQ reuses the same accumulator over a tile of up to 8 tokens and
@@ -1249,3 +1250,425 @@ DEF_TC(q6_k, 11)
 DEF_TC(q8_k, 12)
 
 #undef DEF_TC
+
+/* ---- bandwidth GEMV (T == 1) ------------------------------------------------
+   Four rows per warp, eight threads per row. Each of those eight threads
+   issues one ld.global.v4 (16 bytes) so a row's quant payload is one
+   coalesced 128-byte read. The activation was quantized to q8 (block 32)
+   once per vector; the dot is dp4a.s32.s32. K-quant rows require n % 256
+   == 0. Q8_0 / Q5_0 require n % 32 == 0. No per-element tail branch.
+
+   Lane split: sub = lane >> 3 (row within the four), t = lane & 7.
+   Block: (warps * 32) threads, grid ceil(rows / (warps * 4)). */
+
+__device__ __forceinline__ int dp4a_s32(int a, int b, int c) {
+    int d;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
+__device__ __forceinline__ int pack_lo_nib(unsigned v) {
+    return (int)(v & 0x0f0f0f0fu);
+}
+
+__device__ __forceinline__ int pack_hi_nib(unsigned v) {
+    return (int)((v >> 4) & 0x0f0f0f0fu);
+}
+
+__device__ __forceinline__ unsigned ld_u32_any(const unsigned char* p) {
+    unsigned long long a = (unsigned long long)p;
+    if ((a & 3u) == 0u) return *(const unsigned*)p;
+    unsigned short a0 = *(const unsigned short*)p;
+    unsigned short a1 = *(const unsigned short*)(p + 2);
+    return (unsigned)a0 | ((unsigned)a1 << 16);
+}
+
+__device__ __forceinline__ uint4 ld_u4_any(const unsigned char* p) {
+    unsigned long long a = (unsigned long long)p;
+    if ((a & 15u) == 0u) return *(const uint4*)p;
+    uint4 v;
+    v.x = ld_u32_any(p);
+    v.y = ld_u32_any(p + 4);
+    v.z = ld_u32_any(p + 8);
+    v.w = ld_u32_any(p + 12);
+    return v;
+}
+
+__device__ __forceinline__ int dot_nib(uint4 q, uint4 x, int hi) {
+    unsigned qw[4] = {q.x, q.y, q.z, q.w};
+    unsigned xw[4] = {x.x, x.y, x.z, x.w};
+    int acc = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int packed = hi ? pack_hi_nib(qw[i]) : pack_lo_nib(qw[i]);
+        acc = dp4a_s32(packed, (int)xw[i], acc);
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float f16_bits(unsigned bits) {
+    unsigned char p[2];
+    p[0] = (unsigned char)(bits & 0xff);
+    p[1] = (unsigned char)((bits >> 8) & 0xff);
+    return ld_f16(p);
+}
+
+__device__ __forceinline__ void scales_from_hdr(uint4 hdr, unsigned char* sc) {
+    unsigned w[3] = {hdr.y, hdr.z, hdr.w};
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        sc[i * 4 + 0] = (unsigned char)(w[i] & 0xff);
+        sc[i * 4 + 1] = (unsigned char)((w[i] >> 8) & 0xff);
+        sc[i * 4 + 2] = (unsigned char)((w[i] >> 16) & 0xff);
+        sc[i * 4 + 3] = (unsigned char)((w[i] >> 24) & 0xff);
+    }
+}
+
+__device__ __forceinline__ uint4 shfl_u4(uint4 v, int src) {
+    uint4 o;
+    o.x = (unsigned)__shfl_sync(0xffffffff, (int)v.x, src);
+    o.y = (unsigned)__shfl_sync(0xffffffff, (int)v.y, src);
+    o.z = (unsigned)__shfl_sync(0xffffffff, (int)v.z, src);
+    o.w = (unsigned)__shfl_sync(0xffffffff, (int)v.w, src);
+    return o;
+}
+
+__device__ __forceinline__ float warp8_sum(float v) {
+    v += __shfl_xor_sync(0xffffffff, v, 4);
+    v += __shfl_xor_sync(0xffffffff, v, 2);
+    v += __shfl_xor_sync(0xffffffff, v, 1);
+    return v;
+}
+
+/* x[n] -> q8 groups of 32. scale[g], sum16[g] = (sum of first 16, sum of last 16)
+   of the original floats, so the Q4_K / Q5_K min term stays exact. */
+extern "C" __global__ void quant_q8(const float* x, signed char* qs, float* scale, float2* sum16, int n) {
+    int g = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int ng = n >> 5;
+    if (g >= ng) return;
+    const float* xi = x + (size_t)g * 32;
+    float amax = 0.f, s0 = 0.f, s1 = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        float a = xi[j];
+        float b = xi[j + 16];
+        amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
+        s0 += a;
+        s1 += b;
+    }
+    float d = amax / 127.f;
+    float id = d > 0.f ? 1.f / d : 0.f;
+    scale[g] = d;
+    sum16[g] = make_float2(s0, s1);
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        int q = (int)rintf(xi[j] * id);
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        qs[(size_t)g * 32 + j] = (signed char)q;
+    }
+}
+
+/* RMSNorm one vector and quantize it. One block, 128 threads. n % 32 == 0, n <= 32768. */
+extern "C" __global__ void rmsnorm_quant_q8(const float* inp, float* out, const float* weight,
+                                            signed char* qs, float* scale, float2* sum16, int n, float eps) {
+    int tid = (int)threadIdx.x;
+    float ss = 0.f;
+    for (int i = tid; i < n; i += 128) {
+        float v = inp[i];
+        ss += v * v;
+    }
+    ss = block_sum_128(ss);
+    float inv = rsqrtf(ss / (float)n + eps);
+    for (int i = tid; i < n; i += 128) out[i] = weight[i] * (inp[i] * inv);
+    __syncthreads();
+    int ng = n >> 5;
+    for (int g = tid; g < ng; g += 128) {
+        const float* xi = out + (size_t)g * 32;
+        float amax = 0.f, s0 = 0.f, s1 = 0.f;
+        for (int j = 0; j < 16; ++j) {
+            float a = xi[j];
+            float b = xi[j + 16];
+            amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
+            s0 += a;
+            s1 += b;
+        }
+        float d = amax / 127.f;
+        float id = d > 0.f ? 1.f / d : 0.f;
+        scale[g] = d;
+        sum16[g] = make_float2(s0, s1);
+        for (int j = 0; j < 32; ++j) {
+            int q = (int)rintf(xi[j] * id);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            qs[(size_t)g * 32 + j] = (signed char)q;
+        }
+    }
+}
+
+extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
+                                      float* out, int n, int d) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int sub = lane >> 3;
+    int t = lane & 7;
+    int row = ((int)blockIdx.x * ((int)blockDim.x >> 5) + warp) * 4 + sub;
+    int p = t >> 1;
+    int half = t & 1;
+    int nb = n >> 8;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        uint4 hdr = make_uint4(0, 0, 0, 0);
+        uint4 qv = make_uint4(0, 0, 0, 0);
+        if (row < d) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 144;
+            if (t == 0) hdr = *(const uint4*)blk;
+            qv = *(const uint4*)(blk + 16 + t * 16);
+        }
+        int src = lane & ~7;
+        hdr = shfl_u4(hdr, src);
+        if (row < d) {
+            float dW = f16_bits(hdr.x & 0xffff);
+            float dmin = f16_bits(hdr.x >> 16);
+            unsigned char scb[12];
+            scales_from_hdr(hdr, scb);
+            int sc0, m0, sc1, m1;
+            scale_min_k4(p * 2, scb, &sc0, &m0);
+            scale_min_k4(p * 2 + 1, scb, &sc1, &m1);
+            int group = b * 8 + p * 2;
+            int off = half * 16;
+            uint4 xlo = *(const uint4*)(xq + (size_t)group * 32 + off);
+            uint4 xhi = *(const uint4*)(xq + (size_t)(group + 1) * 32 + off);
+            int dot_lo = dot_nib(qv, xlo, 0);
+            int dot_hi = dot_nib(qv, xhi, 1);
+            float2 slo = sum16[group];
+            float2 shi = sum16[group + 1];
+            float sum_lo = half ? slo.y : slo.x;
+            float sum_hi = half ? shi.y : shi.x;
+            acc += (dW * (float)sc0) * xd[group] * (float)dot_lo - (dmin * (float)m0) * sum_lo;
+            acc += (dW * (float)sc1) * xd[group + 1] * (float)dot_hi - (dmin * (float)m1) * sum_hi;
+        }
+    }
+    acc = warp8_sum(acc);
+    if (t == 0 && row < d) out[row] = acc;
+}
+
+extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char* xq, const float* xd,
+                                      float* out, int n, int d) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int sub = lane >> 3;
+    int t = lane & 7;
+    int row = ((int)blockIdx.x * ((int)blockDim.x >> 5) + warp) * 4 + sub;
+    int half = t >> 2;
+    int piece = t & 3;
+    int l0 = (piece & 1) * 16;
+    int hi_pair = piece >> 1;
+    int nb = n >> 8;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        uint4 ql = make_uint4(0, 0, 0, 0);
+        uint4 qh = make_uint4(0, 0, 0, 0);
+        uint4 scv = make_uint4(0, 0, 0, 0);
+        float dW = 0.f;
+        if (row < d) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 210;
+            ql = ld_u4_any(blk + t * 16);
+            qh = ld_u4_any(blk + 128 + half * 32 + l0);
+            if (t == 0) {
+                scv = ld_u4_any(blk + 192);
+                dW = ld_f16(blk + 208);
+            }
+        }
+        int src = lane & ~7;
+        scv = shfl_u4(scv, src);
+        dW = __shfl_sync(0xffffffff, dW, src);
+        if (row < d) {
+            unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
+            signed char scb[16];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                scb[i * 4 + 0] = (signed char)(scw[i] & 0xff);
+                scb[i * 4 + 1] = (signed char)((scw[i] >> 8) & 0xff);
+                scb[i * 4 + 2] = (signed char)((scw[i] >> 16) & 0xff);
+                scb[i * 4 + 3] = (signed char)((scw[i] >> 24) & 0xff);
+            }
+            int scoff = half * 8;
+            int is = l0 >> 4;
+            int s_a = scoff + is + (hi_pair ? 2 : 0);
+            int s_b = scoff + is + (hi_pair ? 6 : 4);
+            float sa = dW * (float)scb[s_a];
+            float sb = dW * (float)scb[s_b];
+            int group0 = b * 8 + half * 4 + (hi_pair ? 1 : 0);
+            int off = l0;
+            uint4 xa = *(const uint4*)(xq + (size_t)group0 * 32 + off);
+            uint4 xb = *(const uint4*)(xq + (size_t)(group0 + 2) * 32 + off);
+            unsigned qw[4] = {ql.x, ql.y, ql.z, ql.w};
+            unsigned hw[4] = {qh.x, qh.y, qh.z, qh.w};
+            unsigned aw[4] = {xa.x, xa.y, xa.z, xa.w};
+            unsigned bw[4] = {xb.x, xb.y, xb.z, xb.w};
+            int dot_a = 0, dot_b = 0;
+            int hshift_a = hi_pair ? 2 : 0;
+            int hshift_b = hi_pair ? 6 : 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int pa = 0, pb = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    unsigned byte = (qw[i] >> (8 * k)) & 0xff;
+                    unsigned hb = (hw[i] >> (8 * k)) & 0xff;
+                    /* Low nibble is q1 (hi_pair 0) or q2 (hi_pair 1).
+                       High nibble is q3 or q4. hshift selects the matching qh bits. */
+                    int nib_a = (int)(byte & 0xf);
+                    int nib_b = (int)(byte >> 4);
+                    int qa = (nib_a | (int)(((hb >> hshift_a) & 3) << 4)) - 32;
+                    int qb = (nib_b | (int)(((hb >> hshift_b) & 3) << 4)) - 32;
+                    pa |= (qa & 0xff) << (8 * k);
+                    pb |= (qb & 0xff) << (8 * k);
+                }
+                dot_a = dp4a_s32(pa, (int)aw[i], dot_a);
+                dot_b = dp4a_s32(pb, (int)bw[i], dot_b);
+            }
+            acc += sa * xd[group0] * (float)dot_a;
+            acc += sb * xd[group0 + 2] * (float)dot_b;
+        }
+    }
+    acc = warp8_sum(acc);
+    if (t == 0 && row < d) out[row] = acc;
+}
+
+extern "C" __global__ void gemv2_q5_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
+                                      float* out, int n, int d) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int sub = lane >> 3;
+    int t = lane & 7;
+    int row = ((int)blockIdx.x * ((int)blockDim.x >> 5) + warp) * 4 + sub;
+    int p = t >> 1;
+    int half = t & 1;
+    int nb = n >> 8;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        uint4 hdr = make_uint4(0, 0, 0, 0);
+        uint4 qv = make_uint4(0, 0, 0, 0);
+        uint4 hv = make_uint4(0, 0, 0, 0);
+        if (row < d) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 176;
+            if (t == 0) hdr = *(const uint4*)blk;
+            qv = *(const uint4*)(blk + 48 + t * 16);
+            hv = *(const uint4*)(blk + 16 + half * 16);
+        }
+        int src = lane & ~7;
+        hdr = shfl_u4(hdr, src);
+        if (row < d) {
+            float dW = f16_bits(hdr.x & 0xffff);
+            float dmin = f16_bits(hdr.x >> 16);
+            unsigned char scb[12];
+            scales_from_hdr(hdr, scb);
+            int sc0, m0, sc1, m1;
+            scale_min_k4(p * 2, scb, &sc0, &m0);
+            scale_min_k4(p * 2 + 1, scb, &sc1, &m1);
+            unsigned bit_lo = 1u << (2 * p);
+            unsigned bit_hi = bit_lo << 1;
+            int group = b * 8 + p * 2;
+            int off = half * 16;
+            uint4 xlo = *(const uint4*)(xq + (size_t)group * 32 + off);
+            uint4 xhi = *(const uint4*)(xq + (size_t)(group + 1) * 32 + off);
+            unsigned qw[4] = {qv.x, qv.y, qv.z, qv.w};
+            unsigned hw[4] = {hv.x, hv.y, hv.z, hv.w};
+            unsigned al[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+            unsigned ah[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+            int dot_lo = 0, dot_hi = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int plo = 0, phi = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    unsigned byte = (qw[i] >> (8 * k)) & 0xff;
+                    unsigned hb = (hw[i] >> (8 * k)) & 0xff;
+                    int lo = (int)(byte & 0xf) + ((hb & bit_lo) ? 16 : 0);
+                    int hi = (int)(byte >> 4) + ((hb & bit_hi) ? 16 : 0);
+                    plo |= (lo & 0xff) << (8 * k);
+                    phi |= (hi & 0xff) << (8 * k);
+                }
+                dot_lo = dp4a_s32(plo, (int)al[i], dot_lo);
+                dot_hi = dp4a_s32(phi, (int)ah[i], dot_hi);
+            }
+            float2 slo = sum16[group];
+            float2 shi = sum16[group + 1];
+            float sum_lo = half ? slo.y : slo.x;
+            float sum_hi = half ? shi.y : shi.x;
+            acc += (dW * (float)sc0) * xd[group] * (float)dot_lo - (dmin * (float)m0) * sum_lo;
+            acc += (dW * (float)sc1) * xd[group + 1] * (float)dot_hi - (dmin * (float)m1) * sum_hi;
+        }
+    }
+    acc = warp8_sum(acc);
+    if (t == 0 && row < d) out[row] = acc;
+}
+
+extern "C" __global__ void gemv2_q8_0(const unsigned char* wb, const signed char* xq, const float* xd,
+                                      float* out, int n, int d) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int sub = lane >> 3;
+    int t = lane & 7;
+    int row = ((int)blockIdx.x * ((int)blockDim.x >> 5) + warp) * 4 + sub;
+    int nb = n >> 5;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        if (row < d) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 34;
+            float dW = ld_f16(blk);
+            unsigned w = ld_u32_any(blk + 2 + t * 4);
+            unsigned xv = *(const unsigned*)(xq + (size_t)b * 32 + t * 4);
+            int dot = dp4a_s32((int)w, (int)xv, 0);
+            acc += dW * xd[b] * (float)dot;
+        }
+    }
+    acc = warp8_sum(acc);
+    if (t == 0 && row < d) out[row] = acc;
+}
+
+extern "C" __global__ void gemv2_q5_0(const unsigned char* wb, const signed char* xq, const float* xd,
+                                      float* out, int n, int d) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int sub = lane >> 3;
+    int t = lane & 7;
+    int row = ((int)blockIdx.x * ((int)blockDim.x >> 5) + warp) * 4 + sub;
+    int nb = n >> 5;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        uint4 qv = make_uint4(0, 0, 0, 0);
+        unsigned qh = 0;
+        float dW = 0.f;
+        if (row < d) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 22;
+            dW = ld_f16(blk);
+            qh = ld_u32_any(blk + 2);
+            if (t == 0) qv = ld_u4_any(blk + 6);
+        }
+        int src = lane & ~7;
+        qv = shfl_u4(qv, src);
+        if (row < d) {
+            unsigned qw[4] = {qv.x, qv.y, qv.z, qv.w};
+            int base = (t & 3) * 4;
+            int hi = t >> 2;
+            unsigned xv = *(const unsigned*)(xq + (size_t)b * 32 + t * 4);
+            int packed = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                int j = base + k;
+                unsigned byte = (qw[j >> 2] >> (8 * (j & 3))) & 0xff;
+                int nib = hi ? (int)(byte >> 4) : (int)(byte & 0xf);
+                int elem = hi ? (j + 16) : j;
+                int qv_i = (nib | (((qh >> elem) & 1) << 4)) - 16;
+                packed |= (qv_i & 0xff) << (8 * k);
+            }
+            int dot = dp4a_s32(packed, (int)xv, 0);
+            acc += dW * xd[b] * (float)dot;
+        }
+    }
+    acc = warp8_sum(acc);
+    if (t == 0 && row < d) out[row] = acc;
+}

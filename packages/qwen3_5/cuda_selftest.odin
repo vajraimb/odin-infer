@@ -11,6 +11,7 @@ import "core:c"
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:strconv"
 import "core:time"
 
 @(private = "file")
@@ -21,6 +22,7 @@ _cuda_self_import_keep :: proc() {
 	_ = fmt.tprintf("")
 	_ = math.abs(f32(0))
 	_ = os.O_RDONLY
+	_, _ = strconv.parse_int("0")
 	_ = time.now()
 }
 
@@ -271,6 +273,77 @@ run_gemv :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> bool
 		s_note(&st, fmt.tprintf("gemv %s row %d", tag, r), got[r], ref[r], atol, rtol)
 	}
 	return s_report(fmt.tprintf("gemv %s", tag), st, atol, rtol)
+}
+
+@(private)
+run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> bool {
+	tag := cuda_kind_tag(kind)
+	fn := s_fn(fmt.tprintf("gemv2_%s", tag))
+	qfn := s_fn("quant_q8")
+	if fn == nil || qfn == nil {
+		fmt.eprintfln("cuda_selftest: gemv2 %s missing", tag)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, cols)
+	defer delete(x)
+	for i in 0 ..< cols {
+		x[i] = (f32(i % 5) - 2) * 0.05
+	}
+	ref := cpu_gemv(kind, raw, x, rows, cols)
+	defer delete(ref)
+	dw, e1 := cu.alloc(len(raw))
+	dx, e2 := cu.alloc(cols * 4)
+	dy, e3 := cu.alloc(rows * 4)
+	ng := cols / 32
+	dqs, e4 := cu.alloc(cols)
+	dsc, e5 := cu.alloc(ng * 4)
+	dsm, e6 := cu.alloc(ng * 8)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	defer cu.free(dqs)
+	defer cu.free(dsc)
+	defer cu.free(dsm)
+	if e1 != cu.OK || e2 != cu.OK || e3 != cu.OK || e4 != cu.OK || e5 != cu.OK || e6 != cu.OK {
+		fmt.eprintln("cuda_selftest: gemv2 alloc failed")
+		return false
+	}
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), cols * 4)
+	xx, qs, sc, sm := dx, dqs, dsc, dsm
+	nn := i32(cols)
+	qargs := [?]rawptr{&xx, &qs, &sc, &sm, &nn}
+	if cu.launch(qfn, u32((ng + 127) / 128), 1, 1, 128, 1, 1, 0, qargs[:]) != cu.OK {
+		fmt.eprintfln("cuda_selftest: quant_q8 launch failed (%s)", tag)
+		return false
+	}
+	wb, yy := dw, dy
+	dd := i32(rows)
+	warps := 4
+	gx := u32((rows + warps * 4 - 1) / (warps * 4))
+	bx := u32(warps * 32)
+	launched: bool
+	if kind == .Q4_K || kind == .Q5_K {
+		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd}
+		launched = cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
+	} else {
+		args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd}
+		launched = cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
+	}
+	if !launched || cu.sync() != cu.OK {
+		fmt.eprintfln("cuda_selftest: gemv2 launch failed (%s)", tag)
+		return false
+	}
+	got := make([]f32, rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, rows * 4)
+	st: Case_Err
+	for r in 0 ..< rows {
+		s_note(&st, fmt.tprintf("gemv2 %s row %d", tag, r), got[r], ref[r], atol, rtol)
+	}
+	return s_report(fmt.tprintf("gemv2 %s %dx%d", tag, rows, cols), st, atol, rtol)
 }
 
 @(private)
@@ -772,6 +845,19 @@ cuda_selftest :: proc() -> bool {
 			ok = false
 		}
 	}
+	// dp4a GEMV vs the same CPU reference. q8 of x is approximate, so the
+	// tolerance is wider than the scalar kernel; a swapped scale is still O(1).
+	gemv2 := [?]ggml.GGML_Type{.Q4_K, .Q6_K, .Q8_0, .Q5_0, .Q5_K}
+	for kind in gemv2 {
+		// q8 of x is the only approximation. A swapped nibble or scale is O(|ref|).
+		if !run_gemv2(kind, 64, 512, 1, 5e-2) {
+			ok = false
+		}
+		// A row count that is not a multiple of 4 exercises the tail.
+		if !run_gemv2(kind, 6, 256, 1, 5e-2) {
+			ok = false
+		}
+	}
 	mmq_kinds := [?]ggml.GGML_Type{.F32, .Q8_0, .Q4_K, .Q6_K, .Q5_0}
 	for kind in mmq_kinds {
 		if !run_mmq(kind, 3, 256, 5) {
@@ -899,6 +985,143 @@ bench_ms :: proc(fn: cu.Function, args: []rawptr, gx, gy, bx: u32) -> f64 {
 	t0 := time.now()
 	for _ in 0 ..< iters {
 		cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args)
+		cu.sync()
+	}
+	return f64(time.duration_milliseconds(time.since(t0))) / f64(iters)
+}
+
+Gemv_Shape :: struct {
+	name: string,
+	kind: ggml.GGML_Type,
+	rows: int,
+	cols: int,
+}
+
+@(private)
+gemv_gbs :: proc(kind: ggml.GGML_Type, rows, cols: int, ms: f64) -> (bytes: f64, gbs: f64) {
+	elems, bsz := ggml.ggml_block_info(kind)
+	bytes = f64(rows) * f64(cols / elems) * f64(bsz)
+	if ms > 0 {
+		gbs = bytes / ms / 1e6
+	}
+	return
+}
+
+// cuda_gemv_bench times the scalar GEMV and the bandwidth GEMV on the
+// T=1 shapes that dominate 9B and 27B decode. The q8 of x is done once,
+// outside the timed loop, matching a cached activation.
+cuda_gemv_bench :: proc() {
+	if !s_open() {
+		return
+	}
+	defer s_close()
+	peak := 1134.0
+	if s := os.get_env("ODINFER_CUDA_PEAK_GBS", context.temp_allocator); s != "" {
+		if v, ok := strconv.parse_f64(s); ok && v > 0 {
+			peak = v
+		}
+	}
+	fmt.eprintfln("cuda_gemv: T=1  peak %.0f GB/s (ODINFER_CUDA_PEAK_GBS). GB/s counts the weight bytes only.", peak)
+	shapes := [?]Gemv_Shape{
+		{"9B w1", .Q4_K, 12288, 4096},
+		{"9B wq", .Q4_K, 8192, 4096},
+		{"9B wo", .Q4_K, 4096, 4096},
+		{"9B w2", .Q6_K, 4096, 12288},
+		{"9B out", .Q6_K, 248320, 4096},
+		{"27B w1", .Q4_K, 17408, 5120},
+		{"27B wq", .Q4_K, 12288, 5120},
+		{"27B wo", .Q4_K, 5120, 6144},
+		{"27B w2", .Q6_K, 5120, 17408},
+		{"27B out", .Q6_K, 248320, 5120},
+		{"q8_0", .Q8_0, 2048, 2048},
+		{"q5_0", .Q5_0, 2048, 2048},
+		{"q5_k", .Q5_K, 5120, 5120},
+	}
+	for sh in shapes {
+		gemv_bench_one(sh, peak)
+	}
+}
+
+@(private)
+gemv_bench_one :: proc(sh: Gemv_Shape, peak: f64) {
+	tag := cuda_kind_tag(sh.kind)
+	old := s_fn(fmt.tprintf("gemv_%s", tag))
+	nw := s_fn(fmt.tprintf("gemv2_%s", tag))
+	qfn := s_fn("quant_q8")
+	if old == nil || nw == nil || qfn == nil {
+		fmt.eprintfln("  %s %s  kernel missing", sh.name, tag)
+		return
+	}
+	elems, bsz := ggml.ggml_block_info(sh.kind)
+	nbytes := sh.rows * (sh.cols / elems) * bsz
+	raw := fill_weight(sh.kind, sh.rows, sh.cols)
+	defer delete(raw)
+	x := make([]f32, sh.cols)
+	defer delete(x)
+	for i in 0 ..< sh.cols {
+		x[i] = (f32(i % 7) - 3) * 0.02
+	}
+	dw, e1 := cu.alloc(nbytes)
+	dx, e2 := cu.alloc(sh.cols * 4)
+	dy, e3 := cu.alloc(sh.rows * 4)
+	ng := sh.cols / 32
+	dqs, e4 := cu.alloc(sh.cols)
+	dsc, e5 := cu.alloc(ng * 4)
+	dsm, e6 := cu.alloc(ng * 8)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	defer cu.free(dqs)
+	defer cu.free(dsc)
+	defer cu.free(dsm)
+	if e1 != cu.OK || e2 != cu.OK || e3 != cu.OK || e4 != cu.OK || e5 != cu.OK || e6 != cu.OK {
+		fmt.eprintfln("  %s %s  %dx%d  alloc failed (%.1f MiB weights)", sh.name, tag, sh.rows, sh.cols, f64(nbytes) / (1024.0 * 1024.0))
+		return
+	}
+	cu.upload(dw, raw_data(raw), nbytes)
+	cu.upload(dx, raw_data(x), sh.cols * 4)
+	xx, qs, sc, sm := dx, dqs, dsc, dsm
+	nn := i32(sh.cols)
+	qargs := [?]rawptr{&xx, &qs, &sc, &sm, &nn}
+	cu.launch(qfn, u32((ng + 127) / 128), 1, 1, 128, 1, 1, 0, qargs[:])
+	cu.sync()
+	wb, yy := dw, dy
+	dd := i32(sh.rows)
+	old_args := [?]rawptr{&wb, &xx, &yy, &nn, &dd}
+	warm, iters := 2, 5
+	if sh.rows > 100000 {
+		warm, iters = 1, 3
+	}
+	old_ms := gemv_time(old, old_args[:], u32(sh.rows), 1, 32, warm, iters)
+	warps := 8
+	gx := u32((sh.rows + warps * 4 - 1) / (warps * 4))
+	bx := u32(warps * 32)
+	new_ms: f64
+	if sh.kind == .Q4_K || sh.kind == .Q5_K {
+		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd}
+		new_ms = gemv_time(nw, args[:], gx, 1, bx, warm, iters)
+	} else {
+		args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd}
+		new_ms = gemv_time(nw, args[:], gx, 1, bx, warm, iters)
+	}
+	_, old_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, old_ms)
+	bytes, new_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, new_ms)
+	fmt.eprintfln("  %s %s  %dx%d  %.1f MiB", sh.name, tag, sh.rows, sh.cols, bytes / (1024.0 * 1024.0))
+	fmt.eprintfln("    new  %.3f ms  %.1f GB/s  %.1f%% of peak", new_ms, new_gbs, new_gbs / peak * 100)
+	fmt.eprintfln("    old  %.3f ms  %.1f GB/s  %.1f%% of peak", old_ms, old_gbs, old_gbs / peak * 100)
+}
+
+@(private)
+gemv_time :: proc(fn: cu.Function, args: []rawptr, gx, gy, bx: u32, warm, iters: int) -> f64 {
+	for _ in 0 ..< warm {
+		cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args)
+	}
+	cu.sync()
+	t0 := time.now()
+	for _ in 0 ..< iters {
+		if cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args) != cu.OK {
+			return -1
+		}
 		cu.sync()
 	}
 	return f64(time.duration_milliseconds(time.since(t0))) / f64(iters)

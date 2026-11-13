@@ -1,6 +1,7 @@
 /* CUDA kernel correctness. Build with -define:ODINFER_BACKEND="cuda".
    --nvrtc-only [compute_XX] compiles the kernel source and does not need a GPU.
-   --bench times tensor-core WMMA against MMQ on 9B-shaped GEMMs (needs a device).
+   --bench times tensor-core WMMA against MMQ, then the T=1 GEMV old vs new (GB/s).
+   --bench-gemv times only the T=1 GEMV (9B and 27B shapes, GB/s and % of peak).
    With no flag, runs cuda_selftest against the CPU reference (needs a device).
 
    odin run tools/cuda_kernel_test.odin -file -define:ODINFER_BACKEND="cuda" \
@@ -32,10 +33,15 @@ main :: proc() {
 			}
 			return
 		}
+		if len(os.args) > 1 && os.args[1] == "--bench-gemv" {
+			q35.cuda_gemv_bench()
+			return
+		}
 		if len(os.args) > 1 && os.args[1] == "--bench" {
 			if !q35.cuda_tc_bench() {
 				os.exit(1)
 			}
+			q35.cuda_gemv_bench()
 			return
 		}
 		if !q35.cuda_selftest() {
