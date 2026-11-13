@@ -39,19 +39,29 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 		// model silently ran on CPU for a whole release. METAL_FALLBACK=1 opts
 		// back into the old "warn and use CPU" behaviour.
 		allow_fallback := os.get_env("METAL_FALLBACK", context.temp_allocator) == "1"
-		when ODIN_OS == .Darwin {
+		when GPU_METAL {
 			e.metal_ready = metal_init(&e.transformer, path)
+		} else when GPU_CUDA {
+			e.metal_ready = cuda_init(&e.transformer, path)
 		} else {
 			fmt.eprintln("metal: only supported on macOS")
 			e.metal_ready = false
 		}
 		if !e.metal_ready {
-			if !allow_fallback {
-				fmt.eprintln("metal: init failed and --metal was requested; refusing to fall back to CPU (set METAL_FALLBACK=1 to allow)")
-				return e, false
+			when GPU_CUDA {
+				if !allow_fallback {
+					fmt.eprintln("cuda: init failed and GPU was requested; refusing to fall back to CPU (set METAL_FALLBACK=1 to allow)")
+					return e, false
+				}
+				fmt.eprintln("cuda: init failed, METAL_FALLBACK=1 -> using CPU")
+			} else {
+				if !allow_fallback {
+					fmt.eprintln("metal: init failed and --metal was requested; refusing to fall back to CPU (set METAL_FALLBACK=1 to allow)")
+					return e, false
+				}
+				fmt.eprintln("metal: init failed, METAL_FALLBACK=1 -> using CPU")
 			}
-			fmt.eprintln("metal: init failed, METAL_FALLBACK=1 -> using CPU")
-			// Metal failed → allocate CPU Run_State for the CPU forward path
+			// GPU failed → allocate CPU Run_State for the CPU forward path
 			malloc_run_state(&e.transformer.state, e.transformer.config)
 		}
 	}
@@ -59,9 +69,13 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 }
 
 engine_destroy :: proc(e: ^Engine) {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready {
 			metal_destroy()
+		}
+	} else when GPU_CUDA {
+		if e.metal_ready {
+			cuda_destroy()
 		}
 	}
 	free_transformer(&e.transformer)
@@ -69,9 +83,13 @@ engine_destroy :: proc(e: ^Engine) {
 }
 
 engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready {
 			return forward_gpu(&e.transformer, token, pos)
+		}
+	} else when GPU_CUDA {
+		if e.metal_ready {
+			return cuda_forward(&e.transformer, token, pos)
 		}
 	}
 	return forward(&e.transformer, token, pos)
@@ -115,7 +133,13 @@ model_batch_mm_ok :: proc(t: ^Transformer) -> bool {
 }
 
 engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
+	when GPU_CUDA {
+		if e.metal_ready {
+			return cuda_forward_tokens(&e.transformer, tokens, pos_start)
+		}
+	}
 	if e.transformer.config.is_moe {
+		when GPU_METAL {
 		if e.metal_ready {
 			// Batched MoE prefill is the default on Metal (grouped GEMM + one
 			// sync per layer vs two per token; the attention blocks GEMV the
@@ -152,6 +176,7 @@ engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32
 			}
 			return logits
 		}
+		} // GPU_METAL
 		// CPU path: per-token
 		logits: []f32 = nil
 		for i in 0 ..< len(tokens) {
@@ -159,7 +184,7 @@ engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32
 		}
 		return logits
 	}
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready && e.batch_mm_ok {
 			i := 0
 			n := len(tokens)
@@ -197,19 +222,23 @@ engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32
 	// fallback: per-token (Metal when the engine has it, else CPU)
 	logits: []f32 = nil
 	for t in 0 ..< len(tokens) {
-		if e.metal_ready {
-			logits = forward_gpu(&e.transformer, tokens[t], pos_start + t)
-		} else {
-			logits = forward(&e.transformer, tokens[t], pos_start + t)
+		when GPU_METAL {
+			if e.metal_ready {
+				logits = forward_gpu(&e.transformer, tokens[t], pos_start + t)
+				continue
+			}
 		}
+		logits = forward(&e.transformer, tokens[t], pos_start + t)
 	}
 	return logits
 }
 
-// Max tokens the Metal batch path handles per chunk (multiples of 8). 0 on CPU.
+// Max tokens the GPU batch path handles per chunk. 0 on CPU.
 engine_batch_max :: proc() -> int {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		return MAX_BATCH_T
+	} else when GPU_CUDA {
+		return cuda_batch_max()
 	} else {
 		return 0
 	}
@@ -224,9 +253,14 @@ engine_config :: proc(e: ^Engine) -> ^Config {
 // gated-delta recurrent state is not rewindable -- a divergent prompt requires
 // a full recompute from scratch.
 engine_reset_state :: proc(e: ^Engine) {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready {
 			metal_reset_state()
+			return
+		}
+	} else when GPU_CUDA {
+		if e.metal_ready {
+			cuda_reset_state()
 			return
 		}
 	}
@@ -255,15 +289,19 @@ engine_reset_state :: proc(e: ^Engine) {
 // so a snapshot saved by a CPU engine restores on a Metal engine and vice
 // versa (byte-identical formats). See kv_q8.odin for the layout.
 engine_save_full_state :: proc(e: ^Engine) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready { return metal_save_full_state() }
+	} else when GPU_CUDA {
+		if e.metal_ready { return cuda_save_full_state() }
 	}
 	return cpu_save_full_state(&e.transformer)
 }
 
 engine_restore_full_state :: proc(e: ^Engine, kv_k, kv_v, conv, rec: []u8) {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready { metal_restore_full_state(kv_k, kv_v, conv, rec); return }
+	} else when GPU_CUDA {
+		if e.metal_ready { cuda_restore_full_state(kv_k, kv_v, conv, rec); return }
 	}
 	cpu_restore_full_state(&e.transformer, kv_k, kv_v, conv, rec)
 }
@@ -396,20 +434,30 @@ cpu_restore_full_state :: proc(t: ^Transformer, kv_k, kv_v, conv, rec: []u8) {
 
 // Speculative decoding support
 engine_save_spec_state :: proc(e: ^Engine) -> (conv: []u8, rec: []u8) {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready { return metal_save_spec_state() }
+	} else when GPU_CUDA {
+		if e.metal_ready { return cuda_save_spec_state() }
 	}
 	return
 }
 
 engine_restore_spec_state :: proc(e: ^Engine, conv: []u8, rec: []u8) {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready { metal_restore_spec_state(conv, rec); return }
+	} else when GPU_CUDA {
+		if e.metal_ready { cuda_restore_spec_state(conv, rec); return }
 	}
 }
 
 engine_verify_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 {
-	when ODIN_OS == .Darwin {
+	when GPU_CUDA {
+		if e.metal_ready {
+			fmt.eprintln("cuda: engine_verify_batch is not implemented")
+			return {}
+		}
+	}
+	when GPU_METAL {
 		if e.metal_ready {
 			_ = forward_gpu_batch(&e.transformer, tokens, pos_start, len(tokens))
 			return metal_verify_batch_logits(&e.transformer, len(tokens))

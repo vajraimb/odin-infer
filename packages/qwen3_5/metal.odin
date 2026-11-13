@@ -1,5 +1,7 @@
-
+#+build darwin
 /* Metal GPU forward pass for Qwen3.5 hybrid (full + linear attention).
+   Darwin-only: Linux builds use the CPU path or -define:ODINFER_BACKEND="cuda".
+   The Metal dispatch itself is unchanged.
    Reuses the GEMV / rmsnorm / attention / swiglu / residual kernels from the
    Qwen3 engine and adds: partial-rotary MRoPE, attention output gate, conv1d
    step, l2norm+scale, gated-delta recurrent step, and gated RMSNorm. */

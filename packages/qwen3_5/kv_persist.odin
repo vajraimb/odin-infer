@@ -385,18 +385,26 @@ verify_crc32 :: proc(path: string) -> bool {
 // ---------- public dispatch ----------
 
 engine_save_kv :: proc(e: ^Engine, path: string, n_valid_pos: int) -> bool {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready {
 			return metal_save_kv(&e.transformer, path, n_valid_pos)
+		}
+	} else when GPU_CUDA {
+		if e.metal_ready {
+			return cuda_save_kv(&e.transformer, path, n_valid_pos)
 		}
 	}
 	return cpu_save_kv(&e.transformer, path, n_valid_pos)
 }
 
 engine_load_kv :: proc(e: ^Engine, path: string) -> (int, bool) {
-	when ODIN_OS == .Darwin {
+	when GPU_METAL {
 		if e.metal_ready {
 			return metal_load_kv(&e.transformer, path)
+		}
+	} else when GPU_CUDA {
+		if e.metal_ready {
+			return cuda_load_kv(&e.transformer, path)
 		}
 	}
 	return cpu_load_kv(&e.transformer, path)

@@ -1,0 +1,156 @@
+# CUDA backend
+
+[中文](CUDA.zh.md)
+
+Linux x86_64 backend for the Qwen3.5 engine. It targets **sm_70 and newer**
+(validated for Tesla V100S, compute capability 7.0, driver CUDA 13.0).
+Accumulation is fp32. There is no bf16 and no tensor-core MMA, so V100's
+missing bf16 tensor cores are not a problem. dp4a is not required.
+
+macOS builds are unchanged: the default backend is still Metal. A single
+binary never contains both hot paths.
+
+## Build
+
+Odin compile does not need `nvcc`, the CUDA toolkit headers, or a GPU.
+`libcuda.so.1` and NVRTC are `dlopen`'d at runtime.
+
+```sh
+# CPU Linux build (no Metal frameworks). Same entry point as macOS.
+./build.sh
+
+# CUDA engine
+odin build server/serve_harness/serve.odin -file -out:bin/odin-serve \
+  -o:speed -no-bounds-check -disable-assert \
+  -define:ODINFER_BACKEND="cuda" \
+  -collection:ggml=packages -collection:infer=packages \
+  -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
+  -collection:sampler=packages -collection:tokenizer=packages \
+  -collection:cuda=packages
+
+bin/odin-serve model.gguf --cuda --max-ctx 2048
+# --metal is accepted as the same "use the GPU" switch on a CUDA build.
+```
+
+`-define:ODINFER_BACKEND="cuda"` must be quoted. The string is compared to
+`"cuda"`; the bare word `default` (the unset value) keeps Metal on Darwin and
+CPU everywhere else.
+
+The define is read in `packages/qwen3_5/backend.odin` (`GPU_METAL` /
+`GPU_CUDA`). Forward, KV save/load, and reset are `when` branches, so the
+compiled hot path has no Metal-vs-CUDA test.
+
+## NVRTC
+
+Set `NVRTC_DIR` to the directory that contains the real library, or to the
+full soname path. Load order:
+
+1. `$NVRTC_DIR/libnvrtc.so.13`, then `.12`, then `libnvrtc.so` (and the path
+   itself if it already ends in `.so`). `libnvrtc-builtins.so.13` / `.12`,
+   and the fully versioned name the wheel actually ships
+   (`libnvrtc-builtins.so.12.9`, `libnvrtc-builtins.so.13.0`, anything else
+   in that directory starting with `libnvrtc-builtins` except the `.alt.`
+   copy) is preloaded with `RTLD_GLOBAL`.
+2. System `libnvrtc.so.13`, then `libnvrtc.so.12`, then bare `libnvrtc.so`.
+
+The bare soname is last on purpose. On a CUDA 13 machine it is often the
+wrong major. Every compile passes
+`--gpu-architecture=compute_XX` from the device's compute capability.
+CUDA 13 NVRTC defaults to sm_75, which will not JIT on a V100 (sm_70).
+For a 7.0 device the flag is `compute_70`.
+
+`CUDA_DEVICE` selects the ordinal (default 0).
+
+## Check script
+
+`scripts/cuda_check.sh` builds the CUDA test and smoke binaries, compiles the
+kernel source for `compute_70` (no GPU required for that step), and, when a
+GPU is visible, runs the kernel self-test and an end-to-end generation.
+
+```sh
+./scripts/cuda_check.sh
+```
+
+Model search, first hit wins (`MODEL` overrides):
+
+| Path | Size | What it exercises |
+|------|------|-------------------|
+| `$MODEL` | any Qwen3.5 GGUF the loader accepts | whatever you point at |
+| `models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf` | 524 MB | MoE, mixed Q4_K / Q8_0 / Q5_0 |
+| `$HOME/.odinfer/models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf` | 524 MB | same, installer layout |
+| `models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf` | 5.6 GB | dense Q4_K_M (Q4_K + Q6_K + F32 norms) |
+
+Smoke arguments (overridable): `SMOKE_TOKENS` default 16, `SMOKE_CTX` default
+2048. If no model file is present the kernel test still runs and smoke is
+skipped, unless `CUDA_CHECK_REQUIRE_SMOKE=1`.
+
+Direct commands the script wraps:
+
+```sh
+odin build tools/cuda_kernel_test.odin -file -out:bin/cuda_kernel_test \
+  -define:ODINFER_BACKEND="cuda" \
+  -collection:ggml=packages -collection:infer=packages \
+  -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
+  -collection:sampler=packages -collection:tokenizer=packages \
+  -collection:cuda=packages
+
+bin/cuda_kernel_test --nvrtc-only compute_70
+bin/cuda_kernel_test
+
+odin build tools/cuda_smoke.odin -file -out:bin/cuda_smoke \
+  -define:ODINFER_BACKEND="cuda" \
+  -collection:ggml=packages -collection:infer=packages \
+  -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
+  -collection:sampler=packages -collection:tokenizer=packages \
+  -collection:cuda=packages
+
+bin/cuda_smoke models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf 16 2048
+```
+
+`cuda_kernel_test` compares GEMV/MMQ, RMSNorm, RoPE, SwiGLU, mixed-V KV
+store + attention, and the gated-delta step to the CPU reference in
+`packages/ggml` and `packages/qwen3_5/ops.odin`. `cuda_smoke` prints prefill
+and decode tok/s. Sampling stays on the existing CPU sampler (temperature 0
+in the smoke tool).
+
+## What is ported
+
+GEMV (decode, one warp per row) and MMQ (prefill, tile of up to 8 tokens,
+any `T`, token-major output), fp32 accumulate:
+
+F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K.
+
+Also: embedding via the CPU dequantizer plus an upload, RMSNorm, per-head
+Q RMSNorm, partial RoPE, attention decode and prefill, KV store and attention
+for f16, symmetric Q8_0, and the 40-byte mixed V block, attention gate,
+SwiGLU, residual, depthwise conv1d+SiLU, l2norm+scale, per-token gated delta,
+RMSNormGated, MoE softmax top-k plus per-expert GEMV and the optional shared
+expert.
+
+The default 9B Q4_K_M file (Q4_K, Q6_K, F32 norms, often Q8_0 or Q6_K
+embeddings) and the 0.8B MoE file (Q4_K, Q8_0, Q5_0, F32) are in that set.
+Init scans every projection and refuses a kind that is not in the list,
+naming the tensor. Embeddings may be any kind `ggml` can dequant on the CPU,
+including IQ; the output projection may not.
+
+## What is not ported
+
+IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q8_1.
+
+Also not in this backend: Metal's norm-fused GEMV, shape-specialized GEMV
+(`QGEMVSPEC`), wide-N autotune and the tune cache, fast-math, MoE grouped
+GEMM (`forward_gpu_batch_moe`), and `engine_verify_batch` (speculative
+verify). MoE prefill runs the attention projections as MMQ and the experts
+as per-token GEMV. Dense prefill chunks by `CUDA_MAX_BATCH` (128, smaller if
+the activation alloc fails). Decode is GEMV, not MMQ.
+
+Weights are copied to the device once (`cuMemcpyHtoD` of the GGUF mmap, plus
+the host-dequantized MoE router and shared-expert matrices). A 5.6 GB Q4_K_M
+9B fits in a 32 GB V100S; the resident KV cache is extra and follows the same
+`KV_Q8` / `KV_V` layout as Metal, so snapshots interchange.
+
+Sigmoid and softplus in the CUDA kernels match `ops.odin` (stable sigmoid,
+softplus clamped at ±20). Metal's fast-math `1/(1+exp(-x))` can differ by a
+few ulps. Kernel tests compare against the CPU reference, not against Metal
+golden files. GEMV tolerance is about `2e-2 + 1e-3 * |ref|` because the warp
+reduction order is not the CPU's left-to-right sum.

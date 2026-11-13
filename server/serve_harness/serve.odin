@@ -15,7 +15,8 @@
  *     /path/to/ornith.gguf --port 9748 --metal \
  *     -collection:ggml=. -collection:infer=. \
  *     -collection:qwen3_5=. -collection:qwen3_5_tokenizer=. \
- *     -collection:sampler=. -collection:tokenizer=.
+ *     -collection:sampler=. -collection:tokenizer=. \
+ *     -collection:cuda=.
  *
  * Then open http://127.0.0.1:9748 in a browser.
  */
@@ -587,7 +588,8 @@ json_info :: proc() -> string {
 	strings.write_string(&out, fmt.tprintf( "\"head_dim\":%d,", cfg.head_dim))
 	strings.write_string(&out, fmt.tprintf( "\"seq_len\":%d,", cfg.seq_len))
 	strings.write_string(&out, fmt.tprintf( "\"max_seq\":%d,", cfg.max_seq))
-	strings.write_string(&out, fmt.tprintf("\"metal\":%v", g_state.engine.metal_ready))
+	strings.write_string(&out, fmt.tprintf("\"metal\":%v,", g_state.engine.metal_ready))
+	strings.write_string(&out, fmt.tprintf("\"backend\":\"%s\"", q35.gpu_backend_name(g_state.engine.metal_ready)))
 	strings.write_byte(&out, byte('}'))
 	return strings.to_string(out)
 }
@@ -2795,8 +2797,9 @@ mcp_handle :: proc(line: string) -> (string, bool) {
 		case "odin.models":
 			cfg := q35.engine_config(&g_state.engine)
 			info := fmt.tprintf(
-				"model: %s\narchitecture: qwen3_5\nvocab: %d\nseq_len: %d\ndim: %d\nmetal: %v",
+				"model: %s\narchitecture: qwen3_5\nvocab: %d\nseq_len: %d\ndim: %d\nmetal: %v\nbackend: %s",
 				g_state.model_path, cfg.vocab_size, cfg.seq_len, cfg.dim, g_state.engine.metal_ready,
+				q35.gpu_backend_name(g_state.engine.metal_ready),
 			)
 			return mcp_tool_text_result(id, info), respond
 		case "odin.chat":
@@ -2857,7 +2860,7 @@ main :: proc() {
 		}
 	}
 	if len(args) < 2 {
-		fmt.eprintln("usage: serve <model.gguf> [--port N] [--metal] [--max-ctx N]")
+		fmt.eprintln("usage: serve <model.gguf> [--port N] [--metal|--cuda] [--max-ctx N]")
 		fmt.eprintln("       serve --self-test  (parse regression, no model needed)")
 		os.exit(1)
 	}
@@ -2874,7 +2877,7 @@ main :: proc() {
 			v, _ := strconv_parse_int(args[i+1])
 			port = u16(v)
 			i += 2
-		} else if a == "--metal" {
+		} else if a == "--metal" || a == "--cuda" {
 			use_metal = true
 			i += 1
 		} else if a == "--max-ctx" && i + 1 < len(args) {
@@ -2934,8 +2937,8 @@ main :: proc() {
 	// QDUMP_DIVERGE=1: dump divergence windows on cache-miss full prefills.
 	g_dump_diverge = os.get_env("QDUMP_DIVERGE", context.temp_allocator) == "1"
 
-	fmt.eprintfln("serve: ready (vocab=%d, seq_len=%d, metal=%v)",
-		cfg.vocab_size, cfg.seq_len, g_state.engine.metal_ready)
+	fmt.eprintfln("serve: ready (vocab=%d, seq_len=%d, metal=%v, backend=%s)",
+		cfg.vocab_size, cfg.seq_len, g_state.engine.metal_ready, q35.gpu_backend_name(g_state.engine.metal_ready))
 
 	if use_mcp {
 		mcp_loop()

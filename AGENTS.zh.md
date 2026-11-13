@@ -64,6 +64,15 @@ python3 server/serve_harness/test_tune.py   # 首启调优 + 缓存复用
 > 集成测试的二进制缓存在 `server/serve_harness/.test-serve.bin`；**只在
 > serve.odin 或 packages/*.odin 更新时自动重建**（按最新 mtime 判断）。
 
+Linux 上 `./build.sh` 走 CPU（`metal.odin` 带 `#+build darwin`）。CUDA 是单独的编译开关，不是默认：
+
+```sh
+./scripts/cuda_check.sh
+# 或 -define:ODINFER_BACKEND="cuda"  -collection:cuda=packages
+```
+
+见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。热路径是 `when GPU_METAL` / `when GPU_CUDA`，同一个二进制不会在两者之间分支。
+
 ## 运行
 
 ```sh

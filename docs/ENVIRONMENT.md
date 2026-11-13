@@ -38,6 +38,19 @@ Metal backend (`infer/metal.odin`) currently has no env-var knobs.
 `QPROF_*` are GPU-kernel timing ablations — they produce wrong output but let
 you isolate per-stage GPU time. Never enable in production.
 
+## CUDA backend (Linux, `-define:ODINFER_BACKEND="cuda"`)
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `NVRTC_DIR` | unset | Directory (or a full `libnvrtc.so.13` path) searched before the system sonames. Versioned `libnvrtc.so.13` / `.12` are tried before bare `libnvrtc.so`. |
+| `CUDA_DEVICE` | `0` | Device ordinal. |
+| `QTIMING` | off | `=1` prints per-chunk CUDA wall time on stderr. |
+| `KV_Q8` / `KV_V` | Q8 K + mixed V | Same switches as Metal. The on-disk KV snapshot format is shared. |
+| `METAL_FALLBACK` | off | `=1` lets a failed CUDA init fall back to CPU. `--cuda` / `--metal` / `-g 1` otherwise hard-error. |
+| `MOE_CPU` | off | `=1` forces the MoE path onto CPU. |
+
+`QGEMVSPEC`, `QMMQN`, `QFASTMATH`, and the tune cache are Metal-only. The CUDA build does not read them.
+
 ## CLI (`odin-infeer`)
 
 | Variable | Default | Effect                                  |

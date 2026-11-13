@@ -1,6 +1,7 @@
 /* CLI and chat loop. Auto-detects Qwen3 vs Qwen3.5 (Ornith) from the GGUF and
-   dispatches to the matching engine + tokenizer. `-g 1` enables Metal on Apple
-   Silicon (both architectures). `-x` sets repetition penalty (off by default). */
+   dispatches to the matching engine + tokenizer. `-g 1` enables the GPU:
+   Metal on Apple Silicon, CUDA when the binary was built with
+   -define:ODINFER_BACKEND="cuda". `-x` sets repetition penalty (off by default). */
 
 package main
 
@@ -360,7 +361,7 @@ error_usage :: proc() {
 	fmt.eprintln("  -f <int>    print TTFT (ms): 0 = off (default), 1 = on")
 	fmt.eprintln("  -j <int>    CPU matmul threads (default: core count)")
 	fmt.eprintln("  -c <int>    max context length (default 4096; caps KV/state memory)")
-	fmt.eprintln("  -g <int>    Metal GPU: 0 = off (default), 1 = on (Apple Silicon)")
+	fmt.eprintln("  -g <int>    GPU: 0 = off (default), 1 = on (Metal on macOS, CUDA if built with ODINFER_BACKEND=cuda)")
 	fmt.eprintln("  -L <path>   load KV+SSM state from .oikv file (Qwen3.5 only, resumes chat)")
 	fmt.eprintln("  -S <path>   save KV+SSM state to .oikv on exit (Qwen3.5 only)")
 	fmt.eprintln("  -J <int>    force JSON output (Qwen3.5 only): 0 = off (default), 1 = on")

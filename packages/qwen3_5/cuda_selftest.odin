@@ -1,0 +1,730 @@
+/* CUDA correctness checks against the CPU reference in packages/ggml and ops.odin.
+   cuda_nvrtc_check compiles PTX and does not need a GPU.
+   cuda_selftest needs a driver and a device (sm_70+). */
+
+package qwen3_5
+
+import cu "cuda:cuda"
+import ggml "ggml:ggml"
+
+import "core:c"
+import "core:fmt"
+import "core:math"
+import "core:os"
+
+@(private = "file")
+_cuda_self_import_keep :: proc() {
+	_ = cu.BACKEND_TAG
+	_ = ggml.QK_K
+	_ = c.int(0)
+	_ = fmt.tprintf("")
+	_ = math.abs(f32(0))
+	_ = os.O_RDONLY
+}
+
+when GPU_CUDA {
+
+@(private)
+s_dev: cu.Device
+@(private)
+s_ctx: bool
+@(private)
+s_mod: cu.Module
+
+cuda_nvrtc_check :: proc(arch: string) -> bool {
+	if cu.load_nvrtc() != cu.OK {
+		fmt.eprintln("cuda: NVRTC not found. Set NVRTC_DIR to the directory that contains libnvrtc.so.13 (or .12) before the bare libnvrtc.so")
+		return false
+	}
+	opt := fmt.tprintf("--gpu-architecture=%s", arch)
+	ptx, log, err := cu.compile_ptx(CUDA_KERNEL_SRC, "odinfer_cuda.cu", []string{opt})
+	if len(log) > 0 {
+		fmt.eprintfln("nvrtc: %s", log)
+	}
+	if err != cu.OK {
+		fmt.eprintf("cuda: NVRTC compile %s failed: %s\n", arch, cu.error_string(err))
+		return false
+	}
+	fmt.eprintfln("cuda: NVRTC compiled %s (%d bytes PTX) via %s", arch, len(ptx), cu.nv_loaded_from)
+	return true
+}
+
+@(private)
+s_fn :: proc(name: string) -> cu.Function {
+	fn, err := cu.module_function(s_mod, name)
+	if err != cu.OK || fn == nil {
+		fmt.eprintf("cuda_selftest: missing %s (%s)\n", name, cu.error_string(err))
+		return nil
+	}
+	return fn
+}
+
+@(private)
+s_close :: proc() {
+	if s_mod != nil {
+		cu.drv.ModuleUnload(s_mod)
+		s_mod = nil
+	}
+	if s_ctx {
+		cu.drv.DevicePrimaryCtxRelease_v2(s_dev)
+		s_ctx = false
+	}
+}
+
+@(private)
+s_open :: proc() -> bool {
+	if cu.load_driver() != cu.OK {
+		fmt.eprintln("cuda_selftest: libcuda not found")
+		return false
+	}
+	if cu.drv.Init(0) != cu.OK {
+		fmt.eprintln("cuda_selftest: cuInit failed")
+		return false
+	}
+	n: c.int
+	if cu.drv.DeviceGetCount(&n) != cu.OK || n < 1 {
+		fmt.eprintln("cuda_selftest: no CUDA device")
+		return false
+	}
+	if cu.drv.DeviceGet(&s_dev, 0) != cu.OK {
+		return false
+	}
+	major, minor: c.int
+	cu.drv.DeviceGetAttribute(&major, cu.ATTR_COMPUTE_CAPABILITY_MAJOR, s_dev)
+	cu.drv.DeviceGetAttribute(&minor, cu.ATTR_COMPUTE_CAPABILITY_MINOR, s_dev)
+	ctx: cu.Context
+	if cu.drv.DevicePrimaryCtxRetain(&ctx, s_dev) != cu.OK {
+		return false
+	}
+	s_ctx = true
+	if cu.drv.CtxSetCurrent(ctx) != cu.OK {
+		s_close()
+		return false
+	}
+	arch := fmt.tprintf("compute_%d%d", int(major), int(minor))
+	opt := fmt.tprintf("--gpu-architecture=%s", arch)
+	ptx, log, err := cu.compile_ptx(CUDA_KERNEL_SRC, "odinfer_cuda.cu", []string{opt})
+	if len(log) > 0 {
+		fmt.eprintfln("nvrtc: %s", log)
+	}
+	if err != cu.OK {
+		fmt.eprintf("cuda_selftest: compile %s failed: %s\n", arch, cu.error_string(err))
+		s_close()
+		return false
+	}
+	mod, jit, merr := cu.module_load_ptx(ptx)
+	if len(jit) > 0 {
+		fmt.eprintfln("jit: %s", jit)
+	}
+	if merr != cu.OK {
+		fmt.eprintf("cuda_selftest: module load failed: %s\n", cu.error_string(merr))
+		s_close()
+		return false
+	}
+	s_mod = mod
+	fmt.eprintfln("cuda_selftest: device sm_%d%d arch %s", int(major), int(minor), arch)
+	return true
+}
+
+@(private)
+s_fail :: proc(name: string, got, want, atol, rtol: f32) -> bool {
+	d := math.abs(got - want)
+	if math.is_nan(got) || math.is_inf(got) || d > atol + rtol * math.abs(want) {
+		fmt.eprintf("cuda_selftest: %s got %.6g want %.6g diff %.3g\n", name, got, want, d)
+		return true
+	}
+	return false
+}
+
+@(private)
+fill_weight :: proc(kind: ggml.GGML_Type, rows, cols: int) -> []u8 {
+	elems, bsz := ggml.ggml_block_info(kind)
+	nb := cols / elems
+	raw := make([]u8, rows * nb * bsz)
+	if kind == .F32 {
+		f := (cast([^]f32)raw_data(raw))[:rows * cols]
+		for i in 0 ..< rows * cols {
+			f[i] = (f32(i % 7) - 3) * 0.02
+		}
+		return raw
+	}
+	if kind == .F16 {
+		for i in 0 ..< rows * cols {
+			write_f16_le(raw[i * 2:], (f32(i % 7) - 3) * 0.02)
+		}
+		return raw
+	}
+	for i in 0 ..< len(raw) {
+		raw[i] = u8((i * 17 + 9) & 0xFF)
+	}
+	for b in 0 ..< rows * nb {
+		base := b * bsz
+		#partial switch kind {
+		case .Q8_K:
+			bits := transmute(u32)(f32(0.02))
+			raw[base + 0] = u8(bits)
+			raw[base + 1] = u8(bits >> 8)
+			raw[base + 2] = u8(bits >> 16)
+			raw[base + 3] = u8(bits >> 24)
+		case .Q2_K:
+			write_f16_le(raw[base + 80:], 0.05)
+			write_f16_le(raw[base + 82:], 0.01)
+		case .Q3_K:
+			write_f16_le(raw[base + 108:], 0.05)
+		case .Q6_K:
+			write_f16_le(raw[base + 208:], 0.02)
+		case .Q4_1, .Q5_1:
+			write_f16_le(raw[base:], 0.05)
+			write_f16_le(raw[base + 2:], 0.01)
+		case .Q4_K, .Q5_K:
+			write_f16_le(raw[base:], 0.05)
+			write_f16_le(raw[base + 2:], 0.01)
+		case:
+			write_f16_le(raw[base:], 0.05)
+		}
+	}
+	return raw
+}
+
+@(private)
+cpu_gemv :: proc(kind: ggml.GGML_Type, raw: []u8, x: []f32, rows, cols: int) -> []f32 {
+	elems, bsz := ggml.ggml_block_info(kind)
+	rb := (cols / elems) * bsz
+	out := make([]f32, rows)
+	scratch := make([]f32, cols)
+	defer delete(scratch)
+	for r in 0 ..< rows {
+		ggml.dequant_row(kind, raw[r * rb:], cols, scratch)
+		sum: f32 = 0
+		for j in 0 ..< cols {
+			sum += scratch[j] * x[j]
+		}
+		out[r] = sum
+	}
+	return out
+}
+
+@(private)
+run_gemv :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> bool {
+	tag := cuda_kind_tag(kind)
+	fn := s_fn(fmt.tprintf("gemv_%s", tag))
+	if fn == nil {
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, cols)
+	defer delete(x)
+	for i in 0 ..< cols {
+		x[i] = (f32(i % 5) - 2) * 0.05
+	}
+	ref := cpu_gemv(kind, raw, x, rows, cols)
+	defer delete(ref)
+	dw, e1 := cu.alloc(len(raw))
+	dx, e2 := cu.alloc(cols * 4)
+	dy, e3 := cu.alloc(rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	if e1 != cu.OK || e2 != cu.OK || e3 != cu.OK {
+		fmt.eprintln("cuda_selftest: alloc failed")
+		return false
+	}
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), cols * 4)
+	wb, xx, yy := dw, dx, dy
+	nn, dd := i32(cols), i32(rows)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd}
+	if cu.launch(fn, u32(rows), 1, 1, 32, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: gemv %s launch failed\n", tag)
+		return false
+	}
+	got := make([]f32, rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, rows * 4)
+	bad := false
+	for r in 0 ..< rows {
+		if s_fail(fmt.tprintf("gemv %s row %d", tag, r), got[r], ref[r], atol, rtol) {
+			bad = true
+			break
+		}
+	}
+	if !bad {
+		fmt.eprintfln("cuda_selftest: gemv %s ok", tag)
+	}
+	return !bad
+}
+
+@(private)
+run_mmq :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
+	tag := cuda_kind_tag(kind)
+	fn := s_fn(fmt.tprintf("mmq_%s", tag))
+	if fn == nil {
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref := make([]f32, T * rows)
+	defer delete(ref)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw, x[t * cols:][:cols], rows, cols)
+		copy(ref[t * rows:][:rows], row)
+		delete(row)
+	}
+	dw, _ := cu.alloc(len(raw))
+	dx, _ := cu.alloc(T * cols * 4)
+	dy, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	wb, xx, yy := dw, dx, dy
+	nn, dd, tt := i32(cols), i32(rows), i32(T)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	if cu.launch(fn, u32(rows), 1, 1, 32, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: mmq %s launch failed\n", tag)
+		return false
+	}
+	got := make([]f32, T * rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, T * rows * 4)
+	for i in 0 ..< T * rows {
+		if s_fail(fmt.tprintf("mmq %s [%d]", tag, i), got[i], ref[i], 2e-2, 1e-3) {
+			return false
+		}
+	}
+	fmt.eprintfln("cuda_selftest: mmq %s T=%d ok", tag, T)
+	return true
+}
+
+@(private)
+run_elem :: proc() -> bool {
+	// RMSNorm
+	n := 64
+	x := make([]f32, n)
+	w := make([]f32, n)
+	ref := make([]f32, n)
+	defer delete(x)
+	defer delete(w)
+	defer delete(ref)
+	for i in 0 ..< n {
+		x[i] = (f32(i % 9) - 4) * 0.1
+		w[i] = 0.8 + f32(i % 5) * 0.05
+	}
+	rmsnorm(ref, x, w, 1e-6)
+	dx, _ := cu.alloc(n * 4)
+	dw, _ := cu.alloc(n * 4)
+	dy, _ := cu.alloc(n * 4)
+	defer cu.free(dx)
+	defer cu.free(dw)
+	defer cu.free(dy)
+	cu.upload(dx, raw_data(x), n * 4)
+	cu.upload(dw, raw_data(w), n * 4)
+	fn := s_fn("rmsnorm_k")
+	if fn == nil {
+		return false
+	}
+	a, b, c0 := dx, dy, dw
+	sz := i32(n)
+	ep := f32(1e-6)
+	args := [?]rawptr{&a, &b, &c0, &sz, &ep}
+	if cu.launch(fn, 1, 1, 1, 128, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintln("cuda_selftest: rmsnorm launch failed")
+		return false
+	}
+	got := make([]f32, n)
+	defer delete(got)
+	cu.download(raw_data(got), dy, n * 4)
+	for i in 0 ..< n {
+		if s_fail(fmt.tprintf("rmsnorm[%d]", i), got[i], ref[i], 1e-4, 1e-4) {
+			return false
+		}
+	}
+
+	// RoPE, 2 heads, head_dim 8, rotary 4
+	hd, rot, nh, pos := 8, 4, 2, 3
+	vec := make([]f32, nh * hd)
+	cpuv := make([]f32, nh * hd)
+	defer delete(vec)
+	defer delete(cpuv)
+	for i in 0 ..< len(vec) {
+		vec[i] = (f32(i % 5) - 2) * 0.3
+		cpuv[i] = vec[i]
+	}
+	inv := make([]f32, rot / 2)
+	defer delete(inv)
+	inv_freq_default(10000, rot, inv)
+	for h in 0 ..< nh {
+		apply_mrope_text_head(cpuv[h * hd:][:hd], pos, inv, rot)
+	}
+	dv, _ := cu.alloc(len(vec) * 4)
+	defer cu.free(dv)
+	cu.upload(dv, raw_data(vec), len(vec) * 4)
+	rf := s_fn("rope_partial")
+	if rf == nil {
+		return false
+	}
+	vv := dv
+	ihd, ipos, irot, inh := i32(hd), i32(pos), i32(rot), i32(nh)
+	theta := f32(10000)
+	rargs := [?]rawptr{&vv, &ihd, &ipos, &theta, &irot, &inh}
+	total := nh * (rot / 2)
+	if cu.launch(rf, u32((total + 127) / 128), 1, 1, 128, 1, 1, 0, rargs[:]) != cu.OK {
+		fmt.eprintln("cuda_selftest: rope launch failed")
+		return false
+	}
+	gotv := make([]f32, len(vec))
+	defer delete(gotv)
+	cu.download(raw_data(gotv), dv, len(vec) * 4)
+	for i in 0 ..< len(vec) {
+		if s_fail(fmt.tprintf("rope[%d]", i), gotv[i], cpuv[i], 1e-4, 1e-4) {
+			return false
+		}
+	}
+
+	// SwiGLU
+	m := 17
+	hb := make([]f32, m)
+	hb2 := make([]f32, m)
+	defer delete(hb)
+	defer delete(hb2)
+	for i in 0 ..< m {
+		hb[i] = (f32(i) - 8) * 0.4
+		hb2[i] = (f32(i % 3) - 1) * 0.7
+	}
+	want := make([]f32, m)
+	defer delete(want)
+	for i in 0 ..< m {
+		want[i] = silu_f32(hb[i]) * hb2[i]
+	}
+	dh, _ := cu.alloc(m * 4)
+	dh2, _ := cu.alloc(m * 4)
+	defer cu.free(dh)
+	defer cu.free(dh2)
+	cu.upload(dh, raw_data(hb), m * 4)
+	cu.upload(dh2, raw_data(hb2), m * 4)
+	sf := s_fn("swiglu")
+	if sf == nil {
+		return false
+	}
+	ha, hb2p := dh, dh2
+	nn := i32(m)
+	sargs := [?]rawptr{&ha, &hb2p, &nn}
+	if cu.launch(sf, 1, 1, 1, 32, 1, 1, 0, sargs[:]) != cu.OK {
+		return false
+	}
+	gout := make([]f32, m)
+	defer delete(gout)
+	cu.download(raw_data(gout), dh, m * 4)
+	for i in 0 ..< m {
+		if s_fail(fmt.tprintf("swiglu[%d]", i), gout[i], want[i], 1e-5, 1e-5) {
+			return false
+		}
+	}
+	fmt.eprintln("cuda_selftest: rmsnorm rope swiglu ok")
+	return true
+}
+
+@(private)
+run_kv_attn :: proc() -> bool {
+	// One head, head_dim 32, two positions. Mixed V store + attention.
+	hd := 32
+	k := make([]f32, hd)
+	v := make([]f32, hd)
+	q := make([]f32, hd)
+	defer delete(k)
+	defer delete(v)
+	defer delete(q)
+	for i in 0 ..< hd {
+		k[i] = (f32(i % 7) - 3) * 0.2
+		v[i] = (f32(i % 5) - 1) * 0.5
+		q[i] = (f32(i % 4) - 1.5) * 0.3
+	}
+	// Spike an outlier so the mixed-V index is not trivial.
+	v[3] = 4.5
+	seq := 4
+	k_pos := 34
+	v_pos := 40
+	kc := make([]u8, seq * k_pos)
+	vc := make([]u8, seq * v_pos)
+	defer delete(kc)
+	defer delete(vc)
+	dk, _ := cu.alloc(hd * 4)
+	dv, _ := cu.alloc(hd * 4)
+	dq, _ := cu.alloc(hd * 4)
+	dkc, _ := cu.alloc(len(kc))
+	dvc, _ := cu.alloc(len(vc))
+	dsc, _ := cu.alloc(seq * 4)
+	dxb, _ := cu.alloc(hd * 4)
+	defer cu.free(dk)
+	defer cu.free(dv)
+	defer cu.free(dq)
+	defer cu.free(dkc)
+	defer cu.free(dvc)
+	defer cu.free(dsc)
+	defer cu.free(dxb)
+	cu.upload(dk, raw_data(k), hd * 4)
+	cu.upload(dv, raw_data(v), hd * 4)
+	cu.memset(dkc, 0, len(kc))
+	cu.memset(dvc, 0, len(vc))
+	store := s_fn("store_kv_q8v")
+	if store == nil {
+		return false
+	}
+	// pos 0 = k, pos 1 = a second copy scaled, so attention has two keys.
+	for pos in 0 ..< 2 {
+		scale := f32(1)
+		if pos == 1 {
+			scale = 0.5
+		}
+		ks := make([]f32, hd)
+		vs := make([]f32, hd)
+		for i in 0 ..< hd {
+			ks[i] = k[i] * scale
+			vs[i] = v[i] * scale
+		}
+		cu.upload(dk, raw_data(ks), hd * 4)
+		cu.upload(dv, raw_data(vs), hd * 4)
+		a, b, c0, d := dk, dv, dkc, dvc
+		nb, kb, vb, ps := i32(1), i32(k_pos), i32(v_pos), i32(pos)
+		args := [?]rawptr{&a, &b, &c0, &d, &nb, &kb, &vb, &ps}
+		if cu.launch(store, 1, 1, 1, 1, 1, 1, 0, args[:]) != cu.OK {
+			fmt.eprintln("cuda_selftest: store_kv_q8v failed")
+			delete(ks)
+			delete(vs)
+			return false
+		}
+		delete(ks)
+		delete(vs)
+	}
+	cu.download(raw_data(kc), dkc, len(kc))
+	cu.download(raw_data(vc), dvc, len(vc))
+	// CPU quant of pos 0 and compare dequant (f16 scale may differ by an ulp).
+	refk := make([]u8, 34)
+	refv := make([]u8, 40)
+	defer delete(refk)
+	defer delete(refv)
+	quantize_q8_block(k, refk)
+	quantize_q8_v_mix_block(v, refv)
+	dkf := make([]f32, 32)
+	dvf := make([]f32, 32)
+	rkf := make([]f32, 32)
+	rvf := make([]f32, 32)
+	defer delete(dkf)
+	defer delete(dvf)
+	defer delete(rkf)
+	defer delete(rvf)
+	dequantize_q8_block(kc[:34], dkf)
+	dequantize_q8_v_mix_block(vc[:40], dvf)
+	dequantize_q8_block(refk, rkf)
+	dequantize_q8_v_mix_block(refv, rvf)
+	for i in 0 ..< 32 {
+		if s_fail(fmt.tprintf("q8k[%d]", i), dkf[i], rkf[i], 2e-2, 1e-3) {
+			return false
+		}
+		if s_fail(fmt.tprintf("q8v[%d]", i), dvf[i], rvf[i], 2e-2, 1e-3) {
+			return false
+		}
+	}
+
+	cu.upload(dq, raw_data(q), hd * 4)
+	attn := s_fn("attention_q8v")
+	if attn == nil {
+		return false
+	}
+	qa, kca, vca, xb, sc := dq, dkc, dvc, dxb, dsc
+	ihd, ikb, ivb, mul, ps, sl := i32(hd), i32(k_pos), i32(v_pos), i32(1), i32(1), i32(seq)
+	aargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl}
+	if cu.launch(attn, 1, 1, 1, 128, 1, 1, 0, aargs[:]) != cu.OK {
+		fmt.eprintln("cuda_selftest: attention_q8v failed")
+		return false
+	}
+	got := make([]f32, hd)
+	defer delete(got)
+	cu.download(raw_data(got), dxb, hd * 4)
+
+	// CPU attention over the dequantized cache the GPU just wrote.
+	k0 := make([]f32, hd)
+	k1 := make([]f32, hd)
+	v0 := make([]f32, hd)
+	v1 := make([]f32, hd)
+	defer delete(k0)
+	defer delete(k1)
+	defer delete(v0)
+	defer delete(v1)
+	dequantize_q8_block(kc[0:34], k0)
+	dequantize_q8_block(kc[k_pos:k_pos + 34], k1)
+	dequantize_q8_v_mix_block(vc[0:40], v0)
+	dequantize_q8_v_mix_block(vc[v_pos:v_pos + 40], v1)
+	dot := proc(a, b: []f32) -> f32 {
+		s: f32 = 0
+		for i in 0 ..< len(a) {
+			s += a[i] * b[i]
+		}
+		return s
+	}
+	scale := 1 / math.sqrt_f32(f32(hd))
+	s0 := dot(q, k0) * scale
+	s1 := dot(q, k1) * scale
+	m := max(s0, s1)
+	e0 := math.exp_f32(s0 - m)
+	e1 := math.exp_f32(s1 - m)
+	inv := 1 / (e0 + e1)
+	for i in 0 ..< hd {
+		want := (e0 * v0[i] + e1 * v1[i]) * inv
+		if s_fail(fmt.tprintf("attn[%d]", i), got[i], want, 2e-2, 1e-3) {
+			return false
+		}
+	}
+	fmt.eprintln("cuda_selftest: q8v store + attention ok")
+	return true
+}
+
+@(private)
+run_delta :: proc() -> bool {
+	hkd, hvd := 4, 4
+	state := make([]f32, hkd * hvd)
+	q := make([]f32, hkd)
+	k := make([]f32, hkd)
+	v := make([]f32, hvd)
+	defer delete(state)
+	defer delete(q)
+	defer delete(k)
+	defer delete(v)
+	for i in 0 ..< len(state) {
+		state[i] = (f32(i % 5) - 2) * 0.1
+	}
+	for i in 0 ..< hkd {
+		q[i] = 0.2
+		k[i] = (f32(i) - 1) * 0.3
+	}
+	for i in 0 ..< hvd {
+		v[i] = (f32(i) - 0.5) * 0.4
+	}
+	bv := f32(0.3)
+	av := f32(0.2)
+	dec := f32(-0.7)
+	dt := f32(0.1)
+	beta := sigmoid_f32(bv)
+	g := math.exp_f32(dec * softplus_f32(av + dt))
+	cpu_state := make([]f32, len(state))
+	copy(cpu_state, state)
+	defer delete(cpu_state)
+	out := make([]f32, hvd)
+	scratch := make([]f32, hvd)
+	defer delete(out)
+	defer delete(scratch)
+	delta_recurrent_step(out, cpu_state, q, k, v, scratch, beta, g, hkd, hvd)
+
+	ds, _ := cu.alloc(len(state) * 4)
+	dq, _ := cu.alloc(hkd * 4)
+	dk, _ := cu.alloc(hkd * 4)
+	dv, _ := cu.alloc(hvd * 4)
+	db, _ := cu.alloc(4)
+	da, _ := cu.alloc(4)
+	dd, _ := cu.alloc(4)
+	dtb, _ := cu.alloc(4)
+	dout, _ := cu.alloc(hvd * 4)
+	defer cu.free(ds)
+	defer cu.free(dq)
+	defer cu.free(dk)
+	defer cu.free(dv)
+	defer cu.free(db)
+	defer cu.free(da)
+	defer cu.free(dd)
+	defer cu.free(dtb)
+	defer cu.free(dout)
+	cu.upload(ds, raw_data(state), len(state) * 4)
+	cu.upload(dq, raw_data(q), hkd * 4)
+	cu.upload(dk, raw_data(k), hkd * 4)
+	cu.upload(dv, raw_data(v), hvd * 4)
+	b1 := [1]f32{bv}
+	a1 := [1]f32{av}
+	d1 := [1]f32{dec}
+	t1 := [1]f32{dt}
+	cu.upload(db, raw_data(b1[:]), 4)
+	cu.upload(da, raw_data(a1[:]), 4)
+	cu.upload(dd, raw_data(d1[:]), 4)
+	cu.upload(dtb, raw_data(t1[:]), 4)
+	fn := s_fn("delta_recurrent")
+	if fn == nil {
+		return false
+	}
+	o, st, qq, kk, vv, bb, aa, decp, dtp := dout, ds, dq, dk, dv, db, da, dd, dtb
+	ik, iv, nk := i32(hkd), i32(hvd), i32(1)
+	args := [?]rawptr{&o, &st, &qq, &kk, &vv, &bb, &aa, &decp, &dtp, &ik, &iv, &nk}
+	if cu.launch(fn, 1, 1, 1, 128, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintln("cuda_selftest: delta launch failed")
+		return false
+	}
+	gout := make([]f32, hvd)
+	gstate := make([]f32, len(state))
+	defer delete(gout)
+	defer delete(gstate)
+	cu.download(raw_data(gout), dout, hvd * 4)
+	cu.download(raw_data(gstate), ds, len(state) * 4)
+	for i in 0 ..< hvd {
+		if s_fail(fmt.tprintf("delta out[%d]", i), gout[i], out[i], 1e-4, 1e-4) {
+			return false
+		}
+	}
+	for i in 0 ..< len(state) {
+		if s_fail(fmt.tprintf("delta state[%d]", i), gstate[i], cpu_state[i], 1e-4, 1e-4) {
+			return false
+		}
+	}
+	fmt.eprintln("cuda_selftest: delta ok")
+	return true
+}
+
+cuda_selftest :: proc() -> bool {
+	if !s_open() {
+		return false
+	}
+	defer s_close()
+	ok := true
+	kinds := [?]ggml.GGML_Type{
+		.F32, .F16, .Q8_0, .Q4_0, .Q4_1, .Q5_0, .Q5_1,
+		.Q4_K, .Q6_K, .Q2_K, .Q3_K, .Q5_K, .Q8_K,
+	}
+	for kind in kinds {
+		atol, rtol: f32 = 2e-2, 1e-3
+		if kind == .F32 || kind == .F16 {
+			atol, rtol = 1e-4, 1e-5
+		}
+		if !run_gemv(kind, 3, 256, atol, rtol) {
+			ok = false
+		}
+	}
+	mmq_kinds := [?]ggml.GGML_Type{.F32, .Q8_0, .Q4_K, .Q6_K, .Q5_0}
+	for kind in mmq_kinds {
+		if !run_mmq(kind, 3, 256, 5) {
+			ok = false
+		}
+	}
+	if !run_elem() {
+		ok = false
+	}
+	if !run_kv_attn() {
+		ok = false
+	}
+	if !run_delta() {
+		ok = false
+	}
+	if ok {
+		fmt.eprintln("cuda_selftest: PASS")
+	} else {
+		fmt.eprintln("cuda_selftest: FAIL")
+	}
+	return ok
+}
+
+} // GPU_CUDA

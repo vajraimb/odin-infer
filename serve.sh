@@ -18,10 +18,21 @@ echo "model: $MODEL"
 echo "stop with Ctrl-C"
 echo ""
 
+EXTRA=()
+GPU=(--metal)
+if [[ "${ODINFER_BACKEND:-}" == "cuda" ]]; then
+  EXTRA=(-define:ODINFER_BACKEND="cuda")
+  GPU=(--cuda)
+elif [[ "$(uname -s)" != "Darwin" ]]; then
+  GPU=()
+fi
+
 exec odin run server/serve_harness/serve.odin -file -o:speed \
+  "${EXTRA[@]}" \
   -collection:ggml=packages -collection:infer=packages \
   -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
   -collection:sampler=packages -collection:tokenizer=packages \
+  -collection:cuda=packages \
   -- \
   "$MODEL" \
-  --metal --max-ctx "$MAX_CTX" --port "$PORT"
+  "${GPU[@]}" --max-ctx "$MAX_CTX" --port "$PORT"
