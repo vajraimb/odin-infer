@@ -12,7 +12,11 @@ import "core:testing"
 
 MAX_TOKENS :: 1024
 MAX_TOKEN_LEN :: 32
-MAX_VOCAB :: 248077 // 248044 BPE tokens + 33 special tokens (ids 248044..248076)
+// Ceiling for a Qwen3.5 vocab file. The embedding table is padded to
+// 248320; the embedded vocab.txt is 248044 BPE tokens + 33 specials
+// (ids 248044..248076). A file of 248320 lines must load, not stop at
+// 248077 and look like the embedded vocab.
+MAX_VOCAB :: 248320
 
 MERGE_NOT_FOUND :: 1_000_000_000
 MAX_MERGES :: 247587
@@ -107,9 +111,18 @@ load_vocab_data :: proc(t: ^Tokenizer, data: string) {
 	t.vocab = make([dynamic]string, 0, MAX_VOCAB)
 	t.vocab_lookup = make(map[string]int)
 
-	for line in strings.split_lines(data) {
+	lines := strings.split_lines(data)
+	defer delete(lines)
+	n := len(lines)
+	// A trailing newline is not a token. Counting it used to trip the old
+	// 248077 ceiling and drop the load back onto the embedded vocab.
+	if n > 0 && lines[n - 1] == "" {
+		n -= 1
+	}
+	for i in 0 ..< n {
+		line := lines[i]
 		if len(t.vocab) >= MAX_VOCAB {
-			fmt.eprintf("vocab exceeds MAX_VOCAB (%d)\n", MAX_VOCAB)
+			fmt.eprintf("vocab exceeds MAX_VOCAB (%d); further tokens were not loaded\n", MAX_VOCAB)
 			break
 		}
 		id := len(t.vocab)
