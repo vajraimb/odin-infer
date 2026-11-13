@@ -53,11 +53,13 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256). `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` uses the scalar tile at every T. |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. Slower than the scalar tile at 581 and 2000 tokens on the V100S. |
 | `ODINFER_CUDA_ATTN_BATCH` | on | Prefill full attention launches once per chunk (heads by tokens). `=0` launches once per token. |
-| `ODINFER_CUDA_FUSE_NORM` | on | Decode writes the projection to a side buffer and fuses the add with the next RMSNorm and its q8 store. `=0` keeps the accum GEMV plus a separate RMSNorm. |
+| `ODINFER_CUDA_FUSE_NORM` | off | `=1` writes the projection to a side buffer and fuses the add with the next RMSNorm and its q8 store. Slower than the accum GEMV plus `rmsnorm_q8` on the V100S. |
+| `ODINFER_CUDA_Q4_NC` | off | `=1` uses `ld.global.nc` for the Q4 GEMV. Slower than plain `ld.global` on the V100S. |
+| `ODINFER_CUDA_Q4_ILP` | off | `=1` uses `gemv2_q4x` (8 rows/warp, coherent 128-bit loads, two super-blocks per iteration). `--bench-gemv` prints it as `r8`. Not the decode default. |
 | `ODINFER_CUDA_Q6_STAGE` | auto | Unset stages a Q6 GEMV only when K≥16384 or rows>8192. `=1` stages every Q6 GEMV. `=0` uses direct loads. |
 | `ODINFER_CUDA_SMOKE_PREFILL` | unset | `cuda_smoke` only. `=N` prefills N tokens of a fixed repeated sentence instead of the short 2+2 prompt. |
 | `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` decode as one CUDA graph. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
-| `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). |
+| `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). The 8192-event ring is aggregated by kernel name as it fills, so a long prefill is complete. |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. A graph replay prints the captured count. |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | HBM peak for `cuda_kernel_test --bench-gemv` (percent of peak). |
 | `QTIMING` | off | `=1` prints per-chunk CUDA wall time on stderr. |

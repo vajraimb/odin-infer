@@ -141,7 +141,11 @@ g_tc2_wide: bool // ODINFER_CUDA_TC2_WIDE=1: T>64 uses the 128-token tile
 @(private)
 g_attn_batch: bool // prefill attention is one launch per chunk
 @(private)
-g_fuse_norm: bool // decode residual add and the next RMSNorm share a kernel
+g_fuse_norm: bool // ODINFER_CUDA_FUSE_NORM=1: side-buffer residual_norm (slower)
+@(private)
+g_q4_nc: bool // ODINFER_CUDA_Q4_NC=1: ld.global.nc Q4 loads (slower on V100)
+@(private)
+g_q4_ilp: bool // ODINFER_CUDA_Q4_ILP=1: 8 rows/warp, two super-blocks
 @(private)
 g_skip_ffn, g_skip_attn: bool
 @(private)
@@ -189,7 +193,7 @@ g_q8_valid: bool
 @(private)
 k_quant, k_rmsnorm_q8, k_res_norm: cu.Function
 @(private)
-k_gemv2_q4, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
+k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
@@ -215,9 +219,13 @@ g_prof_n: int
 @(private)
 g_prof_ready: bool
 @(private)
-g_prof_trunc: bool
+g_prof_nbins: int
 @(private)
-g_bins: [48]Prof_Bin
+g_prof_launches: int
+@(private)
+g_prof_gpu: f64
+@(private)
+g_bins: [96]Prof_Bin
 
 cuda_batch_max :: proc() -> int {
 	if g_max_t > 0 {
@@ -242,13 +250,14 @@ klaunch :: proc(fn: cu.Function, gx, gy, gz, bx, by, bz: u32, args: []rawptr, wh
 	}
 	ok := ck(cu.launch(fn, gx, gy, gz, bx, by, bz, 0, args, g_launch_stream), what)
 	if ok && g_profile && g_prof_ready && !g_capturing {
+		if g_prof_n >= PROF_MAX {
+			profile_flush()
+		}
 		if g_prof_n < PROF_MAX {
 			if cu.gapi.event_record(g_prof_ev[g_prof_n], g_launch_stream) == cu.OK {
 				g_prof_name[g_prof_n] = what
 				g_prof_n += 1
 			}
-		} else {
-			g_prof_trunc = true
 		}
 	}
 	return ok
@@ -393,7 +402,17 @@ q8_drop :: proc() {
 
 @(private)
 gemv2_for :: proc(kind: ggml.GGML_Type) -> cu.Function {
-	if kind == .Q4_K do return k_gemv2_q4
+	if kind == .Q4_K {
+		// The wider kernel and the .nc loads are off until a V100 bench
+		// says they beat plain gemv2_q4_k. ROWS=1 still wins over both.
+		if g_q4_ilp && k_gemv2_q4x != nil {
+			return k_gemv2_q4x
+		}
+		if g_q4_nc && k_gemv2_q4nc != nil {
+			return k_gemv2_q4nc
+		}
+		return k_gemv2_q4
+	}
 	if kind == .Q6_K do return k_gemv2_q6
 	if kind == .Q5_K do return k_gemv2_q5k
 	if kind == .Q8_0 do return k_gemv2_q8
@@ -525,6 +544,8 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	rows_per := warps * 4
 	if r1 {
 		rows_per = warps
+	} else if fn == k_gemv2_q4x {
+		rows_per = warps * 8
 	}
 	splits := 1
 	// Short Q4/Q6 rows (wq, wo, w2) do not fill the SMs. Split K so more
@@ -555,6 +576,11 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	gx := u32((d + rows_per - 1) / rows_per)
 	bx := u32(warps * 32)
 	what := gemv_what(kind, r1)
+	if fn == k_gemv2_q4x {
+		what = "gemv2_q4x"
+	} else if fn == k_gemv2_q4nc {
+		what = "gemv2_q4nc"
+	}
 	fn_use := fn
 	// 9B q6 is 33 launches: 32 of them are w2 (4096 x 12288). Staging those
 	// was slower (3.95 -> 4.19 ms). 27B w2 is 5120 x 17408 and the logits
@@ -1069,6 +1095,8 @@ bind_kernels :: proc() -> bool {
 	k_rmsnorm_q8 = get_fn("rmsnorm_quant_q8")
 	k_res_norm = get_fn("residual_rmsnorm_q8")
 	k_gemv2_q4 = get_fn("gemv2_q4_k")
+	k_gemv2_q4nc = get_fn("gemv2_q4nc_k")
+	k_gemv2_q4x = get_fn("gemv2_q4x_k")
 	k_gemv2_q6 = get_fn("gemv2_q6_k")
 	k_gemv2_q6s = get_fn("gemv2_q6s_k")
 	k_gemv2_q5k = get_fn("gemv2_q5_k")
@@ -1082,7 +1110,7 @@ bind_kernels :: proc() -> bool {
 		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6,
-		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
+		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
 	}
 	for h in handles {
@@ -1407,7 +1435,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// Wide tile lost to the scalar tile at 581 and 2000 tokens. Opt in.
 	g_tc2_wide = os.get_env("ODINFER_CUDA_TC2_WIDE", context.temp_allocator) == "1"
 	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
-	g_fuse_norm = os.get_env("ODINFER_CUDA_FUSE_NORM", context.temp_allocator) != "0"
+	// Side-buffer residual_norm was slower than accum GEMV + rmsnorm_q8
+	// (9B 1.99 vs 1.41 ms, 27B 4.96 vs 3.53). Opt in.
+	g_fuse_norm = os.get_env("ODINFER_CUDA_FUSE_NORM", context.temp_allocator) == "1"
+	g_q4_nc = os.get_env("ODINFER_CUDA_Q4_NC", context.temp_allocator) == "1"
+	g_q4_ilp = os.get_env("ODINFER_CUDA_Q4_ILP", context.temp_allocator) == "1"
 	g_count_launches = os.get_env("ODINFER_CUDA_LAUNCHES", context.temp_allocator) == "1"
 	g_profile = os.get_env("ODINFER_CUDA_PROFILE", context.temp_allocator) == "1"
 	// Replay was slower than eager (9B 57.6 vs 63.0 tok/s): MemcpyHtoD_v2
@@ -1622,7 +1654,12 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintfln("cuda: tc2 on for Q4_K/Q6_K (%s; ODINFER_CUDA_TC2=0 uses the scalar dequant tile)", wide_note)
 	}
 	if g_fuse_norm {
-		fmt.eprintln("cuda: decode fuses the residual add into the next RMSNorm (ODINFER_CUDA_FUSE_NORM=0 keeps the accum GEMV)")
+		fmt.eprintln("cuda: decode fuses the residual add into the next RMSNorm (ODINFER_CUDA_FUSE_NORM=1). Slower than the accum GEMV on the V100S")
+	}
+	if g_q4_ilp {
+		fmt.eprintln("cuda: Q4 GEMV is 8 rows/warp, two super-blocks (ODINFER_CUDA_Q4_ILP=1). Default is 4 rows and plain ld.global")
+	} else if g_q4_nc {
+		fmt.eprintln("cuda: Q4 GEMV uses ld.global.nc (ODINFER_CUDA_Q4_NC=1). Slower than plain ld.global on the V100S")
 	}
 	if g_gemv_split {
 		fmt.eprintln("cuda: gemv split-K on for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLIT=0 disables it)")
@@ -1965,52 +2002,74 @@ profile_begin :: proc() {
 		g_prof_ready = true
 	}
 	g_prof_n = 0
-	g_prof_trunc = false
+	g_prof_nbins = 0
+	g_prof_launches = 0
+	g_prof_gpu = 0
+	for i in 0 ..< len(g_bins) {
+		g_bins[i] = {}
+	}
 	if cu.gapi.event_record(g_prof_ev[0], nil) == cu.OK {
 		g_prof_name[0] = ""
 		g_prof_n = 1
 	}
 }
 
+// Fold the recorded window into name totals and keep one fresh baseline.
+// A 2000-token prefill is ~200k launches; the 8192-event ring cannot hold it.
 @(private)
-profile_end :: proc(T, pos0: int, t0: time.Tick) {
-	if g_prof_n < 2 {
+profile_flush :: proc() {
+	if g_prof_n < 2 || cu.gapi.event_elapsed == nil {
 		return
 	}
-	cu.gapi.event_sync(g_prof_ev[g_prof_n - 1])
-	wall := time.duration_milliseconds(time.tick_diff(t0, time.tick_now()))
-	for i in 0 ..< len(g_bins) {
-		g_bins[i].count = 0
-		g_bins[i].ms = 0
-		g_bins[i].name = ""
-	}
-	nbin := 0
-	gpu: f64
-	for i in 1 ..< g_prof_n {
-		ms: f32
-		if cu.gapi.event_elapsed(&ms, g_prof_ev[i - 1], g_prof_ev[i]) != cu.OK {
-			continue
-		}
-		gpu += f64(ms)
-		name := g_prof_name[i]
-		slot := -1
-		for b in 0 ..< nbin {
-			if g_bins[b].name == name {
-				slot = b
-				break
-			}
-		}
-		if slot < 0 {
-			if nbin >= len(g_bins) {
+	synced := cu.gapi.event_sync(g_prof_ev[g_prof_n - 1]) == cu.OK
+	if synced {
+		for i in 1 ..< g_prof_n {
+			ms: f32
+			if cu.gapi.event_elapsed(&ms, g_prof_ev[i - 1], g_prof_ev[i]) != cu.OK {
 				continue
 			}
-			slot = nbin
-			g_bins[slot].name = name
-			nbin += 1
+			profile_note(g_prof_name[i], f64(ms))
 		}
-		g_bins[slot].count += 1
-		g_bins[slot].ms += f64(ms)
 	}
+	last := g_prof_n - 1
+	g_prof_ev[0], g_prof_ev[last] = g_prof_ev[last], g_prof_ev[0]
+	if cu.gapi.event_record(g_prof_ev[0], g_launch_stream) == cu.OK {
+		g_prof_name[0] = ""
+	}
+	g_prof_n = 1
+}
+
+@(private)
+profile_note :: proc(name: string, ms: f64) {
+	g_prof_gpu += ms
+	g_prof_launches += 1
+	slot := -1
+	for b in 0 ..< g_prof_nbins {
+		if g_bins[b].name == name {
+			slot = b
+			break
+		}
+	}
+	if slot < 0 {
+		if g_prof_nbins >= len(g_bins) {
+			return
+		}
+		slot = g_prof_nbins
+		g_bins[slot].name = name
+		g_prof_nbins += 1
+	}
+	g_bins[slot].count += 1
+	g_bins[slot].ms += ms
+}
+
+@(private)
+profile_end :: proc(T, pos0: int, t0: time.Tick) {
+	if g_prof_launches == 0 && g_prof_n < 2 {
+		return
+	}
+	profile_flush()
+	wall := time.duration_milliseconds(time.tick_diff(t0, time.tick_now()))
+	nbin := g_prof_nbins
 	order := make([]int, nbin, context.temp_allocator)
 	for i in 0 ..< nbin {
 		order[i] = i
@@ -2024,13 +2083,10 @@ profile_end :: proc(T, pos0: int, t0: time.Tick) {
 		}
 		order[i], order[best] = order[best], order[i]
 	}
-	fmt.eprintfln("cuda: profile T={} pos={}  wall {:.2f} ms  kernels {:.2f} ms  ({} launches)", T, pos0, wall, gpu, g_prof_n - 1)
+	fmt.eprintfln("cuda: profile T={} pos={}  wall {:.2f} ms  kernels {:.2f} ms  ({} launches)", T, pos0, wall, g_prof_gpu, g_prof_launches)
 	for i in order {
 		b := g_bins[i]
 		fmt.eprintfln("  {}  count {}  {:.3f} ms", b.name, b.count, b.ms)
-	}
-	if g_prof_trunc {
-		fmt.eprintln("cuda: profile truncated at 8192 events")
 	}
 }
 

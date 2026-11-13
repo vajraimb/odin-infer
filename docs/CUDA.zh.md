@@ -132,7 +132,7 @@ Q4_K / Q6_K 预填充只在测得更快的长度上走 tensor core。`T<=64` 用
 
 完整注意力的预填充是 prompt 长度的平方。第 t 个 query 要扫过 t+1 个 key，以前每个 token 启动一次，一个 head 一个 block，16 个 head 只占 V100 80 个 SM 里的 16 个。现在先把这一块的 KV 都写完，再按 head × token 启动一次（`ODINFER_CUDA_ATTN_BATCH=0` 恢复逐 token）。计算量仍是 O(N^2)。`delta_recurrent_chunk` 对 T 是线性的：token t 依赖 t-1 的状态，循环留在 block 里面，每个 value head 一个 block，不是平方。解码 `T==1` 仍是单 token 内核。
 
-稠密解码默认把注意力输出、线性层输出和 FFN down 写到旁路缓冲，再由 `residual_rmsnorm_q8` 做加法、RMSNorm 和 q8，并省掉下一次 RMSNorm 启动。拆分 K 的部分和先 `atomicAdd` 到旁路缓冲，再一次加进残差，低位可能和直接加进残差不同。`ODINFER_CUDA_FUSE_NORM=0` 回到累加 GEMV。9B 的 Q4 GEMV 大约读 3.0 GB 权重，6.01 ms 约 500 GB/s，是 1134 GB/s 峰值的 44%。Q6 只在 K≥16384 或行数>8192 时把量化块经对齐加载放进共享内存（27B 的 down 和 logits）；9B 的 down（4096×12288）仍直接加载。`ODINFER_CUDA_Q6_STAGE=0` 关掉，`=1` 全开。
+稠密解码默认把注意力输出、线性层输出和 FFN down 直接累加进残差，下一次 RMSNorm 仍是单独的 `rmsnorm_q8`（9B 1.41 ms，27B 3.53 ms）。`ODINFER_CUDA_FUSE_NORM=1` 才写到旁路缓冲再跑 `residual_rmsnorm_q8`。V100S 上这条更慢（9B 1.99 ms，27B 4.96 ms），解码从 68.4 / 26.05 掉到 63.6 / 23.4 tok/s，所以默认关闭。9B 的 Q4 GEMV 大约读 3.0 GB 权重，6.01 ms 约 500 GB/s，是 1134 GB/s 峰值的 44%。默认 Q4 加载是普通 `ld.global`（与 8975985 相同）。`ld.global.nc` 更慢（9B 6.01 → 6.50 ms，27B 19.57 → 22.4），只在 `ODINFER_CUDA_Q4_NC=1` 时启用。`ODINFER_CUDA_Q4_ILP=1` 选择 `gemv2_q4x`：每 warp 8 行、普通 128 位加载、每次迭代两个 super-block。`--bench-gemv` 把它印成 `r8`。它不是解码默认。Q6 只在 K≥16384 或行数>8192 时把量化块经对齐加载放进共享内存（27B 的 down 和 logits）；9B 的 down（4096×12288）仍直接加载。`ODINFER_CUDA_Q6_STAGE=0` 关掉，`=1` 全开。
 
 16 MiB 以下的 Q8_0 和 Q5_0 留在标量内核。2048×2048 上新内核更慢（Q8_0
 118.5 对 121.8 GB/s，Q5_0 49.2 对 69.7）。9B 和 27B 的热权重是 Q4_K 和
@@ -148,8 +148,8 @@ Q4_0 这一族）仍走标量 GEMV。K 不是量化块的整数倍时也走标�
 每块 32 行；一行时每块的每个 warp 一行。V100S 有 80 个 SM、每个 SM 64 个
 warp 槽。
 
-稠密 `T==1` 时，注意力输出、FFN down 和线性层输出走 `residual_rmsnorm_q8`。
-`ODINFER_CUDA_FUSE_NORM=0` 才把 GEMV 直接加进残差、不再单独发 residual。
+稠密 `T==1` 时，注意力输出、FFN down 和线性层输出直接加进残差。
+`ODINFER_CUDA_FUSE_NORM=1` 才改走 `residual_rmsnorm_q8`。
 预填充（`T>1`）和标量回退仍用单独的加。logits 的 GEMV 不累加。
 
 | 变量 | 默认 | 作用 |
@@ -160,10 +160,13 @@ warp 槽。
 | `ODINFER_CUDA_LAUNCHES` | 关 | `=1` 时每次 forward 打印内核启动次数 |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | `--bench-gemv` 用来算峰值百分比 |
 | `ODINFER_CUDA_GRAPH` | 关 | `=1` 把稠密 `T==1` 收成一张 CUDA graph。位置用图所在 stream 上的异步拷贝。MoE 和预填充仍即时。`ODINFER_CUDA_PROFILE=1` 会关掉 graph |
-| `ODINFER_CUDA_PROFILE` | 关 | `=1` 打印这次 forward 每个内核的 GPU 时间，最慢的在前 |
+| `ODINFER_CUDA_PROFILE` | 关 | `=1` 打印这次 forward 每个内核的 GPU 时间，最慢的在前。8192 个 event 的环在写满时按内核名汇总，长 prompt 不会被截断 |
+| `ODINFER_CUDA_FUSE_NORM` | 关 | `=1` 才把投影加进 `residual_rmsnorm_q8`。V100S 上比累加 GEMV 慢 |
+| `ODINFER_CUDA_Q4_NC` | 关 | `=1` 用 `ld.global.nc` 加载 Q4。V100S 上比普通 `ld.global` 慢 |
+| `ODINFER_CUDA_Q4_ILP` | 关 | `=1` 用 `gemv2_q4x`（每 warp 8 行、128 位加载、每次两个 super-block）。`--bench-gemv` 印成 `r8` |
 
 `cuda_selftest` 用 CPU fp32 点积对四行内核做 Q4_K、Q6_K、Q8_0、Q5_0、Q5_K
-的 64×512 和 6×256（行数不是 4 的倍数）。Q4_K 和 Q6_K 再跑一行内核，包括
+的 64×512 和 6×256（行数不是 4 的倍数）。Q4_K 再跑 `gemv2_q4nc_k` 和 `gemv2_q4x_k`（8 行，K 至少两块时含 split-K）。Q4_K 和 Q6_K 再跑一行内核，包括
 `accumulate=1`（输出先写成 0.25，期望 `ref+0.25`）。容差是 `1 + 0.05*|ref|`。
 和 CPU 的差来自 `x` 的 q8；半字节或 scale 对调会差到 `|ref|` 这一量级。
 

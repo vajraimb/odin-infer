@@ -167,7 +167,7 @@ Q4_K and Q6_K prefill with K a multiple of 256 uses a tensor-core tile only wher
 
 Full attention in prefill is quadratic. Query t scores and mixes `t+1` keys, one block per head, so a 16-head layer used 16 of the V100's 80 SMs and the launches were one per token. A chunk now stores every token's KV and then launches once with a grid of heads by tokens (`ODINFER_CUDA_ATTN_BATCH=0` restores the per-token launch). The flops stay O(N^2); a 2000-token prompt does not become a linear GEMM. `delta_recurrent_chunk` is linear in T. Token t needs the state from t-1, so the loop stays inside the block, one block per value head, one launch per linear layer. It is not quadratic. Decode (`T==1`) still launches `delta_recurrent` once. Decode also folds the q8 cache into the attention gate, SwiGLU, and gated RMSNorm, so those GEMVs skip `quant_q8`.
 
-On a dense `T==1` step the attention out, the linear out, and the FFN down used to atomic-add straight into the residual, and the next RMSNorm was its own one-block launch (about 65 of them, 1.41 ms on the 9B). The default now writes that GEMV into a side buffer and runs `residual_rmsnorm_q8`: add, RMSNorm, and the q8 store, and the following RMSNorm launch is skipped. Split-K still sums partials with `atomicAdd` into the side buffer, then one add into the residual, so the low bits can differ from adding each partial straight onto the residual. `ODINFER_CUDA_FUSE_NORM=0` keeps the accum GEMV. The 9B Q4 GEMVs read about 3.0 GB of weights (8 full layers, 24 linear layers, 32 MLPs of w1 and w3). 6.01 ms is about 500 GB/s, 44% of the 1134 GB/s peak. Counting 4.6 GB instead would be 765 GB/s. The loads go through the read-only cache; the dot itself is unchanged.
+On a dense `T==1` step the attention out, the linear out, and the FFN down atomic-add straight into the residual, and the next RMSNorm is its own launch (`rmsnorm_q8`, 1.41 ms on the 9B, 3.53 ms on the 27B). `ODINFER_CUDA_FUSE_NORM=1` writes that GEMV into a side buffer and runs `residual_rmsnorm_q8` instead. On the V100S that was slower (9B 1.99 ms across 64 launches, 27B 4.96 ms) and decode dropped from 68.4 / 26.05 tok/s to 63.6 / 23.4, so it stays off. The 9B Q4 GEMVs read about 3.0 GB of weights (8 full layers, 24 linear layers, 32 MLPs of w1 and w3). 6.01 ms is about 500 GB/s, 44% of the 1134 GB/s peak. Counting 4.6 GB instead would be 765 GB/s. The default Q4 load is a plain `ld.global` (`*(const uint4*)`), the same as 8975985. `ld.global.nc` was slower (9B q4 6.01 → 6.50 ms, 27B 19.57 → 22.4) and is `ODINFER_CUDA_Q4_NC=1` only. `ODINFER_CUDA_Q4_ILP=1` selects `gemv2_q4x`: 8 rows per warp, coherent 128-bit loads, two super-blocks per iteration. `--bench-gemv` prints that line as `r8` next to `r4` and `nc`. It is not the decode default.
 
 Q6 GEMV stages a block through aligned loads only when K is at least 16384 or the matrix is taller than 8192 rows (the 27B down projection and the logits). The 9B down projection (4096×12288) stays on the direct load. `ODINFER_CUDA_Q6_STAGE=1` stages every Q6 GEMV; `=0` stages none. The staged profile name is `gemv2_q6s`.
 
@@ -192,10 +192,10 @@ it is one row per warp in the block. V100S has 80 SMs and 64 warp slots
 per SM.
 
 On a dense `T==1` step the attention out, the FFN down, and the linear
-out go through `residual_rmsnorm_q8` (see above). `ODINFER_CUDA_FUSE_NORM=0`
-adds the GEMV straight into the residual and skips the separate residual
-kernel. Prefill (`T>1`) and the scalar fallback still add with their own
-kernel. The logits GEMV does not accumulate.
+out add straight into the residual. `ODINFER_CUDA_FUSE_NORM=1` sends them
+through `residual_rmsnorm_q8` instead (see above). Prefill (`T>1`) and the
+scalar fallback still add with their own kernel. The logits GEMV does not
+accumulate.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
@@ -206,15 +206,17 @@ kernel. The logits GEMV does not accumulate.
 | `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill. `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` is the scalar tile at every T |
 | `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. It was slower than the scalar tile at 581 and 2000 tokens |
 | `ODINFER_CUDA_ATTN_BATCH` | on | Prefill full attention is one launch per chunk. `=0` is one launch per token |
-| `ODINFER_CUDA_FUSE_NORM` | on | Decode adds the projection in `residual_rmsnorm_q8` and skips the next RMSNorm. `=0` keeps the accum GEMV |
+| `ODINFER_CUDA_FUSE_NORM` | off | `=1` adds the projection in `residual_rmsnorm_q8` and skips the next RMSNorm. Slower than the accum GEMV on the V100S (9B 1.99 vs 1.41 ms) |
+| `ODINFER_CUDA_Q4_NC` | off | `=1` loads Q4 weights and the q8 vector with `ld.global.nc`. Slower on the V100S (9B 6.01 → 6.50 ms) |
+| `ODINFER_CUDA_Q4_ILP` | off | `=1` uses `gemv2_q4x`: 8 rows/warp, coherent 128-bit loads, two super-blocks per iteration. `--bench-gemv` prints it as `r8` |
 | `ODINFER_CUDA_Q6_STAGE` | auto | `=1` stages every Q6 GEMV through aligned loads. `=0` never stages. Unset stages only when K≥16384 or rows>8192 |
 | `ODINFER_CUDA_SMOKE_PREFILL` | unset | `cuda_smoke` only. `=N` prefills N tokens |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count for each forward |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | Peak used by `--bench-gemv` to print % of HBM |
 | `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` as one CUDA graph. The position is an async copy on the graph stream. MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
-| `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for that forward, slowest first |
+| `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for that forward, slowest first. The 8192-event ring is folded into name totals as it fills, so a long prefill is not truncated |
 
-`cuda_selftest` also runs `residual_rmsnorm_q8` against a CPU residual add plus RMSNorm. It runs the four-row kernel against the CPU fp32 dot for Q4_K,
+`cuda_selftest` also runs `residual_rmsnorm_q8` against a CPU residual add plus RMSNorm. Q4_K also runs `gemv2_q4nc_k` and `gemv2_q4x_k` (8 rows/warp, including split-K when K has at least two blocks). It runs the four-row kernel against the CPU fp32 dot for Q4_K,
 Q6_K, Q8_0, Q5_0, and Q5_K at 64×512 and at 6×256 (the tail that is not a
 multiple of four rows). Q4_K and Q6_K also run the one-row kernel, including
 `accumulate=1` (output starts at 0.25, expect `ref+0.25`). Q6 also runs the staged kernel. The 64×512 cases also launch split-K with `gridDim.y=2`. `tc2s_*` (32-token tile) and `tc2_*` (128-token tile) run at 64×256×32 and at a partial tile; the wide tile also runs at T=80 and T=160. `delta_recurrent_chunk` runs two tokens and two value heads against `delta_recurrent_step`. Allowance is
