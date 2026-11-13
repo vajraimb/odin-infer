@@ -671,17 +671,28 @@ extern "C" __global__ void store_kv_f16(const float* k, const float* v, unsigned
     st_f16(vc + dst, v[gid]);
 }
 
+/* Full attention is quadratic in the prompt: query t scores and mixes
+   npos = t+1 keys. Prefill used to launch that once per token (one block
+   per head, so a 16-head layer filled 16 of 80 SMs). blockIdx.y is the
+   token in the chunk. The host stores every token's KV first, then one
+   launch covers the chunk. Flops stay O(N^2). tok_stride is the float
+   stride of q and xb3. gridDim.y == 1 is the one-token path. */
 extern "C" __global__ void attention_f16(const float* q, const unsigned char* kc, const unsigned char* vc, float* xb3, float* scores,
-                                         int head_dim, int seq_len, int kv_mul, int pos, const int* pos_slot) {
+                                         int head_dim, int seq_len, int kv_mul, int pos, const int* pos_slot, int tok_stride) {
+    int ti = (int)blockIdx.y;
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
     int kvh = h / kv_mul;
+    if (ti != 0) {
+        q += (size_t)ti * (size_t)tok_stride;
+        xb3 += (size_t)ti * (size_t)tok_stride;
+    }
     const float* qh = q + (size_t)h * (size_t)head_dim;
     const unsigned char* kbase = kc + (size_t)kvh * (size_t)seq_len * (size_t)head_dim * 2;
     const unsigned char* vbase = vc + (size_t)kvh * (size_t)seq_len * (size_t)head_dim * 2;
     float scale = rsqrtf((float)head_dim);
-    int npos = live_pos(pos, pos_slot) + 1;
-    float* sc = scores + (size_t)h * (size_t)seq_len;
+    int npos = live_pos(pos, pos_slot) + 1 + ti;
+    float* sc = scores + ((size_t)ti * (size_t)gridDim.x + (size_t)h) * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kk = kbase + (size_t)t * (size_t)head_dim * 2;
         float s = 0.f;
@@ -736,16 +747,21 @@ extern "C" __global__ void store_kv_q8(const float* k, const float* v, unsigned 
 }
 
 extern "C" __global__ void attention_q8(const float* q, const unsigned char* kc, const unsigned char* vc, float* xb3, float* scores,
-                                        int head_dim, int pos_bytes, int kv_mul, int pos, int seq_len, const int* pos_slot) {
+                                        int head_dim, int pos_bytes, int kv_mul, int pos, int seq_len, const int* pos_slot, int tok_stride) {
+    int ti = (int)blockIdx.y;
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
     int nb = head_dim >> 5;
     int kvh = h / kv_mul;
     int hb = kvh * nb;
+    if (ti != 0) {
+        q += (size_t)ti * (size_t)tok_stride;
+        xb3 += (size_t)ti * (size_t)tok_stride;
+    }
     const float* qh = q + (size_t)h * (size_t)head_dim;
     float scale = rsqrtf((float)head_dim);
-    int npos = live_pos(pos, pos_slot) + 1;
-    float* sc = scores + (size_t)h * (size_t)seq_len;
+    int npos = live_pos(pos, pos_slot) + 1 + ti;
+    float* sc = scores + ((size_t)ti * (size_t)gridDim.x + (size_t)h) * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kb = kc + (size_t)t * (size_t)pos_bytes + (size_t)hb * 34;
         float s = 0.f;
@@ -818,16 +834,21 @@ extern "C" __global__ void store_kv_q8v(const float* k, const float* v, unsigned
 }
 
 extern "C" __global__ void attention_q8v(const float* q, const unsigned char* kc, const unsigned char* vc, float* xb3, float* scores,
-                                         int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int pos, int seq_len, const int* pos_slot) {
+                                         int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int pos, int seq_len, const int* pos_slot, int tok_stride) {
+    int ti = (int)blockIdx.y;
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
     int nb = head_dim >> 5;
     int kvh = h / kv_mul;
     int hb = kvh * nb;
+    if (ti != 0) {
+        q += (size_t)ti * (size_t)tok_stride;
+        xb3 += (size_t)ti * (size_t)tok_stride;
+    }
     const float* qh = q + (size_t)h * (size_t)head_dim;
     float scale = rsqrtf((float)head_dim);
-    int npos = live_pos(pos, pos_slot) + 1;
-    float* sc = scores + (size_t)h * (size_t)seq_len;
+    int npos = live_pos(pos, pos_slot) + 1 + ti;
+    float* sc = scores + ((size_t)ti * (size_t)gridDim.x + (size_t)h) * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kb = kc + (size_t)t * (size_t)k_pos_bytes + (size_t)hb * 34;
         float s = 0.f;
@@ -929,7 +950,10 @@ extern "C" __global__ void delta_recurrent(float* out, float* state_all, const f
 }
 
 /* One launch for a whole prefill chunk. Token t depends on the state left
-   by token t-1, so the T loop stays inside the block. Heads stay parallel. */
+   by token t-1, so the T loop stays inside the block and cannot be split
+   across blocks. That is O(T) per head, not O(T^2): each token touches the
+   head_k by head_v state a constant number of times. Heads stay parallel
+   (one block per value head). */
 extern "C" __global__ void delta_recurrent_chunk(float* out, float* state_all, const float* q_lin, const float* k_lin,
                                                  const float* v_vec, const float* b_vec, const float* a_vec,
                                                  const float* a_decay, const float* dt_bias,
@@ -1730,6 +1754,16 @@ __device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p) {
     return u4_from_mis(base[0], base[1], mis);
 }
 
+/* Read-only cache. p is 16-byte aligned. The same q8 group is reloaded by
+   every row in the warp, and the weights are not written in this kernel. */
+__device__ __forceinline__ uint4 ldg_u4(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
 /* Same shift, from a 16-aligned shared tile. `at` is the byte offset. */
 __device__ __forceinline__ uint4 ld_u4_staged(const unsigned char* staged, unsigned at) {
     unsigned base = at & ~15u;
@@ -1869,6 +1903,47 @@ extern "C" __global__ void quant_q8(const float* x, signed char* qs, float* scal
 }
 
 /* RMSNorm one vector and quantize it. One block, 128 threads. n % 32 == 0, n <= 32768. */
+/* x += y, then the same RMSNorm and q8 store as rmsnorm_quant_q8.
+   One block, 128 threads. n % 32 == 0. The add is finished before the
+   sum of squares, matching a separate residual kernel followed by the norm. */
+extern "C" __global__ void residual_rmsnorm_q8(float* x, const float* y, float* out, const float* weight,
+                                               signed char* qs, float* scale, float2* sum16, int n, float eps) {
+    int tid = (int)threadIdx.x;
+    for (int i = tid; i < n; i += 128) x[i] += y[i];
+    __syncthreads();
+    float ss = 0.f;
+    for (int i = tid; i < n; i += 128) {
+        float v = x[i];
+        ss += v * v;
+    }
+    ss = block_sum_128(ss);
+    float inv = rsqrtf(ss / (float)n + eps);
+    for (int i = tid; i < n; i += 128) out[i] = weight[i] * (x[i] * inv);
+    __syncthreads();
+    int ng = n >> 5;
+    for (int g = tid; g < ng; g += 128) {
+        const float* xi = out + (size_t)g * 32;
+        float amax = 0.f, s0 = 0.f, s1 = 0.f;
+        for (int j = 0; j < 16; ++j) {
+            float a = xi[j];
+            float b = xi[j + 16];
+            amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
+            s0 += a;
+            s1 += b;
+        }
+        float d = amax / 127.f;
+        float id = d > 0.f ? 1.f / d : 0.f;
+        scale[g] = d;
+        sum16[g] = make_float2(s0, s1);
+        for (int j = 0; j < 32; ++j) {
+            int q = (int)rintf(xi[j] * id);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            qs[(size_t)g * 32 + j] = (signed char)q;
+        }
+    }
+}
+
 extern "C" __global__ void rmsnorm_quant_q8(const float* inp, float* out, const float* weight,
                                             signed char* qs, float* scale, float2* sum16, int n, float eps) {
     int tid = (int)threadIdx.x;
@@ -1923,8 +1998,8 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
         uint4 qv = make_uint4(0, 0, 0, 0);
         if (row < d) {
             const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 144;
-            if (t == 0) hdr = *(const uint4*)blk;
-            qv = *(const uint4*)(blk + 16 + t * 16);
+            if (t == 0) hdr = ldg_u4(blk);
+            qv = ldg_u4(blk + 16 + t * 16);
         }
         int src = lane & ~7;
         hdr = shfl_u4(hdr, src);
@@ -1936,8 +2011,8 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
             scale_min_hdr(p * 2 + 1, hdr, &sc1, &m1);
             int group = b * 8 + p * 2;
             int off = half * 16;
-            uint4 xlo = *(const uint4*)(xq + (size_t)group * 32 + off);
-            uint4 xhi = *(const uint4*)(xq + (size_t)(group + 1) * 32 + off);
+            uint4 xlo = ldg_u4(xq + (size_t)group * 32 + off);
+            uint4 xhi = ldg_u4(xq + (size_t)(group + 1) * 32 + off);
             int dot_lo = dot_nib(qv, xlo, 0);
             int dot_hi = dot_nib(qv, xhi, 1);
             float2 slo = sum16[group];

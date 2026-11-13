@@ -50,8 +50,10 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K rows per warp. Unset is four. `1` selects the one-row kernel, which was slower on the V100S. |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
 | `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K four ways and `atomicAdd`s the partials. `=0` is one K range. |
-| `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256). `T<=64` uses the 32-token fp16 tile. `T>64` uses the 128-token tile. `=0` uses the scalar-dequant tile. |
-| `ODINFER_CUDA_TC2_WIDE` | on | `=0` keeps the 32-token tile at every T. |
+| `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256). `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` uses the scalar tile at every T. |
+| `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. Slower than the scalar tile at 581 and 2000 tokens on the V100S. |
+| `ODINFER_CUDA_ATTN_BATCH` | on | Prefill full attention launches once per chunk (heads by tokens). `=0` launches once per token. |
+| `ODINFER_CUDA_FUSE_NORM` | on | Decode writes the projection to a side buffer and fuses the add with the next RMSNorm and its q8 store. `=0` keeps the accum GEMV plus a separate RMSNorm. |
 | `ODINFER_CUDA_Q6_STAGE` | auto | Unset stages a Q6 GEMV only when K≥16384 or rows>8192. `=1` stages every Q6 GEMV. `=0` uses direct loads. |
 | `ODINFER_CUDA_SMOKE_PREFILL` | unset | `cuda_smoke` only. `=N` prefills N tokens of a fixed repeated sentence instead of the short 2+2 prompt. |
 | `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` decode as one CUDA graph. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |

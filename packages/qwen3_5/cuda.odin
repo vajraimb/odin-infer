@@ -54,6 +54,8 @@ TC_MIN_T :: 16
 Store_Fn :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool
 @(private)
 Attn_Fn :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool
+@(private)
+Attn_Batch_Fn :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool
 
 @(private)
 g_ready: bool
@@ -85,6 +87,8 @@ g_k_bytes, g_v_bytes, g_conv_bytes, g_rec_bytes: int
 do_store: Store_Fn
 @(private)
 do_attn: Attn_Fn
+@(private)
+do_attn_batch: Attn_Batch_Fn
 
 @(private)
 d_x, d_xb, d_xb2, d_xb3: cu.Device_Ptr
@@ -133,7 +137,15 @@ g_gemv_split: bool // short Q4_K / Q6_K GEMV splits K across grid.y
 @(private)
 g_q6_stage: int // -1 auto, 0 direct loads, 1 staged loads
 @(private)
-g_tc2_wide: bool // T>64 uses the 128-token tile
+g_tc2_wide: bool // ODINFER_CUDA_TC2_WIDE=1: T>64 uses the 128-token tile
+@(private)
+g_attn_batch: bool // prefill attention is one launch per chunk
+@(private)
+g_fuse_norm: bool // decode residual add and the next RMSNorm share a kernel
+@(private)
+g_skip_ffn, g_skip_attn: bool
+@(private)
+g_score_batch: int // how many query tokens d_scores can hold
 @(private)
 g_pos_host: i32 // stable source for the async decode-pos copy
 @(private)
@@ -175,7 +187,7 @@ g_q8_src: cu.Device_Ptr
 @(private)
 g_q8_valid: bool
 @(private)
-k_quant, k_rmsnorm_q8: cu.Function
+k_quant, k_rmsnorm_q8, k_res_norm: cu.Function
 @(private)
 k_gemv2_q4, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
@@ -628,32 +640,34 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 	nn, dd, tt := i32(n), i32(d), i32(tcount)
 	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
 	if g_tc2 && n > 0 && n % 256 == 0 && (kind == .Q4_K || kind == .Q6_K) {
-		// T=19 on the 128-token tile was 323 ms vs 176 ms for the 32-token
-		// tile: a skipped second chunk still MMAs 64 tokens at BK=128, so
-		// each K is loaded twice. T<=64 stays on that 32-token tile. A
-		// prefill chunk is 128 tokens, so T>64 uses the wide tile and
-		// dequantizes once per chunk. ODINFER_CUDA_TC2_WIDE=0 keeps the
-		// 32-token tile at every T.
-		wide := g_tc2_wide && tcount > 64
-		fn := k_tc2s_q4
-		if wide {
-			fn = k_tc2_q4
-		}
-		if kind == .Q6_K {
-			fn = k_tc2s_q6
-			if wide {
-				fn = k_tc2_q6
+		// T<=64 stays on the 32-token tile: at T=19 the 128-token tile
+		// still MMAs a 64-token N and was 323 ms vs 176 ms. T>64 measured
+		// slower than the scalar tile (9B 581: 124.5 vs 138.9 tok/s, 2000:
+		// 71.9 vs 76.7; 27B 581: 50.9 vs 53.1), so the scalar tile is the
+		// default there. ODINFER_CUDA_TC2_WIDE=1 opts into tc2w.
+		use_small := tcount <= 64
+		use_wide := g_tc2_wide && tcount > 64
+		if use_small || use_wide {
+			fn := k_tc2s_q4
+			if use_wide {
+				fn = k_tc2_q4
 			}
-		}
-		if fn != nil {
-			gx := u32((d + 31) / 32)
-			gy := u32((tcount + 31) / 32)
-			name := "tc2"
-			if wide {
-				gy = u32((tcount + 127) / 128)
-				name = "tc2w"
+			if kind == .Q6_K {
+				fn = k_tc2s_q6
+				if use_wide {
+					fn = k_tc2_q6
+				}
 			}
-			return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], name)
+			if fn != nil {
+				gx := u32((d + 31) / 32)
+				gy := u32((tcount + 31) / 32)
+				name := "tc2"
+				if use_wide {
+					gy = u32((tcount + 127) / 128)
+					name = "tc2w"
+				}
+				return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], name)
+			}
 		}
 	}
 	fn := tc_fn[int(kind)]
@@ -787,6 +801,53 @@ launch_residual :: proc(x, y: cu.Device_Ptr, n: int) -> bool {
 	return klaunch(k_residual, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "residual")
 }
 
+// x += y, RMSNorm into out, quantize out. Same loops as residual then
+// rmsnorm_quant_q8. The following stage skips its rmsnorm launch.
+@(private)
+launch_residual_norm :: proc(x, y, outp, weight: cu.Device_Ptr, n: int, eps: f32) -> bool {
+	if k_res_norm == nil || weight == 0 || n <= 0 || n % 32 != 0 || n > g_q8_cap || d_xq == 0 {
+		return false
+	}
+	a, b, c, d := x, y, outp, weight
+	qs, sc, sm := d_xq, d_xd, d_xs
+	nn := i32(n)
+	ep := eps
+	args := [?]rawptr{&a, &b, &c, &d, &qs, &sc, &sm, &nn, &ep}
+	if !klaunch(k_res_norm, 1, 1, 1, 128, 1, 1, args[:], "residual_norm") {
+		return false
+	}
+	g_q8_src = outp
+	g_q8_n = n
+	g_q8_valid = true
+	return true
+}
+
+// Writes W*act into d_xb2, adds it onto d_x, and RMSNorms that sum into
+// d_xb. applied means the residual already includes the projection, so the
+// caller must not add it again. normed means d_xb is the next stage's
+// input and the next launch_rmsnorm should be skipped.
+@(private)
+try_fuse_proj :: proc(t: Tensor, act: cu.Device_Ptr, n, d: int, norm_w: cu.Device_Ptr, eps: f32) -> (applied, normed: bool) {
+	if !g_fuse_norm || !g_gemv_new || k_res_norm == nil || norm_w == 0 {
+		return false, false
+	}
+	if d <= 0 || d % 32 != 0 || d > g_q8_cap {
+		return false, false
+	}
+	w := wptr(raw_data(t.data))
+	if !launch_gemv(t.kind, w, act, d_xb2, n, d) {
+		return false, false
+	}
+	if launch_residual_norm(d_x, d_xb2, d_xb, norm_w, d, eps) {
+		return true, true
+	}
+	if !launch_residual(d_x, d_xb2, d) {
+		fmt.eprintln("cuda: residual add after a fused projection failed")
+		os.exit(1)
+	}
+	return true, false
+}
+
 @(private)
 launch_axpy :: proc(y, x: cu.Device_Ptr, a: f32, n: int) -> bool {
 	yy, xx := y, x
@@ -812,8 +873,20 @@ attn_f16_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	sc := d_scores
 	hd, sl, mul, ps := i32(g_head), i32(g_seq), i32(g_heads / g_kv_heads), i32(decode_pos(pos))
 	slot := pos_slot()
-	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &sl, &mul, &ps, &slot}
+	stride := i32(0)
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &sl, &mul, &ps, &slot, &stride}
 	return klaunch(k_attn_f16, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_f16")
+}
+
+@(private)
+attn_f16_batch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
+	a, b, c, d := q, kc, vc, xb3
+	sc := d_scores
+	hd, sl, mul, ps := i32(g_head), i32(g_seq), i32(g_heads / g_kv_heads), i32(pos0)
+	slot: cu.Device_Ptr
+	stride := i32(g_heads * g_head)
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &sl, &mul, &ps, &slot, &stride}
+	return klaunch(k_attn_f16, u32(g_heads), u32(T), 1, 128, 1, 1, args[:], "attn_f16")
 }
 
 @(private)
@@ -831,8 +904,20 @@ attn_q8_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	sc := d_scores
 	hd, pb, mul, ps, sl := i32(g_head), i32(g_k_pos), i32(g_heads / g_kv_heads), i32(decode_pos(pos)), i32(g_seq)
 	slot := pos_slot()
-	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &pb, &mul, &ps, &sl, &slot}
+	stride := i32(0)
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &pb, &mul, &ps, &sl, &slot, &stride}
 	return klaunch(k_attn_q8, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8")
+}
+
+@(private)
+attn_q8_batch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
+	a, b, c, d := q, kc, vc, xb3
+	sc := d_scores
+	hd, pb, mul, ps, sl := i32(g_head), i32(g_k_pos), i32(g_heads / g_kv_heads), i32(pos0), i32(g_seq)
+	slot: cu.Device_Ptr
+	stride := i32(g_heads * g_head)
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &pb, &mul, &ps, &sl, &slot, &stride}
+	return klaunch(k_attn_q8, u32(g_heads), u32(T), 1, 128, 1, 1, args[:], "attn_q8")
 }
 
 @(private)
@@ -852,8 +937,22 @@ attn_q8v_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	kb, vb := i32(g_k_pos), i32(g_v_pos)
 	mul, ps, sl := i32(g_heads / g_kv_heads), i32(decode_pos(pos)), i32(g_seq)
 	slot := pos_slot()
-	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &kb, &vb, &mul, &ps, &sl, &slot}
+	stride := i32(0)
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &kb, &vb, &mul, &ps, &sl, &slot, &stride}
 	return klaunch(k_attn_q8v, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8v")
+}
+
+@(private)
+attn_q8v_batch :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos0, T: int) -> bool {
+	a, b, c, d := q, kc, vc, xb3
+	sc := d_scores
+	hd := i32(g_head)
+	kb, vb := i32(g_k_pos), i32(g_v_pos)
+	mul, ps, sl := i32(g_heads / g_kv_heads), i32(pos0), i32(g_seq)
+	slot: cu.Device_Ptr
+	stride := i32(g_heads * g_head)
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &kb, &vb, &mul, &ps, &sl, &slot, &stride}
+	return klaunch(k_attn_q8v, u32(g_heads), u32(T), 1, 128, 1, 1, args[:], "attn_q8v")
 }
 
 @(private)
@@ -968,6 +1067,7 @@ bind_kernels :: proc() -> bool {
 	k_moe_topk = get_fn("moe_softmax_topk")
 	k_quant = get_fn("quant_q8")
 	k_rmsnorm_q8 = get_fn("rmsnorm_quant_q8")
+	k_res_norm = get_fn("residual_rmsnorm_q8")
 	k_gemv2_q4 = get_fn("gemv2_q4_k")
 	k_gemv2_q6 = get_fn("gemv2_q6_k")
 	k_gemv2_q6s = get_fn("gemv2_q6s_k")
@@ -982,7 +1082,7 @@ bind_kernels :: proc() -> bool {
 		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6,
-		k_quant, k_rmsnorm_q8, k_gemv2_q4, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
+		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
 	}
 	for h in handles {
@@ -1093,8 +1193,28 @@ alloc_acts :: proc(t: ^Transformer, T: int) -> bool {
 		d_klin, ok = alloc_bytes(T * keydim * 4); if !ok do return false
 	}
 	d_logits, ok = alloc_bytes(p.vocab_size * 4); if !ok do return false
-	if p.n_heads > 0 {
-		d_scores, ok = alloc_bytes(p.n_heads * p.seq_len * 4); if !ok do return false
+	g_score_batch = 1
+	if p.n_heads > 0 && p.seq_len > 0 {
+		one := p.n_heads * p.seq_len * 4
+		if one <= 0 {
+			fmt.eprintln("cuda: attention score buffer overflowed")
+			return false
+		}
+		batch := 1
+		// One score row per (token, head). Cap the buffer at 256 MiB and
+		// batch the prefill attention in chunks of that many tokens.
+		if g_attn_batch && one > 0 && one <= 256 * 1024 * 1024 {
+			fit := (256 * 1024 * 1024) / one
+			if fit > T {
+				fit = T
+			}
+			if fit < 1 {
+				fit = 1
+			}
+			batch = fit
+		}
+		d_scores, ok = alloc_bytes(batch * one); if !ok do return false
+		g_score_batch = batch
 	}
 	d_partial, ok = alloc_bytes(dim * 4); if !ok do return false
 	max_k := dim
@@ -1216,6 +1336,7 @@ cuda_destroy :: proc() {
 	g_max_t = 0
 	do_store = nil
 	do_attn = nil
+	do_attn_batch = nil
 }
 
 cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
@@ -1283,7 +1404,10 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		g_q6_stage = 1
 	}
 	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
-	g_tc2_wide = os.get_env("ODINFER_CUDA_TC2_WIDE", context.temp_allocator) != "0"
+	// Wide tile lost to the scalar tile at 581 and 2000 tokens. Opt in.
+	g_tc2_wide = os.get_env("ODINFER_CUDA_TC2_WIDE", context.temp_allocator) == "1"
+	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
+	g_fuse_norm = os.get_env("ODINFER_CUDA_FUSE_NORM", context.temp_allocator) != "0"
 	g_count_launches = os.get_env("ODINFER_CUDA_LAUNCHES", context.temp_allocator) == "1"
 	g_profile = os.get_env("ODINFER_CUDA_PROFILE", context.temp_allocator) == "1"
 	// Replay was slower than eager (9B 57.6 vs 63.0 tok/s): MemcpyHtoD_v2
@@ -1407,12 +1531,14 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			g_v_bytes = kv_v_mix_total_bytes(p.n_full, p.seq_len, g_kv_dim)
 			do_store = store_q8v_call
 			do_attn = attn_q8v_call
+			do_attn_batch = attn_q8v_batch
 		} else {
 			g_v_pos = g_k_pos
 			g_v_layer = g_k_layer
 			g_v_bytes = g_k_bytes
 			do_store = store_q8_call
 			do_attn = attn_q8_call
+			do_attn_batch = attn_q8_batch
 		}
 	} else {
 		g_k_layer = p.seq_len * g_kv_dim * 2
@@ -1421,6 +1547,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		g_v_bytes = g_k_bytes
 		do_store = store_f16_call
 		do_attn = attn_f16_call
+		do_attn_batch = attn_f16_batch
 	}
 	conv_f := 0
 	rec_f := 0
@@ -1488,11 +1615,14 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_tc2 {
-		wide_note := "T<=64 is the 32-token tile, T>64 is the 128-token tile"
-		if !g_tc2_wide {
-			wide_note = "32-token tile at every T (ODINFER_CUDA_TC2_WIDE=0)"
+		wide_note := "T<=64 is the 32-token tile; larger T uses the scalar tile (ODINFER_CUDA_TC2_WIDE=1 selects the 128-token tile)"
+		if g_tc2_wide {
+			wide_note = "T<=64 is the 32-token tile, T>64 is the 128-token tile"
 		}
 		fmt.eprintfln("cuda: tc2 on for Q4_K/Q6_K (%s; ODINFER_CUDA_TC2=0 uses the scalar dequant tile)", wide_note)
+	}
+	if g_fuse_norm {
+		fmt.eprintln("cuda: decode fuses the residual add into the next RMSNorm (ODINFER_CUDA_FUSE_NORM=0 keeps the accum GEMV)")
 	}
 	if g_gemv_split {
 		fmt.eprintln("cuda: gemv split-K on for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLIT=0 disables it)")
@@ -1590,23 +1720,46 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 	slot := tr.full_slot[l]
 	kc := cu.ptr_add(d_kc, slot * g_k_layer)
 	vc := cu.ptr_add(d_vc, slot * g_v_layer)
+	// Store every token before attention. Query t only reads KV through
+	// position t, so writing the rest of the chunk first does not change
+	// the scores. The per-token launch was one block per head and left
+	// most SMs idle; the chunk launch is still O(N^2) flops.
 	for ti in 0 ..< T {
 		qrow := fp(d_q, ti * attdim)
 		krow := fp(d_k, ti * kvdim)
 		vrow := fp(d_v, ti * kvdim)
-		qproj := fp(d_qproj, ti * qdim)
-		xb3 := fp(d_xb3, ti * attdim)
 		pos := pos0 + ti
 		must(launch_rope(qrow, p.head_dim, pos, p.rope_theta, p.rotary_dim, p.n_heads))
 		must(launch_rope(krow, p.head_dim, pos, p.rope_theta, p.rotary_dim, p.n_kv_heads))
 		must(do_store(krow, vrow, kc, vc, pos))
-		must(do_attn(qrow, kc, vc, xb3, pos))
+	}
+	batch := T > 1 && g_attn_batch && g_score_batch > 1 && do_attn_batch != nil
+	if batch {
+		for base := 0; base < T; base += g_score_batch {
+			ntok := min(g_score_batch, T - base)
+			must(do_attn_batch(fp(d_q, base * attdim), kc, vc, fp(d_xb3, base * attdim), pos0 + base, ntok))
+		}
+	}
+	for ti in 0 ..< T {
+		qproj := fp(d_qproj, ti * qdim)
+		xb3 := fp(d_xb3, ti * attdim)
+		if !batch {
+			must(do_attn(fp(d_q, ti * attdim), kc, vc, xb3, pos0 + ti))
+		}
 		must(launch_gate(xb3, qproj, p.head_dim, p.n_heads, T == 1))
 	}
-	if !(T == 1 && try_accum_gemv(fa.wo, d_xb3, d_x, attdim, dim)) {
-		must(launch_mm(fa.wo, d_xb3, d_xb2, attdim, dim, T))
-		must(launch_residual(d_x, d_xb2, T * dim))
+	applied := false
+	normed := false
+	if T == 1 && !p.is_moe && g_fuse_norm {
+		applied, normed = try_fuse_proj(fa.wo, d_xb3, attdim, dim, dev_f32(lw.ffn_norm), eps)
 	}
+	if !applied {
+		if !(T == 1 && try_accum_gemv(fa.wo, d_xb3, d_x, attdim, dim)) {
+			must(launch_mm(fa.wo, d_xb3, d_xb2, attdim, dim, T))
+			must(launch_residual(d_x, d_xb2, T * dim))
+		}
+	}
+	g_skip_ffn = normed
 }
 
 @(private)
@@ -1657,27 +1810,47 @@ cuda_linear :: proc(tr: ^Transformer, l, pos0, T: int) {
 		lout := fp(d_lout, ti * val)
 		must(launch_gated(lout, lout, dev_f32(la.norm_w), fp(d_z, ti * val), p.lin_n_v_heads, p.lin_head_v_dim, eps, T == 1))
 	}
-	if !(T == 1 && try_accum_gemv(la.out, d_lout, d_x, val, dim)) {
-		must(launch_mm(la.out, d_lout, d_xb2, val, dim, T))
-		must(launch_residual(d_x, d_xb2, T * dim))
+	applied := false
+	normed := false
+	if T == 1 && !p.is_moe && g_fuse_norm {
+		applied, normed = try_fuse_proj(la.out, d_lout, val, dim, dev_f32(lw.ffn_norm), eps)
 	}
+	if !applied {
+		if !(T == 1 && try_accum_gemv(la.out, d_lout, d_x, val, dim)) {
+			must(launch_mm(la.out, d_lout, d_xb2, val, dim, T))
+			must(launch_residual(d_x, d_xb2, T * dim))
+		}
+	}
+	g_skip_ffn = normed
 }
 
 @(private)
-cuda_mlp :: proc(tr: ^Transformer, l, T: int) {
+cuda_mlp :: proc(tr: ^Transformer, l, T: int, next_norm: cu.Device_Ptr) {
 	p := &tr.config
 	lw := &tr.weights.layers[l]
 	dim := p.dim
 	hid := p.hidden_dim
-	must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.ffn_norm), T, dim, p.rms_eps))
+	if g_skip_ffn {
+		g_skip_ffn = false
+	} else {
+		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.ffn_norm), T, dim, p.rms_eps))
+	}
 	must(launch_mm(lw.w1, d_xb, d_hb, dim, hid, T))
 	must(launch_mm(lw.w3, d_xb, d_hb2, dim, hid, T))
 	// swiglu(gate, up): result lands in the gate buffer. w1 is gate, w3 is up.
 	must(launch_swiglu(d_hb, d_hb2, T * hid, T == 1))
-	if !(T == 1 && try_accum_gemv(lw.w2, d_hb, d_x, hid, dim)) {
-		must(launch_mm(lw.w2, d_hb, d_xb2, hid, dim, T))
-		must(launch_residual(d_x, d_xb2, T * dim))
+	applied := false
+	normed := false
+	if T == 1 && g_fuse_norm {
+		applied, normed = try_fuse_proj(lw.w2, d_hb, hid, dim, next_norm, p.rms_eps)
 	}
+	if !applied {
+		if !(T == 1 && try_accum_gemv(lw.w2, d_hb, d_x, hid, dim)) {
+			must(launch_mm(lw.w2, d_hb, d_xb2, hid, dim, T))
+			must(launch_residual(d_x, d_xb2, T * dim))
+		}
+	}
+	g_skip_attn = normed
 }
 
 @(private)
@@ -1736,9 +1909,15 @@ cuda_forward_body :: proc(tr: ^Transformer, pos0, T: int) {
 	p := &tr.config
 	w := &tr.weights
 	g_q8_valid = false
+	g_skip_ffn = false
+	g_skip_attn = false
 	for l in 0 ..< p.n_layers {
 		lw := &w.layers[l]
-		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.attn_norm), T, p.dim, p.rms_eps))
+		if g_skip_attn {
+			g_skip_attn = false
+		} else {
+			must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.attn_norm), T, p.dim, p.rms_eps))
+		}
 		switch lw.layer_type {
 		case .Full_Attention:
 			cuda_full(tr, l, pos0, T)
@@ -1746,15 +1925,25 @@ cuda_forward_body :: proc(tr: ^Transformer, pos0, T: int) {
 			cuda_linear(tr, l, pos0, T)
 		}
 		if p.is_moe {
+			g_skip_ffn = false
 			for ti in 0 ..< T {
 				cuda_moe_token(tr, l, ti)
 			}
 		} else {
-			cuda_mlp(tr, l, T)
+			next := dev_f32(w.output_norm)
+			if l + 1 < p.n_layers {
+				next = dev_f32(w.layers[l + 1].attn_norm)
+			}
+			cuda_mlp(tr, l, T, next)
 		}
 	}
 	last := (T - 1) * p.dim
-	must(launch_rmsnorm(fp(d_x, last), d_xb, dev_f32(w.output_norm), 1, p.dim, p.rms_eps))
+	if g_skip_attn {
+		// The last down projection already wrote the output norm into d_xb.
+		g_skip_attn = false
+	} else {
+		must(launch_rmsnorm(fp(d_x, last), d_xb, dev_f32(w.output_norm), 1, p.dim, p.rms_eps))
+	}
 	must(launch_gemv(w.output.kind, wptr(raw_data(w.output.data)), d_xb, d_logits, p.dim, p.vocab_size))
 }
 

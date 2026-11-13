@@ -667,6 +667,55 @@ run_elem :: proc() -> bool {
 		return false
 	}
 
+	// residual add then the same RMSNorm, one kernel. n is a multiple of 32.
+	yv := make([]f32, n)
+	sumv := make([]f32, n)
+	defer delete(yv)
+	defer delete(sumv)
+	for i in 0 ..< n {
+		yv[i] = (f32(i % 7) - 3) * 0.05
+		sumv[i] = x[i] + yv[i]
+	}
+	ref2 := make([]f32, n)
+	defer delete(ref2)
+	rmsnorm(ref2, sumv, w, 1e-6)
+	dy2, _ := cu.alloc(n * 4)
+	dqs, _ := cu.alloc(n)
+	dsc, _ := cu.alloc((n / 32) * 4)
+	dsm, _ := cu.alloc((n / 32) * 8)
+	defer cu.free(dy2)
+	defer cu.free(dqs)
+	defer cu.free(dsc)
+	defer cu.free(dsm)
+	cu.upload(dx, raw_data(x), n * 4)
+	cu.upload(dy2, raw_data(yv), n * 4)
+	rn := s_fn("residual_rmsnorm_q8")
+	if rn == nil {
+		fmt.eprintln("cuda_selftest: residual_rmsnorm_q8 missing")
+		return false
+	}
+	rx, ry, ro, rw := dx, dy2, dy, dw
+	rqs, rsc, rsm := dqs, dsc, dsm
+	rn_args := [?]rawptr{&rx, &ry, &ro, &rw, &rqs, &rsc, &rsm, &sz, &ep}
+	if cu.launch(rn, 1, 1, 1, 128, 1, 1, 0, rn_args[:]) != cu.OK {
+		fmt.eprintln("cuda_selftest: residual_rmsnorm_q8 launch failed")
+		return false
+	}
+	got2 := make([]f32, n)
+	gotx := make([]f32, n)
+	defer delete(got2)
+	defer delete(gotx)
+	cu.download(raw_data(got2), dy, n * 4)
+	cu.download(raw_data(gotx), dx, n * 4)
+	st_rn: Case_Err
+	for i in 0 ..< n {
+		s_note(&st_rn, fmt.tprintf("residual_norm.x[%d]", i), gotx[i], sumv[i], 1e-5, 1e-5)
+		s_note(&st_rn, fmt.tprintf("residual_norm[%d]", i), got2[i], ref2[i], 1e-4, 1e-4)
+	}
+	if !s_report("residual_rmsnorm_q8", st_rn, 1e-4, 1e-4) {
+		return false
+	}
+
 	// RoPE, 2 heads, head_dim 8, rotary 4
 	hd, rot, nh, pos := 8, 4, 2, 3
 	vec := make([]f32, nh * hd)
@@ -863,7 +912,8 @@ run_kv_attn :: proc() -> bool {
 	qa, kca, vca, xb, sc := dq, dkc, dvc, dxb, dsc
 	ihd, ikb, ivb, mul, ps, sl := i32(hd), i32(k_pos), i32(v_pos), i32(1), i32(1), i32(seq)
 	slot: cu.Device_Ptr
-	aargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl, &slot}
+	stride := i32(0)
+	aargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl, &slot, &stride}
 	if cu.launch(attn, 1, 1, 1, 128, 1, 1, 0, aargs[:]) != cu.OK {
 		fmt.eprintln("cuda_selftest: attention_q8v failed")
 		return false

@@ -128,8 +128,11 @@ Q4_K 和 Q6_K 默认都是四行一个 warp。一行一个 warp 在 V100S 上每
 39%）。`ODINFER_CUDA_GEMV_ROWS=1` 仍可选它。一段 K 上的总 warp 数是 `rows / 4`。
 行数不超过 8192 的 Q4_K / Q6_K 把这段 K 拆到 `gridDim.y`（默认 4 路，
 `atomicAdd` 汇总）。`ODINFER_CUDA_GEMV_SPLIT=0` 关掉。K 是 256 倍数的
-Q4_K / Q6_K 预填充走 `tc2`。`T<=64` 用 32-token 的块（一次展开 256 宽的量化块）。`T>64` 一块覆盖 32 行和 128 个 token，同一份 fp16 权重给两个 64-token 的 WMMA 用。V100S 上 T=19 的 128-token 块是 323 ms，32-token 块是 176 ms。`ODINFER_CUDA_TC2_WIDE=0` 让任何 T 都用 32-token 块。`ODINFER_CUDA_TC2=0` 回到逐元素反量化。Q6 只在 K≥16384 或行数>8192 时把量化块经对齐加载放进共享内存（27B 的 down 和 logits）；9B 的 down（4096×12288）仍直接加载。`ODINFER_CUDA_Q6_STAGE=0` 关掉，`=1` 全开。预填充的线性注意力一层一次
-`delta_recurrent_chunk`；解码 `T==1` 仍是原来的单 token 内核。
+Q4_K / Q6_K 预填充只在测得更快的长度上走 tensor core。`T<=64` 用 32-token 的块（profile 名 `tc2`）：V100S 上 T=19 是 176 ms，128-token 的块是 323 ms。`T>64` 默认用逐元素反量化（profile 名 `tc`）。128-token 的块（`tc2w`）在长 prompt 上更慢：9B 581 token 124.5 对 138.9 tok/s，2000 token 71.9 对 76.7；27B 581 token 50.9 对 53.1。`ODINFER_CUDA_TC2_WIDE=1` 才选它。`ODINFER_CUDA_TC2=0` 在任何 T 都用标量块。
+
+完整注意力的预填充是 prompt 长度的平方。第 t 个 query 要扫过 t+1 个 key，以前每个 token 启动一次，一个 head 一个 block，16 个 head 只占 V100 80 个 SM 里的 16 个。现在先把这一块的 KV 都写完，再按 head × token 启动一次（`ODINFER_CUDA_ATTN_BATCH=0` 恢复逐 token）。计算量仍是 O(N^2)。`delta_recurrent_chunk` 对 T 是线性的：token t 依赖 t-1 的状态，循环留在 block 里面，每个 value head 一个 block，不是平方。解码 `T==1` 仍是单 token 内核。
+
+稠密解码默认把注意力输出、线性层输出和 FFN down 写到旁路缓冲，再由 `residual_rmsnorm_q8` 做加法、RMSNorm 和 q8，并省掉下一次 RMSNorm 启动。拆分 K 的部分和先 `atomicAdd` 到旁路缓冲，再一次加进残差，低位可能和直接加进残差不同。`ODINFER_CUDA_FUSE_NORM=0` 回到累加 GEMV。9B 的 Q4 GEMV 大约读 3.0 GB 权重，6.01 ms 约 500 GB/s，是 1134 GB/s 峰值的 44%。Q6 只在 K≥16384 或行数>8192 时把量化块经对齐加载放进共享内存（27B 的 down 和 logits）；9B 的 down（4096×12288）仍直接加载。`ODINFER_CUDA_Q6_STAGE=0` 关掉，`=1` 全开。
 
 16 MiB 以下的 Q8_0 和 Q5_0 留在标量内核。2048×2048 上新内核更慢（Q8_0
 118.5 对 121.8 GB/s，Q5_0 49.2 对 69.7）。9B 和 27B 的热权重是 Q4_K 和
@@ -145,9 +148,9 @@ Q4_0 这一族）仍走标量 GEMV。K 不是量化块的整数倍时也走标�
 每块 32 行；一行时每块的每个 warp 一行。V100S 有 80 个 SM、每个 SM 64 个
 warp 槽。
 
-稠密 `T==1` 时，注意力输出、FFN down 和线性层输出的 GEMV 直接加进残差，
-这一步不再单独发 residual。预填充（`T>1`）和标量回退仍用单独的加。logits
-的 GEMV 不累加。
+稠密 `T==1` 时，注意力输出、FFN down 和线性层输出走 `residual_rmsnorm_q8`。
+`ODINFER_CUDA_FUSE_NORM=0` 才把 GEMV 直接加进残差、不再单独发 residual。
+预填充（`T>1`）和标量回退仍用单独的加。logits 的 GEMV 不累加。
 
 | 变量 | 默认 | 作用 |
 |------|------|------|
