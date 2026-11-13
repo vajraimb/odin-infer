@@ -20,7 +20,7 @@ Four state buffers, all position-evolving:
 | Buffer             | Layers           | Shape (per layer)                  | Notes                                         |
 |--------------------|------------------|------------------------------------|-----------------------------------------------|
 | `key_cache`        | full-attention   | `[seq_len, kv_dim]` (trimmed)      | Q8_0 position-major on Metal (`KV_Q8=0`: legacy f16 head-major), f32 layer-major on CPU |
-| `value_cache`      | full-attention   | `[seq_len, kv_dim]` (trimmed)      | same as K                                     |
+| `value_cache`      | full-attention   | `[seq_len, kv_dim]` (trimmed)      | mixed block on Metal (peak f16 + residual Q8; `KV_V=q8` for symmetric Q8), f32 layer-major on CPU |
 | `conv_states`      | linear-attention | `[conv_dim, kernel-1]`             | causal conv1d state                            |
 | `recurrent_states` | linear-attention | `[v_heads, head_k_dim, head_v_dim]`| gated-delta recurrent state                   |
 

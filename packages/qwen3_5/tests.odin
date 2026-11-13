@@ -226,6 +226,50 @@ q8_block_quantization_error_bound :: proc(t: ^testing.T) {
 }
 
 @(test)
+q8_v_mix_outlier_exact :: proc(t: ^testing.T) {
+	// One spike sets a symmetric Q8 scale and coarsens the other 31 values.
+	// The mixed block keeps that spike as f16 and quantizes the rest against
+	// their own (much smaller) amax.
+	src := make([]f32, QK8_0)
+	defer delete(src)
+	for j in 0 ..< QK8_0 {
+		src[j] = math.sin(f32(j) * 0.4) * 0.8
+	}
+	src[17] = 85.0
+	blk := make([]u8, Q8_V_MIX_BLOCK_BYTES)
+	defer delete(blk)
+	out := make([]f32, QK8_0)
+	defer delete(out)
+	quantize_q8_v_mix_block(src, blk)
+	testing.expect(t, int(blk[2]) == 17, "outlier index is the spike")
+	dequantize_q8_v_mix_block(blk, out)
+	approx(t, out[17], 85.0, 1e-3, "spike survives as f16")
+	// Residual amax is < 1, so the Q8 error on the other elements is tiny
+	// compared with d=85/127 of a symmetric block.
+	for j in 0 ..< QK8_0 {
+		if j == 17 { continue }
+		testing.expect(t, math.abs(out[j] - src[j]) < 0.01, fmt.tprintf("mix residual [%d]", j))
+	}
+}
+
+@(test)
+q8_v_mix_tie_takes_lowest_index :: proc(t: ^testing.T) {
+	src := make([]f32, QK8_0)
+	defer delete(src)
+	src[3] = 4.0
+	src[9] = -4.0
+	blk := make([]u8, Q8_V_MIX_BLOCK_BYTES)
+	defer delete(blk)
+	quantize_q8_v_mix_block(src, blk)
+	testing.expect(t, int(blk[2]) == 3, "tie keeps the lowest index")
+	out := make([]f32, QK8_0)
+	defer delete(out)
+	dequantize_q8_v_mix_block(blk, out)
+	approx(t, out[3], 4.0, 1e-4, "tied outlier exact")
+	approx(t, out[9], -4.0, 1e-3, "second peak quantized against itself as amax")
+}
+
+@(test)
 q8_kv_byte_math :: proc(t: ^testing.T) {
 	testing.expect(t, kv_pos_bytes(1024) == (1024 / 32) * 34, "kv_pos_bytes(1024)")
 	testing.expect(t, kv_pos_bytes(512) == (512 / 32) * 34, "kv_pos_bytes(512)")

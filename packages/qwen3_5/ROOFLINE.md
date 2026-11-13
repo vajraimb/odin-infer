@@ -36,7 +36,7 @@ GPU f32 ~2.15 TFLOPS / fp16 ~4.3 TFLOPS。
 | Stage 1b 批量投影 + tuned MMQ | prefill 122→23 ms/tok(**4.9×**) | ✅ 已交付 |
 | Stage 2 chunked delta(线性层递推) | ~2 ms/tok | ❌ 数据否决(低 ROI),kernel 验证过但未接 |
 | MMQ dequant/staging 往 1.5 TFLOPS 推 | prefill 15→~9-12 ms/tok(~1.5×) | 硬工程,唯一真杠杆,收益封顶 ~2× |
-| tile sweep(真实 shape) | ~10-20%(900→1100) | ✅ 已交付并采纳进 engine:`gemm_harness/gemm_autotune.odin` + `metal.odin` 的 `gemm_q4k_f32_b64`(M%64 走 bm=64 bk=64,其余回退 v3)。Q4K isolated w1 874→1028(+18%);**engine 实测 prefill ~1.2×**(QTIMING 位置对齐 median 39.2→32.4 ms/tok)。Q6K b64 是 0.66× 回归已排除(w2 保持 v3 ~400 GFLOPS 上限);fm on/off 无差 |
+| tile sweep(真实 shape) | ~10-20%(900→1100) | ✅ 已交付并采纳进 engine:`gemm_harness/gemm_autotune.odin` + `metal.odin` 的 `gemm_q4k_f32_b64`(M%64 走 bm=64 bk=64,其余回退 v3)。Q4K isolated w1 874→1028(+18%);**engine 实测 prefill ~1.2×**(QTIMING 位置对齐 median 39.2→32.4 ms/tok)。Q6K b64 是 0.66× 回归已排除(w2 保持 v3 ~400 GFLOPS 上限);fm on/off 无差。2026-11-13 列方向加宽(BN 不再锁 8,`qn_sweep.odin`):Q4 `gemm_q4k_f32_n32` BM=32 BN=32 BK=64,9B 形状 ~1470 vs b64 ~1195 GFLOPS;Q6 `gemm_q6k_f32_n64` BM=16 BN=64 BK=64,~800 vs v3 ~480。Q6 的 BN=8 b64 回归仍然成立,不选。`QMMQN=0` 回到 BN=8。dense prefill 按 64 token 对齐切块。八种 IQ 同一块 BM=32 BN=32 BK=64（`iq_n_sweep.odin`，up 形状约 1.25–1.34×）。27B IQ2_XXS 端到端对照（QMMQN=0 vs 默认，两边都不做 GEMV 覆盖）：448 token 对齐块 60.7→53.6 ms/tok，499 token 预填充墙钟 31.0→28.1 s，贪心都是 Four / fox |
 | fp16 累加路径 | 死路 | ❌ half 操作数已用;全 half 累加 K=4096 精度崩;dequant 是瓶颈非 MAC |
 | 全注意力批量(Stage 1c) | ~1-4 ms/tok | 低 ROI(全注意力只 8 层) |
 | Flash attention | ~5% 以下 | 跳过(Rigel:分解式优于融合) |

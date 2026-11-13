@@ -564,9 +564,11 @@ build_transformer :: proc(t: ^Transformer, checkpoint_path: string, max_ctx: int
 	kv_bytes: int
 	kv_fmt: string
 	if skip_cpu_state {
-		// Metal KV: separate K and V buffers (Q8_0 or legacy f16).
-		kv_fmt = g_kv_q8 ? "Q8_0" : "f16"
-		kv_bytes = g_kv_q8 ? 2 * kv_total_bytes_q8(t.config.n_full, t.config.seq_len, t.config.n_kv_heads * t.config.head_dim) : 2 * t.config.n_full * t.config.seq_len * t.config.n_kv_heads * t.config.head_dim * 2
+		// Metal KV: K and V buffers. Default is Q8 K + mixed V; KV_V=q8 is
+		// symmetric Q8; KV_Q8=0 is legacy f16.
+		kv_dim_m := t.config.n_kv_heads * t.config.head_dim
+		kv_fmt = kv_resident_tag()
+		kv_bytes = kv_resident_bytes(t.config.n_full, t.config.seq_len, kv_dim_m)
 	} else {
 		// CPU Run_State KV stays fp32 in both modes (Q8 conversion happens at
 		// the snapshot boundary only — see kv_q8.odin).

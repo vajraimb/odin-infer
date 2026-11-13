@@ -127,21 +127,26 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   build.sh 自动重生成，CI 用 --check 防漂移。不要手改 msl_tables.odin。Qwen3.8-27B 可 GPU 解码
   （~0.4-1.3s/token）；ctx 8192 已验证（Q8_0 KV 0.27GB，总占用 7.7GB），
   ctx 32768 kv 1.14GB（总占用 8.56GB）。
-- KV 缓存默认 Q8_0 量化（KV_Q8=0 退回旧 f16 Metal 路径）。对称量化
-  d=amax/127，与 llama.cpp 逐位一致。布局 position-major
-  [n_full][seq_len][kv_dim/32 块][34B]；CPU Run_State 保持 fp32、在快照边界
-  转换（CPU 恢复保真 ~4e-2，Metal 快照逐字节精确）。.oikv 为 KV_VERSION=2
-  （v1 文件明确拒绝）。离群值重的 V 缓存上 Q8 误差真实存在（27B logits
-  ~1e-1），但 argmax/质量不受影响——llama.cpp 标准做法。
+- KV 缓存默认 K=Q8_0、V=混合块（KV_Q8=0 退回旧 f16；KV_V=q8 让 V 也走
+  对称 Q8）。K 布局 position-major [n_full][seq_len][kv_dim/32 块][34B]。
+  V 混合块 40B：块内绝对值最大的一个元素存 f16，其余 31 个按剩余 amax 做
+  Q8——避免一个离群值（V amax≈85）把整块尺度拉开。CPU Run_State 保持
+  fp32、在快照边界转换（与 store 内核逐位一致）。.oikv 仍是 KV_VERSION=2
+  （磁盘体是 f32；v1 文件明确拒绝）。对称 Q8 V 的 logits 噪声 ~1e-1 仍是
+  KV_V=q8 的预期行为。
 - dense 批量 prefill（enc_mm）仅支持 Q4_K/Q6_K；model_batch_mm_ok 把关，
   混合量化模型回退逐 token Metal。IQ 批量 prefill 已实现（见下一条）。
 - dense 批量 prefill（enc_mm）现已支持 13 种量化——Q4_K/Q6_K/Q8_0/Q2_K/Q3_K
   + IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS（v3 形状 MMQ
-  内核，dequant 与 GEMV 一致）。27B 的 Dynamic 混合量化 prefill 已批量化
+  内核，dequant 与 GEMV 一致）。Q4_K/Q6_K 在 token 数能整除时走宽 N tile
+  （Q4 32×32×64、Q6 16×64×64；QMMQN=0 退回 BN=8）。dense 预填充默认直接采用
+  MMQ 投影（QGEMVEXACT=1 才用逐 token GEMV 覆盖，换回与解码逐位一致）。27B 的 Dynamic 混合量化 prefill 已批量化
   （~1.8x GPU，30-token prompt 227 vs 420 ms/tok）；批量 vs 逐 token prefill
   max_abs ~5.7e-3、解码步 ~6.6e-3（64 层 MLP 舍入残留，argmax 一致）。
-  真实 token 的注意力列用 GEMV 覆盖以保持状态近精确。IQ 的 b64 变体为
-  后续性能项。GGUF 检查工具：tools/inspect_iq_gguf.py + tools/gguf_meta.py。
+  MoE 预填充仍逐 token GEMV 覆盖注意力列。八种 IQ 在 M/N/K 整除 32/32/64
+  时走 BM=32 BN=32 BK=64（QMMQN=0 退回 BN=8）。27B IQ2_XXS：448 token 对齐块
+  60.7→53.6 ms/tok，499 token 预填充墙钟 31.0→28.1 s；贪心两边都是 Four / fox。
+  GGUF 检查工具：tools/inspect_iq_gguf.py + tools/gguf_meta.py。
 - 前缀缓存/会话连续性：两条 HTTP 路径（OpenAI 与 Ollama）都跨请求复用引擎
   状态——延续（prompt 是上次 token 序列的精确前缀延伸时只 prefill 新尾）、
   系统边界快照（恢复后只 prefill 后缀）、否则全量 reset。OpenAI 路径在
@@ -183,12 +188,12 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
   0x10）。
 - 社区 MoE GGUF 逐层混合量化种类（0.8B-MoE 的 down_exps 在 Q8_0/Q5_0 间
   交替）——按张量 kind 分派，不要假设。
-- GEMV 形状特化（Tier 3.5）：collect_gemv_shapes 扫描 GEMV 分派张量，
-  保留 Q4_K/Q6_K 且 n%256==0 && d%256==0 的形状（上限 16），msl_gemv_spec
-  生成逐形状 constexpr n/d 内核（去行守卫、nsb 编译期）。默认开，
-  QGEMVSPEC=0 关。9B 实测解码 +5.6%（交错 A/B 各 8 轮）；特化内核是逐位
-  一致的替换（贪婪输出与 prod 逐字节相同）。selftest 额外编译 spec 构建
-  （103/103）。MoE 模型不收集形状（惰性）。
+- GEMV 形状特化（Tier 3.5）：collect_gemv_shapes 扫描 GEMV 分派张量。
+  Q4_K/Q6_K 仍要求 n%256==0 && d%256==0；IQ 超块要求 n%256==0（IQ4_NL
+  为 n%32==0），d 为 GEMV_ROWS 的倍数。按 n*d*count 排序，上限 64。
+  Q4_K/Q6_K 手写体；IQ 从通用内核改写（去 Dims、去行守卫、nsb/nb 编译期），
+  数学与通用核相同。默认开，QGEMVSPEC=0 关。9B 的 Q4/Q6 集合不变（实测
+  解码 +5.6%）。MoE 模型不收集形状（惰性）。
 - Tier 2 热路径纪律：每 token 每层的分派零模式分支——enc_store_attn_gate
   拆成四个具体 proc（sag_f16/f16c/q8/q8c）+ 预选 g_gate_pso/g_gate_needs_hd；
   metal_init 在 kv_dim 校验后一次性选 g_sag。新增 KV 格式或 QCONST 组相关

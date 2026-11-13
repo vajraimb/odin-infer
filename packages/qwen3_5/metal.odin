@@ -1195,6 +1195,96 @@ kernel void attention_q8(device const float *q [[buffer(0)]], device const uchar
     }
 }
 
+// ---------- mixed V cache (K = Q8_0, V = outlier-f16 + residual Q8) ----------
+// V block, 40 bytes: f16 d, u8 index, u8 pad, f16 outlier, 32 int8, 2 pad.
+// The lowest-index maximum-|v| element is stored as f16; the other 31 are
+// symmetric Q8 against the residual amax. K layout is unchanged (34 bytes).
+
+struct Q8VStoreP { uint k_pos_bytes; uint v_pos_bytes; uint pos; };
+
+kernel void store_kv_q8v(device const float *ktmp [[buffer(0)]], device const float *vtmp [[buffer(1)]],
+    device uchar *kc [[buffer(2)]], device uchar *vc [[buffer(3)]], constant Q8VStoreP &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    device const float *k32 = ktmp + (ulong)gid * 32;
+    device const float *v32 = vtmp + (ulong)gid * 32;
+    float kamax = 0.0;
+    for (uint j = 0; j < 32; ++j) kamax = max(kamax, fabs(k32[j]));
+    float kd = kamax / 127.0;
+    float kid = kd != 0.0 ? 1.0/kd : 0.0;
+    device uchar *kb = kc + (ulong)P.pos * P.k_pos_bytes + (ulong)gid * 34;
+    *(device half*)(kb) = (half)kd;
+    device char *kq = (device char*)(kb + 2);
+    for (uint j = 0; j < 32; ++j) kq[j] = (char)round(k32[j] * kid);
+
+    float vamax = fabs(v32[0]); uint jmax = 0;
+    for (uint j = 1; j < 32; ++j) {
+        float a = fabs(v32[j]);
+        if (a > vamax) { vamax = a; jmax = j; }
+    }
+    float amax2 = 0.0;
+    for (uint j = 0; j < 32; ++j) { if (j != jmax) amax2 = max(amax2, fabs(v32[j])); }
+    float vd = amax2 / 127.0;
+    float vid = vd != 0.0 ? 1.0/vd : 0.0;
+    device uchar *vb = vc + (ulong)P.pos * P.v_pos_bytes + (ulong)gid * 40;
+    for (uint j = 0; j < 40; ++j) vb[j] = 0;
+    *(device half*)(vb) = (half)vd;
+    vb[2] = (uchar)jmax;
+    *(device half*)(vb + 4) = (half)v32[jmax];
+    device char *vq = (device char*)(vb + 6);
+    for (uint j = 0; j < 32; ++j) {
+        if (j != jmax) vq[j] = (char)round(v32[j] * vid);
+    }
+}
+
+struct Q8VAttnP { uint head_dim; uint k_pos_bytes; uint v_pos_bytes; uint kv_mul; uint pos; };
+
+kernel void attention_q8v(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+    device const uchar *vc [[buffer(2)]], device float *xb3 [[buffer(3)]], constant Q8VAttnP &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    uint nb = P.head_dim / 32;
+    uint kvh = h / P.kv_mul;
+    uint hb = kvh * nb;
+    device const float *qh = q + (ulong)h * P.head_dim;
+    float scale = rsqrt((float)P.head_dim); uint n = P.pos + 1;
+    for (uint t = tid; t < n; t += NT) {
+        device const uchar *kb = kc + (ulong)t * P.k_pos_bytes + (ulong)hb * 34;
+        float s = 0.0;
+        for (uint b = 0; b < nb; ++b) {
+            device const uchar *bb = kb + (ulong)b * 34;
+            float d = (float)(*(device const half*)bb);
+            device const char *qs = (device const char*)(bb + 2);
+            for (uint j = 0; j < 32; ++j) s += qh[b*32+j] * (d * (float)qs[j]);
+        }
+        scores[t] = s * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint t = tid; t < n; t += NT) lm = max(lm, scores[t]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint t = tid; t < n; t += NT) { float e = exp(scores[t] - m); scores[t] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < P.head_dim; i += NT) {
+        uint bb = (kvh * P.head_dim + i) / 32;
+        uint jj = (kvh * P.head_dim + i) - bb * 32;
+        float acc = 0.0;
+        for (uint t = 0; t < n; ++t) {
+            device const uchar *vb = vc + (ulong)t * P.v_pos_bytes + (ulong)bb * 40;
+            float d = (float)(*(device const half*)vb);
+            uint idx = vb[2];
+            float ov = (float)(*(device const half*)(vb + 4));
+            device const char *qs = (device const char*)(vb + 6);
+            float vv = (jj == idx) ? ov : d * (float)qs[jj];
+            acc += scores[t] * vv;
+        }
+        xb3[(ulong)h * P.head_dim + i] = acc * inv;
+    }
+}
+
 // Multiply attention output by sigmoid(gate), where gate is the second half of each head's qproj block.
 kernel void attn_gate(device float *xb3 [[buffer(0)]], device const float *qproj [[buffer(1)]],
     constant uint &head_dim [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
@@ -2254,6 +2344,590 @@ kernel void gemm_q4k_f32_b64(
     simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0, N);
 }
 
+// Wider N tile (tools/gemm_harness/qn_sweep.odin, wall-clock, Apple M3).
+// Dequant of A is reused across BN columns instead of 8. Shipped b64 is
+// BM=64 BN=8 BK=64. On the 9B shapes the winners were:
+//   Q4_K  BM=32 BN=32 BK=64  ~1470 GFLOPS vs b64 ~1195 and vs BN=8 ~1020
+//   Q6_K  BM=16 BN=64 BK=64  ~800 GFLOPS vs BN=8 ~480
+//     (Q6 BM=64 BN=8 BK=64 stays the known ~0.66x regression; do not select it)
+// Requires M%BM==0, N%BN==0, K%BK==0. Rel err vs ggml.dequant_row+f16 was ~4e-7.
+kernel void gemm_q4k_f32_n32(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 144;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row >= M) { continue; }
+            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 144;
+            int ew = int(e_base & 255), sup = ew >> 6, hf = (ew >> 5) & 1, is = sup * 2 + hf;
+            float d = (float)(*(device const half *)(blk));
+            float dmin = (float)(*(device const half *)(blk + 2));
+            device const uchar * scales = blk + 4;
+            device const uchar * qs = blk + 16;
+            uchar sc, m; k4_get_scale_min(is, scales, sc, m);
+            float dl = d * (float)sc, ml = dmin * (float)m;
+            int qoff = sup * 32, shift = 4 * hf;
+            int l32 = ew & 31;
+            for (uint j = 0; j < 8; j++) {
+                uchar nib = (qs[qoff + l32 + int(j)] >> shift) & 0xF;
+                sa[row * 64 + col_base + j] = (half)(dl * (float)nib - ml);
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_q6k_f32_n64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 16, c0 = tgpig.x * 64;
+    const ulong row_bytes = (ulong)(K / 256) * 210;
+    threadgroup half sa[16 * 64];
+    threadgroup half sb[64 * 64];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 8) * 8;
+    const uint sg_col = (sgitg % 8) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 16; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row >= M) { continue; }
+            device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 210;
+            int ew = int(e_base & 255);
+            int hf = ew >> 7, sub = (ew >> 5) & 3, is = (ew >> 4) & 1;
+            float d = (float)(*(device const half *)(blk + 208));
+            device const uchar * ql = blk;
+            device const uchar * qh = blk + 128;
+            device const char  * sc = (device const char *)(blk + 192);
+            float dl = d * (float)sc[hf * 8 + is + 2 * sub];
+            int qloff = hf * 64, qhoff = hf * 32;
+            int l32 = ew & 31;
+            for (uint j = 0; j < 8; j++) {
+                int l = l32 + int(j);
+                int q;
+                if (sub == 0)      q = ((ql[qloff + l]      & 0xF) | (((qh[qhoff + l] >> 0) & 3) << 4)) - 32;
+                else if (sub == 1) q = ((ql[qloff + l + 32] & 0xF) | (((qh[qhoff + l] >> 2) & 3) << 4)) - 32;
+                else if (sub == 2) q = ((ql[qloff + l] >> 4)       | (((qh[qhoff + l] >> 4) & 3) << 4)) - 32;
+                else               q = ((ql[qloff + l + 32] >> 4)  | (((qh[qhoff + l] >> 6) & 3) << 4)) - 32;
+                sa[row * 64 + col_base + j] = (half)(dl * (float)q);
+            }
+        }
+        for (uint t = tiitg; t < 64 * 64; t += 512) {
+            uint kr = t / 64, nc = t % 64;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 64 + sg_col, 64);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+// IQ wide-N MMQ: BM=32 BN=32 BK=64 (iq_n_sweep, 2026-11-13). Same geometry as
+// gemm_q4k_f32_n32. QMMQN=0 keeps these kinds on the BN=8 v3 kernels.
+kernel void gemm_iq2xxs_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 66;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 66;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                uint ib32 = (uint)ew >> 5;
+                uint qb = 2 + 8 * ib32;
+                uint aux1 = (uint)blk[qb + 4] | ((uint)blk[qb + 5] << 8) | ((uint)blk[qb + 6] << 16) | ((uint)blk[qb + 7] << 24);
+                float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                ulong grid = iq2xxs_grid[blk[qb + l]];
+                uchar signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float sgn = (signs & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 64 + col_base + j] = (half)(db * v * sgn);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_iq1s_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 50;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 50;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * qh = blk + 34;
+                uint ib = (uint)ew >> 5;
+                uint qhv = (uint)qh[2 * ib] | ((uint)qh[2 * ib + 1] << 8);
+                float dl = d * (float)(2 * (int)((qhv >> 12) & 7) + 1);
+                float delta = (qhv & 0x8000) == 0 ? 0.125f : -0.125f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint idx = (uint)qs[4 * ib + l] | (((qhv >> (3 * l)) & 7) << 8);
+                ulong grid = iq1s_grid[idx];
+                for (uint j = 0; j < 8; j++) {
+                    float gv = (float)((char)((grid >> (8 * j)) & 0xff));
+                    sa[row * 64 + col_base + j] = (half)(dl * (gv + delta));
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_iq2s_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 82;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 82;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * signs = blk + 34;
+                device const uchar * qh = blk + 66; device const uchar * scales = blk + 74;
+                uint ib32 = (uint)ew >> 5;
+                uchar sc = scales[ib32];
+                float db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+                float db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint idx = (uint)qs[4 * ib32 + l] | (((uint)qh[ib32] << (8 - 2 * l)) & 0x300);
+                ulong grid = iq2s_grid[idx];
+                uchar sn = signs[4 * ib32 + l];
+                float dl = (l < 2) ? db0 : db1;
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float sgn = (sn & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 64 + col_base + j] = (half)(dl * v * sgn);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_iq3xxs_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 98;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 98;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * sas = blk + 66;
+                uint ib32 = (uint)ew >> 5;
+                uint sbo = 4 * ib32;
+                uint aux = (uint)sas[sbo] | ((uint)sas[sbo + 1] << 8) | ((uint)sas[sbo + 2] << 16) | ((uint)sas[sbo + 3] << 24);
+                float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+                uint l = ((uint)ew >> 3) & 3;
+                uchar signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+                uint g1 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 0]];
+                uint g2 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 1]];
+                for (uint j = 0; j < 4; j++) {
+                    float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                    float v2 = (float)((g2 >> (8 * j)) & 0xff);
+                    float s1 = (signs & kmask_iq2xs[j + 0]) == 0 ? 1.0f : -1.0f;
+                    float s2 = (signs & kmask_iq2xs[j + 4]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 64 + col_base + j + 0] = (half)(db * v1 * s1);
+                    sa[row * 64 + col_base + j + 4] = (half)(db * v2 * s2);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_iq2xs_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 74;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 74;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                uint ib32 = (uint)ew >> 5;
+                uchar sc = blk[66 + ib32];
+                float db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+                float db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+                uint l = ((uint)ew >> 3) & 3;
+                uint qoff = 2 + 2 * (4 * ib32 + l);
+                uint q = (uint)blk[qoff] | ((uint)blk[qoff + 1] << 8);
+                ulong grid = iq2xs_grid[q & 511];
+                uchar signs = ksigns_iq2xs[q >> 9];
+                float dl = (l < 2) ? db0 : db1;
+                for (uint j = 0; j < 8; j++) {
+                    float v = (float)((grid >> (8 * j)) & 0xff);
+                    float sgn = (signs & kmask_iq2xs[j]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 64 + col_base + j] = (half)(dl * v * sgn);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_iq3s_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 110;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 110;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                device const uchar * qs = blk + 2; device const uchar * qh = blk + 66;
+                device const uchar * signs = blk + 74; device const uchar * scales = blk + 106;
+                uint ib32 = (uint)ew >> 5;
+                uint qoff = 8 * ib32; uint signoff = 4 * ib32; uint qhoff = 2 * (ib32 >> 1);
+                float db1 = d * (float)(1 + 2 * (int)(scales[qhoff / 2] & 0xF));
+                float db2 = d * (float)(1 + 2 * (int)(scales[qhoff / 2] >> 4));
+                uint l = ((uint)ew >> 3) & 3;
+                uint qhi = qhoff + (ib32 & 1);
+                uint idx1 = (uint)qs[qoff + 2 * l + 0] | (((uint)qh[qhi] << (8 - 2 * l)) & 256);
+                uint idx2 = (uint)qs[qoff + 2 * l + 1] | (((uint)qh[qhi] << (7 - 2 * l)) & 256);
+                uint g1 = iq3s_grid[idx1]; uint g2 = iq3s_grid[idx2];
+                uchar sn = signs[signoff + l];
+                float dl = (ib32 & 1) == 0 ? db1 : db2;
+                for (uint j = 0; j < 4; j++) {
+                    float v1 = (float)((g1 >> (8 * j)) & 0xff);
+                    float v2 = (float)((g2 >> (8 * j)) & 0xff);
+                    float s1 = (sn & kmask_iq2xs[j + 0]) == 0 ? 1.0f : -1.0f;
+                    float s2 = (sn & kmask_iq2xs[j + 4]) == 0 ? 1.0f : -1.0f;
+                    sa[row * 64 + col_base + j + 0] = (half)(dl * v1 * s1);
+                    sa[row * 64 + col_base + j + 4] = (half)(dl * v2 * s2);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_iq4xs_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 136;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 136;
+                int ew = int(e_base & 255);
+                float d = (float)(*(device const half *)blk);
+                uint scales_h = (uint)blk[2] | ((uint)blk[3] << 8);
+                device const uchar * scales_l = blk + 4;
+                device const uchar * qs = blk + 8;
+                uint ib = (uint)ew >> 5;
+                int ls = (int)((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (int)(((scales_h >> (2 * ib)) & 3) << 4);
+                float dl = d * (float)(ls - 32);
+                uint e32 = (uint)ew & 31;
+                uint qoff = 16 * ib;
+                for (uint j = 0; j < 8; j++) {
+                    uchar qb = qs[qoff + (e32 & 15) + j];
+                    float v = (float)kvalues_iq4nl[(e32 < 16) ? (qb & 0xF) : (qb >> 4)];
+                    sa[row * 64 + col_base + j] = (half)(dl * v);
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+kernel void gemm_iq1m_32_32_64(
+    device const uchar * A [[buffer(0)]], device const half * B [[buffer(1)]],
+    device float * C [[buffer(2)]], constant GemmDims & dims [[buffer(3)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]) {
+    const uint M = dims.M, N = dims.N, K = dims.K;
+    const uint r0 = tgpig.y * 32, c0 = tgpig.x * 32;
+    const ulong row_bytes = (ulong)(K / 256) * 56;
+    threadgroup half sa[32 * 64];
+    threadgroup half sb[64 * 32];
+    simdgroup_half8x8 a_tile, b_tile;
+    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    const uint sg_row = (sgitg / 4) * 8;
+    const uint sg_col = (sgitg % 4) * 8;
+    for (uint k = 0; k < K; k += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint row = tiitg / 8; row < 32; row += 64) {
+            const uint col_base = (tiitg % 8) * 8;
+            uint e_base = k + col_base;
+            if (r0 + row < M) {
+
+                device const uchar * blk = A + (ulong)(r0 + row) * row_bytes + (uint)(e_base / 256) * 56;
+                int ew = int(e_base & 255);
+                device const uchar * qs = blk; device const uchar * qh = blk + 32;
+                device const uchar * scales = blk + 48;
+                uint sc0 = (uint)scales[0] | ((uint)scales[1] << 8);
+                uint sc1 = (uint)scales[2] | ((uint)scales[3] << 8);
+                uint sc2 = (uint)scales[4] | ((uint)scales[5] << 8);
+                uint sc3 = (uint)scales[6] | ((uint)scales[7] << 8);
+                uint scale = (sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000);
+                float d = half_to_float((ushort)scale);
+                uint ib = (uint)ew >> 5;
+                uint sca[4] = {sc0, sc1, sc2, sc3};
+                uint scv = (ib & 1) == 0 ? sca[ib / 2] : (sca[ib / 2] >> 6);
+                float dl1 = d * (float)(2 * (int)((scv >> 0) & 0x7) + 1);
+                float dl2 = d * (float)(2 * (int)((scv >> 3) & 0x7) + 1);
+                uint l = ((uint)ew >> 3) & 3;
+                uint qoff = 4 * ib; uint qhoff = 2 * ib;
+                uint idx; float delta;
+                if (l == 0)      { idx = (uint)qs[qoff + 0] | (((uint)qh[qhoff + 0] << 8) & 0x700); delta = (qh[qhoff + 0] & 0x08) == 0 ? 0.125f : -0.125f; }
+                else if (l == 1) { idx = (uint)qs[qoff + 1] | (((uint)qh[qhoff + 0] << 4) & 0x700); delta = (qh[qhoff + 0] & 0x80) == 0 ? 0.125f : -0.125f; }
+                else if (l == 2) { idx = (uint)qs[qoff + 2] | (((uint)qh[qhoff + 1] << 8) & 0x700); delta = (qh[qhoff + 1] & 0x08) == 0 ? 0.125f : -0.125f; }
+                else             { idx = (uint)qs[qoff + 3] | (((uint)qh[qhoff + 1] << 4) & 0x700); delta = (qh[qhoff + 1] & 0x80) == 0 ? 0.125f : -0.125f; }
+                float dl = (l < 2) ? dl1 : dl2;
+                ulong grid = iq1s_grid[idx];
+                for (uint j = 0; j < 8; j++) {
+                    float gv = (float)((char)((grid >> (8 * j)) & 0xff));
+                    sa[row * 64 + col_base + j] = (half)(dl * (gv + delta));
+                }
+            }
+        }
+        for (uint t = tiitg; t < 64 * 32; t += 512) {
+            uint kr = t / 32, nc = t % 32;
+            sb[t] = B[(ulong)(k + kr) * N + c0 + nc];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ik = 0; ik < 64 / 8; ik++) {
+            simdgroup_load(a_tile, sa + sg_row * 64 + ik * 8, 64);
+            simdgroup_load(b_tile, sb + ik * 8 * 32 + sg_col, 32);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (r0 + sg_row < M) simdgroup_store(acc, C + (ulong)(r0 + sg_row) * N + c0 + sg_col, N);
+}
+
+
 // elementwise f32 -> f16 cast (activations must be half for simdgroup_load B)
 kernel void cast_f32_f16(device const float * src [[buffer(0)]], device half * dst [[buffer(1)]],
     constant uint &n [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
@@ -2783,6 +3457,89 @@ kernel void attention_q8_c(device const float *q [[buffer(0)]], device const uch
     }
 }
 
+struct Q8VStorePC { uint pos; };
+kernel void store_kv_q8v_c(device const float *ktmp [[buffer(0)]], device const float *vtmp [[buffer(1)]],
+    device uchar *kc [[buffer(2)]], device uchar *vc [[buffer(3)]], constant Q8VStorePC &P [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    device const float *k32 = ktmp + (ulong)gid * 32;
+    device const float *v32 = vtmp + (ulong)gid * 32;
+    float kamax = 0.0;
+    for (uint j = 0; j < 32; ++j) kamax = max(kamax, fabs(k32[j]));
+    float kd = kamax / 127.0;
+    float kid = kd != 0.0 ? 1.0/kd : 0.0;
+    device uchar *kb = kc + (ulong)P.pos * KV_POS_BYTES + (ulong)gid * 34;
+    *(device half*)(kb) = (half)kd;
+    device char *kq = (device char*)(kb + 2);
+    for (uint j = 0; j < 32; ++j) kq[j] = (char)round(k32[j] * kid);
+
+    float vamax = fabs(v32[0]); uint jmax = 0;
+    for (uint j = 1; j < 32; ++j) {
+        float a = fabs(v32[j]);
+        if (a > vamax) { vamax = a; jmax = j; }
+    }
+    float amax2 = 0.0;
+    for (uint j = 0; j < 32; ++j) { if (j != jmax) amax2 = max(amax2, fabs(v32[j])); }
+    float vd = amax2 / 127.0;
+    float vid = vd != 0.0 ? 1.0/vd : 0.0;
+    device uchar *vb = vc + (ulong)P.pos * V_POS_BYTES + (ulong)gid * 40;
+    for (uint j = 0; j < 40; ++j) vb[j] = 0;
+    *(device half*)(vb) = (half)vd;
+    vb[2] = (uchar)jmax;
+    *(device half*)(vb + 4) = (half)v32[jmax];
+    device char *vq = (device char*)(vb + 6);
+    for (uint j = 0; j < 32; ++j) {
+        if (j != jmax) vq[j] = (char)round(v32[j] * vid);
+    }
+}
+
+struct Q8VAttnPC { uint pos; };
+kernel void attention_q8v_c(device const float *q [[buffer(0)]], device const uchar *kc [[buffer(1)]],
+    device const uchar *vc [[buffer(2)]], device float *xb3 [[buffer(3)]], constant Q8VAttnPC &P [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]], uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    const uint NT = 128; threadgroup float red[NT];
+    uint nb = HEAD_DIM / 32;
+    uint kvh = h / KV_MUL;
+    uint hb = kvh * nb;
+    device const float *qh = q + (ulong)h * HEAD_DIM;
+    float scale = rsqrt((float)HEAD_DIM); uint n = P.pos + 1;
+    for (uint t = tid; t < n; t += NT) {
+        device const uchar *kb = kc + (ulong)t * KV_POS_BYTES + (ulong)hb * 34;
+        float s = 0.0;
+        for (uint b = 0; b < nb; ++b) {
+            device const uchar *bb = kb + (ulong)b * 34;
+            float d = (float)(*(device const half*)bb);
+            device const char *qs = (device const char*)(bb + 2);
+            for (uint j = 0; j < 32; ++j) s += qh[b*32+j] * (d * (float)qs[j]);
+        }
+        scores[t] = s * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lm = -INFINITY; for (uint t = tid; t < n; t += NT) lm = max(lm, scores[t]); red[tid] = lm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = max(red[tid], red[tid + s]); threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float m = red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ls = 0.0; for (uint t = tid; t < n; t += NT) { float e = exp(scores[t] - m); scores[t] = e; ls += e; }
+    red[tid] = ls; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = NT / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = red[tid] + red[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv = 1.0 / red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < HEAD_DIM; i += NT) {
+        uint bb = (kvh * HEAD_DIM + i) / 32;
+        uint jj = (kvh * HEAD_DIM + i) - bb * 32;
+        float acc = 0.0;
+        for (uint t = 0; t < n; ++t) {
+            device const uchar *vb = vc + (ulong)t * V_POS_BYTES + (ulong)bb * 40;
+            float d = (float)(*(device const half*)vb);
+            uint idx = vb[2];
+            float ov = (float)(*(device const half*)(vb + 4));
+            device const char *qs = (device const char*)(vb + 6);
+            float vv = (jj == idx) ? ov : d * (float)qs[jj];
+            acc += scores[t] * vv;
+        }
+        xb3[(ulong)h * HEAD_DIM + i] = acc * inv;
+    }
+}
+
 kernel void attn_gate_c(device float *xb3 [[buffer(0)]], device const float *qproj [[buffer(1)]],
     uint gid [[thread_position_in_grid]]) {
     uint n = HEAD_DIM; uint h = gid / n, i = gid % n;
@@ -3004,6 +3761,7 @@ msl_prelude :: proc(c: Config) -> string {
 	conv_dim := key_dim * 2 + value_dim
 	kv_mul := c.n_heads / c.n_kv_heads
 	kv_pos_bytes := (kv_dim / QK8_0) * Q8_0_BLOCK_BYTES
+	v_pos_bytes := (kv_dim / QK8_0) * Q8_V_MIX_BLOCK_BYTES
 	l2_scale: f32 = 1.0 / math.sqrt_f32(f32(c.lin_head_k_dim))
 	return strings.concatenate([]string{
 		"// ---- Tier 3 per-model constants (generated at metal_init; QCONST=0 omits this) ----\n",
@@ -3029,6 +3787,7 @@ msl_prelude :: proc(c: Config) -> string {
 		fmt.tprintf("constant uint CONV_KERNEL = {};\n", c.lin_conv_kernel),
 		fmt.tprintf("constant float L2_SCALE = {}f;\n", l2_scale),
 		fmt.tprintf("constant uint KV_POS_BYTES = {};\n", kv_pos_bytes),
+		fmt.tprintf("constant uint V_POS_BYTES = {};\n", v_pos_bytes),
 	}, context.temp_allocator)
 }
 
@@ -3053,6 +3812,8 @@ g_prof_nolin := false
 g_prof_nofull := false
 }
 g_gemv3: bool       // use row-split v3 GEMV kernels (env QGEMV3=1)
+g_mmq_n: bool       // wide-N MMQ tiles (default on; QMMQN=0 restores BN=8)
+g_gemv_exact: bool // prefill: recompute projections with GEMV over the MMQ (QGEMVEXACT=1)
 g_gemv2r: bool      // use 2-rows-per-lane GEMV kernels (env QGEMV2R=1)
 g_normfuse: bool    // fuse rmsnorm into GEMV dispatches (env QGEMVNORM=1)
 g_gemv_spec: bool   // Tier 3.5: per-tensor GEMV shape-specialized kernels (default ON; QGEMVSPEC=0 disables)
@@ -3070,12 +3831,13 @@ g_tune_enabled: bool
 
 // ---- Tier 3.5: per-tensor GEMV shape specialization (QGEMVSPEC=1) ----
 // One constexpr-n/d kernel per (kind, n, d) GEMV shape, generated at init from
-// the model's real weights. The body is the production gemv_q4_k / gemv_q6_k
-// body with dim.n/dim.d baked, the row guard dropped (d is an exact multiple
-// of GEMV_ROWS) and nsb constexpr. Q4_K/Q6_K only; other kinds keep the
-// generic kernels. MoE models return no shapes (expert GEMVs use per-expert
-// offsets, no single shape), so the path is inert there.
-GEMV_SPEC_MAX :: 16 // cap on generated kernels (compile time); sorted by n*d*count
+// the model's real weights. The body is the production GEMV body with
+// dim.n/dim.d baked, the row guard dropped (d is an exact multiple of
+// GEMV_ROWS) and nsb constexpr. Q4_K/Q6_K are hand-specialized; the IQ family
+// is generated by rewriting the generic kernel (same math, constexpr n).
+// Other kinds keep the generic kernels. MoE models return no shapes (expert
+// GEMVs use per-expert offsets, no single shape), so the path is inert there.
+GEMV_SPEC_MAX :: 64 // cap on generated kernels (compile time); sorted by n*d*count
 Gemv_Shape :: struct { kind: ggml.GGML_Type, n, d, count: int }
 // Spec_Pick is the runtime dispatch entry: {kind, n, d} -> pso. No strings.
 Spec_Pick :: struct { kind: ggml.GGML_Type, n, d: int, pso: ^MTL.ComputePipelineState }
@@ -3104,6 +3866,7 @@ m_pso_f32, m_pso_f16, m_pso_q8_0, m_pso_q4_0, m_pso_q4_1, m_pso_q5_0, m_pso_q5_1
 @(private = "file")
 m_pso_rmsnorm, m_pso_rope, m_pso_qnorm, m_pso_store_kv, m_pso_attn, m_pso_attn_gate, m_pso_swiglu, m_pso_residual: ^MTL.ComputePipelineState
 	m_pso_store_kv_q8, m_pso_attn_q8: ^MTL.ComputePipelineState // Q8_0 KV cache (KV_Q8=1 default)
+	m_pso_store_kv_q8v, m_pso_attn_q8v: ^MTL.ComputePipelineState // K=Q8_0, V=mixed outlier block (KV_V default)
 	m_pso_gemv_f32, m_pso_gemv_q80, m_pso_gemv_q50, m_pso_moe_topk, m_pso_moe_combine: ^MTL.ComputePipelineState
 	m_pso_gemv_f32_b, m_pso_moe_topk_b: ^MTL.ComputePipelineState
 	m_pso_moe_up_id_q4, m_pso_moe_down_id_q80, m_pso_moe_down_id_q50: ^MTL.ComputePipelineState
@@ -3113,12 +3876,17 @@ m_pso_conv, m_pso_l2norm, m_pso_delta, m_pso_rmsgated: ^MTL.ComputePipelineState
 m_pso_q4k, m_pso_q6k, m_pso_cast, m_pso_copy, m_pso_tr_h16, m_pso_tr_f32: ^MTL.ComputePipelineState // Stage 1a
 @(private = "file")
 m_pso_q4k_b64: ^MTL.ComputePipelineState // Stage 1a autotuned bm=64 bk=64 (M%64==0; Q4K only, Q6K regresses)
+m_pso_q4k_n32, m_pso_q6k_n64: ^MTL.ComputePipelineState // wide-N tiles: Q4 32x32x64, Q6 16x64x64
 @(private = "file")
 g_b64_seen: bool // one-shot dispatch confirmation (debug)
 @(private = "file")
 // Stage 1a IQ/K/Q8 MMQ kernels (v3 shape: BM=32 x BN=8, BK=32)
 m_pso_iq1s_mm, m_pso_iq1m_mm, m_pso_iq2xxs_mm, m_pso_iq2xs_mm, m_pso_iq2s_mm,
 m_pso_iq3xxs_mm, m_pso_iq3s_mm, m_pso_iq4xs_mm, m_pso_q2k_mm, m_pso_q3k_mm, m_pso_q80_mm: ^MTL.ComputePipelineState
+@(private = "file")
+// IQ wide-N MMQ (BM=32 BN=32 BK=64). QMMQN=0 keeps the v3 PSOs above.
+m_pso_iq1s_n32, m_pso_iq1m_n32, m_pso_iq2xxs_n32, m_pso_iq2xs_n32, m_pso_iq2s_n32,
+m_pso_iq3xxs_n32, m_pso_iq3s_n32, m_pso_iq4xs_n32: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_conv_batch, m_pso_conv_update: ^MTL.ComputePipelineState // Stage 2 batched conv1d
 @(private = "file")
@@ -3131,6 +3899,7 @@ m_pso_rmsnorm_c, m_pso_rmsnorm_hd_c, m_pso_rope_c, m_pso_qnorm_c: ^MTL.ComputePi
 m_pso_q4_knorm_c, m_pso_q6_knorm_c: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_store_kv_c, m_pso_attn_c, m_pso_attn_gate_c, m_pso_store_kv_q8_c, m_pso_attn_q8_c: ^MTL.ComputePipelineState
+	m_pso_store_kv_q8v_c, m_pso_attn_q8v_c: ^MTL.ComputePipelineState
 @(private = "file")
 m_pso_conv_c, m_pso_l2norm_c, m_pso_delta_c, m_pso_rmsgated_c: ^MTL.ComputePipelineState
 @(private = "file")
@@ -3324,13 +4093,24 @@ metal_save_kv :: proc(t: ^Transformer, path: string, n_valid_pos: int) -> bool {
 			if !write_f32_slice(f, tmp) {
 				fmt.eprintf("kv: K write failed at layer %d\n", l); return false
 			}
-			// V
-			for p in 0 ..< n_valid_pos {
-				for b in 0 ..< kv_dim / QK8_0 {
-					m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
-					d := f32(transmute(f16)(u16(vc_bytes[m_off]) | (u16(vc_bytes[m_off + 1]) << 8)))
-					for j in 0 ..< QK8_0 {
-						tmp[p * kv_dim + b * QK8_0 + j] = d * f32(i8(vc_bytes[m_off + 2 + j]))
+			// V: symmetric Q8, or the mixed outlier block (different stride).
+			if g_kv_v_mix {
+				v_pos := kv_v_mix_pos_bytes(kv_dim)
+				v_off := l * kv_v_mix_layer_bytes(c.seq_len, kv_dim)
+				for p in 0 ..< n_valid_pos {
+					for b in 0 ..< kv_dim / QK8_0 {
+						m_off := v_off + p * v_pos + b * Q8_V_MIX_BLOCK_BYTES
+						dequantize_q8_v_mix_block(vc_bytes[m_off:m_off + Q8_V_MIX_BLOCK_BYTES], tmp[p * kv_dim + b * QK8_0:p * kv_dim + (b + 1) * QK8_0])
+					}
+				}
+			} else {
+				for p in 0 ..< n_valid_pos {
+					for b in 0 ..< kv_dim / QK8_0 {
+						m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
+						d := f32(transmute(f16)(u16(vc_bytes[m_off]) | (u16(vc_bytes[m_off + 1]) << 8)))
+						for j in 0 ..< QK8_0 {
+							tmp[p * kv_dim + b * QK8_0 + j] = d * f32(i8(vc_bytes[m_off + 2 + j]))
+						}
 					}
 				}
 			}
@@ -3471,10 +4251,21 @@ metal_load_kv :: proc(t: ^Transformer, path: string) -> (int, bool) {
 			if !read_f32_into(f, tmp) {
 				fmt.eprintf("kv: V read failed at layer %d\n", l); return 0, false
 			}
-			for p in 0 ..< int(h.n_valid_pos) {
-				for b in 0 ..< kv_dim / QK8_0 {
-					m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
-					quantize_q8_block(tmp[p * kv_dim + b * QK8_0:p * kv_dim + (b + 1) * QK8_0], vc_bytes[m_off:m_off + Q8_0_BLOCK_BYTES])
+			if g_kv_v_mix {
+				v_pos := kv_v_mix_pos_bytes(kv_dim)
+				v_off := l * kv_v_mix_layer_bytes(c.seq_len, kv_dim)
+				for p in 0 ..< int(h.n_valid_pos) {
+					for b in 0 ..< kv_dim / QK8_0 {
+						m_off := v_off + p * v_pos + b * Q8_V_MIX_BLOCK_BYTES
+						quantize_q8_v_mix_block(tmp[p * kv_dim + b * QK8_0:p * kv_dim + (b + 1) * QK8_0], vc_bytes[m_off:m_off + Q8_V_MIX_BLOCK_BYTES])
+					}
+				}
+			} else {
+				for p in 0 ..< int(h.n_valid_pos) {
+					for b in 0 ..< kv_dim / QK8_0 {
+						m_off := int(l_off) + p * pos_bytes + b * Q8_0_BLOCK_BYTES
+						quantize_q8_block(tmp[p * kv_dim + b * QK8_0:p * kv_dim + (b + 1) * QK8_0], vc_bytes[m_off:m_off + Q8_0_BLOCK_BYTES])
+					}
 				}
 			}
 		}
@@ -3586,6 +4377,10 @@ metal_shader_selftest :: proc(allocator := context.allocator) -> (names: []strin
 		{.Q4_K, 4096, 4096, 56},
 		{.Q4_K, 4096, 2048, 48},
 		{.Q4_K, 4096, 1024, 16},
+		{.IQ2_XXS, 4096, 12288, 40},
+		{.IQ4_NL, 4096, 1024, 8},
+		{.IQ4_XS, 4096, 4096, 16},
+		{.IQ3_S, 4096, 8192, 12},
 	}
 	spec_msl, _ := msl_gemv_spec(spec_samples[:], allocator)
 	sources := [3]string{
@@ -3666,6 +4461,11 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		g_prof_nofull = os.get_env("QPROF_NOFULL", context.temp_allocator) == "1"
 	}
 	g_gemv3 = os.get_env("QGEMV3", context.temp_allocator) == "1"
+	g_mmq_n = os.get_env("QMMQN", context.temp_allocator) != "0"
+	// The MMQ result is what the per-token loops read. Overwriting every real
+	// token with a GEMV made prefill bit-identical to decode and cost about as
+	// much as the GEMVs themselves. QGEMVEXACT=1 restores that overwrite.
+	g_gemv_exact = os.get_env("QGEMVEXACT", context.temp_allocator) == "1"
 	g_gemv2r = os.get_env("QGEMV2R", context.temp_allocator) == "1"
 	g_normfuse = os.get_env("QGEMVNORM", context.temp_allocator) == "1"
 	// Tier 3.5 is ON by default (interleaved A/B on the 9B: +5.6% decode tps,
@@ -3696,16 +4496,20 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	spec_shapes := make([dynamic]Gemv_Shape)
 	if g_gemv_spec {
 		spec_shapes = collect_gemv_shapes(t)
+		n_collected := len(spec_shapes)
 		gemv_spec_finalize(&spec_shapes)
+		if len(spec_shapes) < n_collected {
+			fmt.eprintfln("metal: gemv spec kept {} of {} shapes (cap {})", len(spec_shapes), n_collected, GEMV_SPEC_MAX)
+		}
 		spec_msl: string
 		spec_msl, g_spec_entries = msl_gemv_spec(spec_shapes[:], context.temp_allocator)
 		if spec_msl != "" {
 			src_str = strings.concatenate({src_str, spec_msl}, context.temp_allocator)
 		}
 		if len(g_spec_entries) > 0 {
-			fmt.eprintfln("metal: gemv spec (Tier 3.5, QGEMVSPEC=0 disables): {} per-tensor Q4_K/Q6_K kernels", len(g_spec_entries))
+			fmt.eprintfln("metal: gemv spec (Tier 3.5, QGEMVSPEC=0 disables): {} per-tensor Q4_K/Q6_K/IQ kernels", len(g_spec_entries))
 		} else {
-			fmt.eprintfln("metal: gemv spec (Tier 3.5, QGEMVSPEC=0 disables): no eligible Q4_K/Q6_K shapes ({} collected)", len(spec_shapes))
+			fmt.eprintfln("metal: gemv spec (Tier 3.5, QGEMVSPEC=0 disables): no eligible Q4_K/Q6_K/IQ shapes")
 		}
 	}
 	src := NS.String.alloc()->initWithOdinString(src_str)
@@ -3741,6 +4545,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_attn = make_pso(lib, "attention"); m_pso_attn_gate = make_pso(lib, "attn_gate")
 	m_pso_swiglu = make_pso(lib, "swiglu"); m_pso_residual = make_pso(lib, "residual")
 	m_pso_store_kv_q8 = make_pso(lib, "store_kv_q8"); m_pso_attn_q8 = make_pso(lib, "attention_q8")
+	m_pso_store_kv_q8v = make_pso(lib, "store_kv_q8v"); m_pso_attn_q8v = make_pso(lib, "attention_q8v")
 	m_pso_gemv_f32 = make_pso(lib, "moe_gemv_f32"); m_pso_gemv_q80 = make_pso(lib, "moe_gemv_q80"); m_pso_gemv_q50 = make_pso(lib, "moe_gemv_q50")
 	m_pso_moe_topk = make_pso(lib, "moe_softmax_topk"); m_pso_moe_combine = make_pso(lib, "moe_combine")
 	m_pso_gemv_f32_b = make_pso(lib, "gemv_f32_b"); m_pso_moe_topk_b = make_pso(lib, "moe_softmax_topk_b")
@@ -3750,10 +4555,20 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	m_pso_delta = make_pso(lib, "delta_recurrent"); m_pso_rmsgated = make_pso(lib, "rmsnorm_gated")
 	m_pso_q4k = make_pso(lib, "gemm_q4k_f32"); m_pso_q6k = make_pso(lib, "gemm_q6k_f32")
 	m_pso_q4k_b64 = make_pso(lib, "gemm_q4k_f32_b64")
+	m_pso_q4k_n32 = make_pso(lib, "gemm_q4k_f32_n32")
+	m_pso_q6k_n64 = make_pso(lib, "gemm_q6k_f32_n64")
 	m_pso_iq1s_mm = make_pso(lib, "gemm_iq1s_f32"); m_pso_iq1m_mm = make_pso(lib, "gemm_iq1m_f32")
 	m_pso_iq2xxs_mm = make_pso(lib, "gemm_iq2xxs_f32"); m_pso_iq2xs_mm = make_pso(lib, "gemm_iq2xs_f32")
 	m_pso_iq2s_mm = make_pso(lib, "gemm_iq2s_f32"); m_pso_iq3xxs_mm = make_pso(lib, "gemm_iq3xxs_f32")
 	m_pso_iq3s_mm = make_pso(lib, "gemm_iq3s_f32"); m_pso_iq4xs_mm = make_pso(lib, "gemm_iq4xs_f32")
+	m_pso_iq2xxs_n32 = make_pso(lib, "gemm_iq2xxs_32_32_64")
+	m_pso_iq1s_n32 = make_pso(lib, "gemm_iq1s_32_32_64")
+	m_pso_iq2s_n32 = make_pso(lib, "gemm_iq2s_32_32_64")
+	m_pso_iq3xxs_n32 = make_pso(lib, "gemm_iq3xxs_32_32_64")
+	m_pso_iq2xs_n32 = make_pso(lib, "gemm_iq2xs_32_32_64")
+	m_pso_iq3s_n32 = make_pso(lib, "gemm_iq3s_32_32_64")
+	m_pso_iq4xs_n32 = make_pso(lib, "gemm_iq4xs_32_32_64")
+	m_pso_iq1m_n32 = make_pso(lib, "gemm_iq1m_32_32_64")
 	m_pso_q2k_mm = make_pso(lib, "gemm_q2k_f32"); m_pso_q3k_mm = make_pso(lib, "gemm_q3k_f32")
 	m_pso_q80_mm = make_pso(lib, "gemm_q8_0_f32")
 	m_pso_cast = make_pso(lib, "cast_f32_f16"); m_pso_copy = make_pso(lib, "copy_f32")
@@ -3771,8 +4586,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		append(&g_spec_list, Spec_Pick{e.kind, e.n, e.d, make_pso(lib, e.name)})
 	}
 	for e in g_spec_entries {
-		tag := e.kind == .Q4_K ? "q4k" : "q6k"
-		fmt.eprintfln("metal: gemv spec {} {}x{} count={} -> {}", tag, e.d, e.n, e.count, e.name)
+		fmt.eprintfln("metal: gemv spec {}x{} count={} -> {}", e.d, e.n, e.count, e.name)
 	}
 
 	// Tier 3 load-time-specialized variants (only compiled with the QCONST=1 prelude).
@@ -3786,6 +4600,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	if g_qc_b {
 		m_pso_store_kv_c = make_pso(lib, "store_kv_c"); m_pso_attn_c = make_pso(lib, "attention_c")
 		m_pso_attn_q8_c = make_pso(lib, "attention_q8_c")
+		m_pso_attn_q8v_c = make_pso(lib, "attention_q8v_c")
 	}
 	if g_qc_c {
 		m_pso_conv_c = make_pso(lib, "conv1d_step_silu_c"); m_pso_l2norm_c = make_pso(lib, "l2norm_scale_c")
@@ -3796,6 +4611,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	if g_qc_d {
 		m_pso_store_kv_q8_c = make_pso(lib, "store_kv_q8_c")
+		m_pso_store_kv_q8v_c = make_pso(lib, "store_kv_q8v_c")
 		m_pso_attn_gate_c = make_pso(lib, "attn_gate_c")
 	}
 
@@ -3822,6 +4638,7 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	if g_kv_q8 && kv_dim % 32 != 0 {
 		fmt.eprintf("metal: kv_dim=%d not a multiple of 32 — Q8 KV unsupported, using f16 KV\n", kv_dim)
 		g_kv_q8 = false
+		g_kv_v_mix = false
 	}
 	// Tier 2: select the store/attention/gate dispatchers ONCE (after the
 	// kv_dim validation may have demoted Q8). The hot path has zero branches.
@@ -3832,7 +4649,16 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		g_gate_pso = m_pso_attn_gate
 		g_gate_needs_hd = true
 	}
-	if g_kv_q8 {
+	if g_kv_q8 && g_kv_v_mix {
+		// Specialized store lives in group d and attention in group b; both
+		// are present for QCONST=1. A partial QCONST group falls back to the
+		// runtime-param mixed kernels, which are always compiled.
+		if g_qc_b && g_qc_d {
+			g_sag = sag_q8vc
+		} else {
+			g_sag = sag_q8v
+		}
+	} else if g_kv_q8 {
 		if g_qc_b {
 			g_sag = sag_q8c
 		} else {
@@ -3847,7 +4673,12 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	if g_kv_q8 {
 		kv_bytes_q8 := kv_total_bytes_q8(c.n_full, c.seq_len, kv_dim)
-		m_b_kc = new_shared_bytes(kv_bytes_q8); m_b_vc = new_shared_bytes(kv_bytes_q8)
+		v_bytes := kv_bytes_q8
+		if g_kv_v_mix {
+			v_bytes = kv_v_mix_total_bytes(c.n_full, c.seq_len, kv_dim)
+			fmt.eprintln("metal: KV V mixed (outlier f16 + Q8 residual; KV_V=q8 for symmetric Q8)")
+		}
+		m_b_kc = new_shared_bytes(kv_bytes_q8); m_b_vc = new_shared_bytes(v_bytes)
 	} else {
 		kv_elems := c.n_full * c.seq_len * kv_dim
 		m_b_kc = new_shared_bytes(kv_elems * 2); m_b_vc = new_shared_bytes(kv_elems * 2)
@@ -3913,15 +4744,9 @@ metal_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	if pi := NS.ProcessInfo_processInfo(); pi != nil {
 		phys := u64(NS.ProcessInfo_physicalMemory(pi))
 		if fi, ferr := os.stat(model_path, context.allocator); ferr == os.ERROR_NONE {
-			kv_bytes: u64
-			kv_tag: string
-			if g_kv_q8 {
-				kv_bytes = 2 * u64(kv_total_bytes_q8(c.n_full, c.seq_len, c.n_kv_heads * c.head_dim))
-				kv_tag = "Q8_0"
-			} else {
-				kv_bytes = 2 * u64(c.n_full) * u64(c.seq_len) * u64(c.n_kv_heads) * u64(c.head_dim) * 2
-				kv_tag = "f16"
-			}
+			kv_dim_m := c.n_kv_heads * c.head_dim
+			kv_bytes := u64(kv_resident_bytes(c.n_full, c.seq_len, kv_dim_m))
+			kv_tag := kv_resident_tag()
 			conv_dim := c.lin_n_k_heads * c.lin_head_k_dim * 2 + c.lin_n_v_heads * c.lin_head_v_dim
 			lin_bytes :=
 				u64(c.n_linear) * u64(conv_dim) * u64(c.lin_conv_kernel - 1) * 4 +
@@ -4119,15 +4944,30 @@ collect_gemv_shapes :: proc(t: ^Transformer) -> [dynamic]Gemv_Shape {
 	return shapes
 }
 
-// Keep Q4_K/Q6_K shapes with clean block math only (n % 256 == 0 so nsb =
-// n/256 is exact, d % 256 == 0 so the guardless row math covers d exactly),
-// sort by per-token FLOP weight (n*d*count) desc, cap at GEMV_SPEC_MAX.
+// Q4_K/Q6_K keep the historical d%256 filter (the measured 9B set). IQ
+// superblocks need n%256; IQ4_NL is 32-wide. d%32 covers the guardless
+// GEMV_ROWS dispatch exactly.
+@(private = "file")
+gemv_spec_keep :: proc(s: Gemv_Shape) -> bool {
+	if s.d % GEMV_ROWS != 0 || s.d <= 0 || s.n <= 0 { return false }
+	#partial switch s.kind {
+	case .Q4_K, .Q6_K:
+		return s.n % 256 == 0 && s.d % 256 == 0
+	case .IQ1_S, .IQ1_M, .IQ2_XXS, .IQ2_XS, .IQ2_S, .IQ3_XXS, .IQ3_S, .IQ4_XS:
+		return s.n % 256 == 0
+	case .IQ4_NL:
+		return s.n % 32 == 0
+	}
+	return false
+}
+
+// Keep shapes with clean block math, sort by per-token FLOP weight
+// (n*d*count) desc, cap at GEMV_SPEC_MAX.
 @(private = "file")
 gemv_spec_finalize :: proc(shapes: ^[dynamic]Gemv_Shape) {
 	kept := make([dynamic]Gemv_Shape, 0, len(shapes))
 	for s in shapes {
-		if s.kind != .Q4_K && s.kind != .Q6_K { continue }
-		if s.n % 256 == 0 && s.d % 256 == 0 {
+		if gemv_spec_keep(s) {
 			append(&kept, s)
 		}
 	}
@@ -4146,19 +4986,97 @@ gemv_spec_finalize :: proc(shapes: ^[dynamic]Gemv_Shape) {
 	shapes^ = kept
 }
 
-// msl_gemv_spec emits one constexpr-n/d kernel per Q4_K/Q6_K shape. The body
-// is the production gemv_q4_k / gemv_q6_k body verbatim with dim.n/dim.d
-// replaced by the baked n/d, the `row < dim.d` guards dropped, and nsb
-// constexpr. The section is APPENDED AFTER MSL_SRC (not between prelude and
-// MSL_SRC as a first cut would suggest) so the kernels can use the
-// GEMV_ROWS/GEMV_SG constants and helper functions (get_scale_min_k4,
-// dot_q6_superblock2) defined in MSL_SRC without forward declarations.
+// Generic IQ GEMV kernel name + short tag for the generated spec kernel.
+@(private = "file")
+iq_gemv_names :: proc(kind: ggml.GGML_Type) -> (generic, tag: string, ok: bool) {
+	#partial switch kind {
+	case .IQ1_S:   return "gemv_iq1_s", "iq1s", true
+	case .IQ1_M:   return "gemv_iq1_m", "iq1m", true
+	case .IQ2_XXS: return "gemv_iq2_xxs", "iq2xxs", true
+	case .IQ2_XS:  return "gemv_iq2_xs", "iq2xs", true
+	case .IQ2_S:   return "gemv_iq2_s", "iq2s", true
+	case .IQ3_XXS: return "gemv_iq3_xxs", "iq3xxs", true
+	case .IQ3_S:   return "gemv_iq3_s", "iq3s", true
+	case .IQ4_NL:  return "gemv_iq4_nl", "iq4nl", true
+	case .IQ4_XS:  return "gemv_iq4_xs", "iq4xs", true
+	}
+	return "", "", false
+}
+
+// Pull one `kernel void name(...) { ... }` out of MSL_SRC, brace-matched.
+@(private = "file")
+extract_msl_kernel :: proc(name: string) -> (body: string, ok: bool) {
+	needle := fmt.tprintf("kernel void {}(", name)
+	i := strings.index(MSL_SRC, needle)
+	if i < 0 { return "", false }
+	rest := MSL_SRC[i:]
+	b := strings.index_byte(rest, '{')
+	if b < 0 { return "", false }
+	depth := 0
+	for k in b ..< len(rest) {
+		switch rest[k] {
+		case '{':
+			depth += 1
+		case '}':
+			depth -= 1
+			if depth == 0 {
+				return rest[:k + 1], true
+			}
+		}
+	}
+	return "", false
+}
+
+// Rewrite a generic IQ GEMV into a constexpr-n/d kernel: drop the Dims
+// argument and the row guard, bake n (so nsb / nb are constexpr). The math
+// is the generic body, so the spec kernel stays bit-identical to it.
+@(private = "file")
+msl_iq_spec_kernel :: proc(generic, spec: string, n, d: int) -> (out: string, ok: bool) {
+	raw, found := extract_msl_kernel(generic)
+	if !found { return "", false }
+	raw, _ = strings.replace_all(raw, fmt.tprintf("kernel void {}(", generic), fmt.tprintf("kernel void {}(", spec), context.temp_allocator)
+	raw, _ = strings.replace_all(raw, ", constant Dims &dim [[buffer(3)]]", "", context.temp_allocator)
+	raw, _ = strings.replace_all(raw, "if (row < dim.d) {", "{", context.temp_allocator)
+	raw, _ = strings.replace_all(raw, " && row < dim.d", "", context.temp_allocator)
+	raw, _ = strings.replace_all(raw, "dim.n", "n", context.temp_allocator)
+	raw, _ = strings.replace_all(raw, "uint nsb = n / 256", "constexpr uint nsb = n / 256", context.temp_allocator)
+	raw, _ = strings.replace_all(raw, "uint nb = n / 32", "constexpr uint nb = n / 32", context.temp_allocator)
+	if strings.contains(raw, "dim.") {
+		fmt.eprintf("metal: IQ spec transform left a dim. reference in %s\n", generic)
+		return "", false
+	}
+	inj := fmt.tprintf(") {{\n    constexpr uint n = {};\n    constexpr uint d = {};\n", n, d)
+	// was_allocation is false when the needle is absent (no copy is made).
+	baked, hit := strings.replace(raw, ") {\n", inj, 1, context.temp_allocator)
+	if !hit { return "", false }
+	return baked, true
+}
+
+// msl_gemv_spec emits one constexpr-n/d kernel per shape. Q4_K/Q6_K bodies are
+// the production kernels verbatim (guards dropped, nsb constexpr). IQ bodies
+// are rewritten from the generic kernel in MSL_SRC so the dequant stays one
+// source of truth. The section is APPENDED AFTER MSL_SRC so the kernels can
+// use GEMV_ROWS/GEMV_SG and the helpers (get_scale_min_k4, iq grids,
+// dot_q6_superblock2) defined there.
 @(private = "file")
 msl_gemv_spec :: proc(shapes: []Gemv_Shape, allocator := context.allocator) -> (msl: string, entries: [dynamic]Spec_Entry) {
 	entries = make([dynamic]Spec_Entry, 0, len(shapes))
 	parts := make([dynamic]string, 0, len(shapes) * 3 + 1, allocator)
 	append(&parts, "\n// ---- Tier 3.5 per-tensor GEMV shape-specialized kernels (QGEMVSPEC=1, generated at metal_init) ----\n")
 	for s, i in shapes {
+		if generic, iq_tag, is_iq := iq_gemv_names(s.kind); is_iq {
+			name := fmt.tprintf("gemv_spec_{}_{}", iq_tag, i)
+			body, bok := msl_iq_spec_kernel(generic, name, s.n, s.d)
+			if !bok {
+				fmt.eprintf("metal: IQ spec transform failed for %s\n", generic)
+				continue
+			}
+			append(&entries, Spec_Entry{s.kind, s.n, s.d, s.count, name})
+			append(&parts, fmt.tprintf("// {} {}x{} count={}\n", iq_tag, s.d, s.n, s.count))
+			append(&parts, body)
+			append(&parts, "\n")
+			continue
+		}
 		tag: string
 		#partial switch s.kind {
 		case .Q4_K: tag = "q4k"
@@ -4712,13 +5630,19 @@ enc_copy :: proc(enc: ^MTL.ComputeCommandEncoder, src: ^MTL.Buffer, src_off: NS.
 }
 
 // Q4_K MMQ: C[M,N] = A[M,K] @ B[K,N]. A = Q4_K weights (mmap), B = half activations.
-// Autotuned (gemm_autotune): M%64==0 -> bm=64 bk=64 kernel (+13-18%); else v3 bm=32.
+// N%32==0 -> BM=32 BN=32 BK=64 (qn_sweep: ~1.23x over b64 on the 9B shapes).
+// Else M%64==0 -> bm=64 bk=64 BN=8. Else v3. QMMQN=0 skips the wide tile.
 @(private = "file")
 enc_q4k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
-	enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
 	dims := GemmDims{u32(M), u32(N), u32(K)}
-	if M % 64 == 0 {
+	if g_mmq_n && M % 32 == 0 && N % 32 == 0 && K % 64 == 0 {
+		enc->setComputePipelineState(m_pso_q4k_n32)
+		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 32), NS.Integer(M / 32), 1}, MTL.Size{512, 1, 1})
+	} else if M % 64 == 0 {
 		enc->setComputePipelineState(m_pso_q4k_b64)
+		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
 		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
 		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer(M / 64), 1}, MTL.Size{256, 1, 1})
 		if !g_b64_seen {
@@ -4727,6 +5651,7 @@ enc_q4k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_of
 		}
 	} else {
 		enc->setComputePipelineState(m_pso_q4k)
+		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
 		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
 		// ceil: M < 32 (e.g. MoE in_b/in_a with n_vh=16) must still dispatch
 		// ONE threadgroup; the kernel guards rows >= M (load + store).
@@ -4734,17 +5659,24 @@ enc_q4k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_of
 	}
 }
 
-// Q6_K MMQ variant (Q4_K_M stores ffn_down/output/qkv as Q6_K). Stays on v3:
-// autotune shows bm=64 bk=64 is a ~0.66x REGRESSION for Q6K (w2 4096x512x12288),
-// v3 bm=32 bk=32 is already at the platform ceiling (~400 GFLOPS).
+// Q6_K MMQ. N%64==0 -> BM=16 BN=64 BK=64 (~1.7x over v3 on w2/qkv).
+// The BN=8 bm=64 bk=64 tile is a ~0.66x regression and is not selected.
+// QMMQN=0 keeps every Q6 dispatch on v3.
 @(private = "file")
 enc_q6k :: proc(enc: ^MTL.ComputeCommandEncoder, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
-	enc->setComputePipelineState(m_pso_q6k)
-	enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
 	dims := GemmDims{u32(M), u32(N), u32(K)}
-	enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
-	// ceil: same M < 32 zero-grid hazard as enc_q4k; kernel guards rows >= M.
-	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
+	if g_mmq_n && M % 16 == 0 && N % 64 == 0 && K % 64 == 0 {
+		enc->setComputePipelineState(m_pso_q6k_n64)
+		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 64), NS.Integer(M / 16), 1}, MTL.Size{512, 1, 1})
+	} else {
+		enc->setComputePipelineState(m_pso_q6k)
+		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		// ceil: same M < 32 zero-grid hazard as enc_q4k; kernel guards rows >= M.
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
+	}
 }
 
 // Generic v3 MMQ dispatcher (BM=32 x BN=8, BK=32, 128 threads, 4 simdgroups) for
@@ -4759,20 +5691,34 @@ enc_mm_v3 :: proc(enc: ^MTL.ComputeCommandEncoder, pso: ^MTL.ComputePipelineStat
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 8), NS.Integer((M + 31) / 32), 1}, MTL.Size{128, 1, 1})
 }
 
+// IQ wide tile when M, N, K divide 32/32/64. QMMQN=0 and misaligned tails stay on v3.
+@(private = "file")
+enc_iq :: proc(enc: ^MTL.ComputeCommandEncoder, wide, v3: ^MTL.ComputePipelineState, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
+	if g_mmq_n && M % 32 == 0 && N % 32 == 0 && K % 64 == 0 {
+		enc->setComputePipelineState(wide)
+		enc->setBuffer(m_weights, woff(w), 0); enc->setBuffer(B, B_off, 1); enc->setBuffer(C, C_off, 2)
+		dims := GemmDims{u32(M), u32(N), u32(K)}
+		enc->setBytes(bytes_of(&dims, size_of(dims)), 3)
+		enc->dispatchThreadgroups(MTL.Size{NS.Integer(N / 32), NS.Integer(M / 32), 1}, MTL.Size{512, 1, 1})
+	} else {
+		enc_mm_v3(enc, v3, w, B, B_off, C, C_off, M, N, K)
+	}
+}
+
 // dispatch batched GEMM by weight quant kind (Q4_K/Q6_K + IQ/K/Q8_0 MMQ).
 @(private = "file")
 enc_mm :: proc(enc: ^MTL.ComputeCommandEncoder, kind: ggml.GGML_Type, w: rawptr, B: ^MTL.Buffer, B_off: NS.UInteger, C: ^MTL.Buffer, C_off: NS.UInteger, M, N, K: int) {
 	#partial switch kind {
 	case .Q4_K: enc_q4k(enc, w, B, B_off, C, C_off, M, N, K)
 	case .Q6_K: enc_q6k(enc, w, B, B_off, C, C_off, M, N, K)
-	case .IQ1_S:   enc_mm_v3(enc, m_pso_iq1s_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ1_M:   enc_mm_v3(enc, m_pso_iq1m_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ2_XXS: enc_mm_v3(enc, m_pso_iq2xxs_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ2_XS:  enc_mm_v3(enc, m_pso_iq2xs_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ2_S:   enc_mm_v3(enc, m_pso_iq2s_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ3_XXS: enc_mm_v3(enc, m_pso_iq3xxs_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ3_S:   enc_mm_v3(enc, m_pso_iq3s_mm, w, B, B_off, C, C_off, M, N, K)
-	case .IQ4_XS:  enc_mm_v3(enc, m_pso_iq4xs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ1_S:   enc_iq(enc, m_pso_iq1s_n32, m_pso_iq1s_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ1_M:   enc_iq(enc, m_pso_iq1m_n32, m_pso_iq1m_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_XXS: enc_iq(enc, m_pso_iq2xxs_n32, m_pso_iq2xxs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_XS:  enc_iq(enc, m_pso_iq2xs_n32, m_pso_iq2xs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ2_S:   enc_iq(enc, m_pso_iq2s_n32, m_pso_iq2s_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ3_XXS: enc_iq(enc, m_pso_iq3xxs_n32, m_pso_iq3xxs_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ3_S:   enc_iq(enc, m_pso_iq3s_n32, m_pso_iq3s_mm, w, B, B_off, C, C_off, M, N, K)
+	case .IQ4_XS:  enc_iq(enc, m_pso_iq4xs_n32, m_pso_iq4xs_mm, w, B, B_off, C, C_off, M, N, K)
 	case .Q2_K:    enc_mm_v3(enc, m_pso_q2k_mm, w, B, B_off, C, C_off, M, N, K)
 	case .Q3_K:    enc_mm_v3(enc, m_pso_q3k_mm, w, B, B_off, C, C_off, M, N, K)
 	case .Q8_0:    enc_mm_v3(enc, m_pso_q80_mm, w, B, B_off, C, C_off, M, N, K)
@@ -5002,6 +5948,50 @@ sag_q8c :: proc(enc: ^MTL.ComputeCommandEncoder, slot: int, pos, head_dim, seq_l
 	enc->setComputePipelineState(m_pso_attn_q8_c)
 	q8ap := struct { pos: u32 }{u32(pos)}
 	enc->setBytes(bytes_of(&q8ap, size_of(q8ap)), 4)
+	enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
+	enc_attn_gate(enc, head_dim, att_head_dim)
+}
+
+@(private = "file")
+sag_q8v :: proc(enc: ^MTL.ComputeCommandEncoder, slot: int, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim: int) {
+	k_off := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes_q8(seq_len, kv_dim))
+	v_off := NS.UInteger(slot) * NS.UInteger(kv_v_mix_layer_bytes(seq_len, kv_dim))
+	enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
+	enc->setBuffer(m_b_kc, k_off, 2); enc->setBuffer(m_b_vc, v_off, 3)
+	enc->setComputePipelineState(m_pso_store_kv_q8v)
+	sp := struct { k_pos_bytes: u32, v_pos_bytes: u32, pos: u32 }{
+		u32(kv_pos_bytes(kv_dim)), u32(kv_v_mix_pos_bytes(kv_dim)), u32(pos),
+	}
+	enc->setBytes(bytes_of(&sp, size_of(sp)), 4)
+	nb := kv_dim / QK8_0
+	enc->dispatchThreads(MTL.Size{NS.Integer(nb), 1, 1}, MTL.Size{NS.Integer(min(nb, 256)), 1, 1})
+	enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, k_off, 1); enc->setBuffer(m_b_vc, v_off, 2); enc->setBuffer(m_b_xb3, 0, 3)
+	enc->setComputePipelineState(m_pso_attn_q8v)
+	ap := struct { head_dim: u32, k_pos_bytes: u32, v_pos_bytes: u32, kv_mul: u32, pos: u32 }{
+		u32(head_dim), u32(kv_pos_bytes(kv_dim)), u32(kv_v_mix_pos_bytes(kv_dim)), u32(kv_mul), u32(pos),
+	}
+	enc->setBytes(bytes_of(&ap, size_of(ap)), 4)
+	enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
+	enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
+	enc_attn_gate(enc, head_dim, att_head_dim)
+}
+
+@(private = "file")
+sag_q8vc :: proc(enc: ^MTL.ComputeCommandEncoder, slot: int, pos, head_dim, seq_len, kv_dim, kv_mul, n_heads, att_head_dim: int) {
+	k_off := NS.UInteger(slot) * NS.UInteger(kv_layer_bytes_q8(seq_len, kv_dim))
+	v_off := NS.UInteger(slot) * NS.UInteger(kv_v_mix_layer_bytes(seq_len, kv_dim))
+	enc->setBuffer(m_b_ktmp, 0, 0); enc->setBuffer(m_b_vtmp, 0, 1)
+	enc->setBuffer(m_b_kc, k_off, 2); enc->setBuffer(m_b_vc, v_off, 3)
+	enc->setComputePipelineState(m_pso_store_kv_q8v_c)
+	sp := struct { pos: u32 }{u32(pos)}
+	enc->setBytes(bytes_of(&sp, size_of(sp)), 4)
+	nb := kv_dim / QK8_0
+	enc->dispatchThreads(MTL.Size{NS.Integer(nb), 1, 1}, MTL.Size{NS.Integer(min(nb, 256)), 1, 1})
+	enc->setBuffer(m_b_q, 0, 0); enc->setBuffer(m_b_kc, k_off, 1); enc->setBuffer(m_b_vc, v_off, 2); enc->setBuffer(m_b_xb3, 0, 3)
+	enc->setComputePipelineState(m_pso_attn_q8v_c)
+	ap := struct { pos: u32 }{u32(pos)}
+	enc->setBytes(bytes_of(&ap, size_of(ap)), 4)
 	enc->setThreadgroupMemoryLength(NS.UInteger((pos + 1) * size_of(f32)), 0)
 	enc->dispatchThreadgroups(MTL.Size{NS.Integer(n_heads), 1, 1}, MTL.Size{128, 1, 1})
 	enc_attn_gate(enc, head_dim, att_head_dim)
@@ -5634,12 +6624,10 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			enc_proj_fwd(enc, fa.wq.kind, raw_data(fa.wq.data), m_b_bxb, qproj_dim, T, dim, m_b_qproj_t)
 			enc_proj_fwd(enc, fa.wk.kind, raw_data(fa.wk.data), m_b_bxb, kv_dim, T, dim, m_b_kt)
 			enc_proj_fwd(enc, fa.wv.kind, raw_data(fa.wv.data), m_b_bxb, kv_dim, T, dim, m_b_vt)
-			// Real tokens: overwrite the MMQ columns with the per-token GEMV so
-			// q/k/v are bit-identical to the per-token path (the MMQ's f16-B +
-			// different accumulation order otherwise diverges ~1e-4 and the
-			// KV cache + recurrent state amplify it across the prefill).
-			// The MMQ result only survives in the filler columns (n_real..T-1).
-			{
+			// QGEMVEXACT=1 recomputes q/k/v with the per-token GEMV so they match
+			// decode bit for bit. Default keeps the MMQ result: the GEMV pass
+			// repeated every projection and dominated prefill.
+			if g_gemv_exact {
 				qproj_b2 := NS.UInteger(qproj_dim * 4); kv_b2 := NS.UInteger(kv_dim * 4)
 				for t in 0 ..< n_real {
 					ox := NS.UInteger(t) * dim_bytes
@@ -5697,8 +6685,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			} // end QPROF_NOFULL guard
 			// batched wo -> residual
 			enc_proj_fwd(enc, fa.wo.kind, raw_data(fa.wo.data), m_b_xb3t, dim, T, att_head_dim, m_b_xb2t)
-			{
-				// real tokens: GEMV-overwrite for bit-exactness with the per-token path
+			if g_gemv_exact {
 				ahd_b := NS.UInteger(att_head_dim * 4)
 				for t in 0 ..< n_real {
 					enc_gemv(enc, fa.wo.kind, woff(raw_data(fa.wo.data)), m_b_xb3t, NS.UInteger(t) * ahd_b, m_b_xb2t, NS.UInteger(t) * dim_bytes, att_head_dim, dim)
@@ -5712,11 +6699,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			enc_proj_fwd(enc, la.in_z.kind, raw_data(la.in_z.data), m_b_bxb, value_dim, T, dim, m_b_zt)
 			enc_proj_fwd(enc, la.in_b.kind, raw_data(la.in_b.data), m_b_bxb, n_vh, T, dim, m_b_bt)
 			enc_proj_fwd(enc, la.in_a.kind, raw_data(la.in_a.data), m_b_bxb, n_vh, T, dim, m_b_at)
-			// Real tokens: overwrite the MMQ columns with the per-token GEMV so
-			// the conv/delta inputs (and the recurrent state they update) are
-			// bit-identical to the per-token path. The MMQ result only survives
-			// in the filler columns (n_real..T-1).
-			{
+			if g_gemv_exact {
 				qkv_b3 := NS.UInteger(conv_dim * 4); z_b3 := NS.UInteger(value_dim * 4); ba_b3 := NS.UInteger(n_vh * 4)
 				for t in 0 ..< n_real {
 					ox := NS.UInteger(t) * dim_bytes
@@ -5782,8 +6765,7 @@ forward_gpu_batch :: proc(transformer: ^Transformer, tokens: []int, pos_start: i
 			} // end QPROF_NOLIN guard
 			enc_conv1d_update(enc, m_b_qkv_t, m_b_conv_states, conv_off, conv_dim, n_real, kernel)
 			enc_proj_fwd(enc, la.out.kind, raw_data(la.out.data), m_b_loutt, dim, T, value_dim, m_b_xb2t)
-			{
-				// real tokens: GEMV-overwrite for bit-exactness with the per-token path
+			if g_gemv_exact {
 				lout_b2 := NS.UInteger(value_dim * 4)
 				for t in 0 ..< n_real {
 					enc_gemv(enc, la.out.kind, woff(raw_data(la.out.data)), m_b_loutt, NS.UInteger(t) * lout_b2, m_b_xb2t, NS.UInteger(t) * dim_bytes, value_dim, dim)

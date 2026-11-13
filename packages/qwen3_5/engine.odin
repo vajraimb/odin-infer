@@ -78,9 +78,9 @@ engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
 }
 
 // Batched prefill (Metal only): process `tokens` from position `pos`, batching
-// the MLP projections. Chunks into <=MAX_BATCH_T blocks (multiples of 8); the
-// trailing 1-7 tokens run through the per-token path. Returns the logits for the
-// LAST token (the one used to predict the next token). CPU path falls back to
+// the MLP projections. Chunks of at least 64 tokens are multiples of 64 (wide-N
+// MMQ); shorter tails are multiples of 8. A trailing 1-7 tokens run through the
+// per-token path. Returns the logits for the LAST token. CPU path falls back to
 // per-token forward.
 // The dense batched-prefill MMQ kernels (enc_mm / enc_proj_fwd) handle
 // Q4_K/Q6_K, the IQ family (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/
@@ -166,9 +166,15 @@ engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32
 			logits: []f32 = nil
 			for i < n {
 				rem := n - i
-				if rem >= 8 {
+				// 64-aligned chunks hit the wide-N MMQ tiles (Q4 BN=32, Q6 BN=64).
+				// The short tail stays a multiple of 8 so the BN=8 kernels still apply.
+				if rem >= 64 {
 					chunk := min(MAX_BATCH_T, rem)
-					chunk -= chunk % 8
+					chunk -= chunk % 64
+					logits = forward_gpu_batch(&e.transformer, tokens[i : i + chunk], pos_start + i, chunk)
+					i += chunk
+				} else if rem >= 8 {
+					chunk := rem - rem % 8
 					logits = forward_gpu_batch(&e.transformer, tokens[i : i + chunk], pos_start + i, chunk)
 					i += chunk
 				} else if rem >= 3 {
@@ -265,11 +271,11 @@ engine_restore_full_state :: proc(e: ^Engine, kv_k, kv_v, conv, rec: []u8) {
 // CPU full-state snapshot: the Run_State KV stays fp32 (the CPU attention dots
 // read it directly), and the conversion to/from the Metal-native byte layout
 // happens here at the snapshot boundary only. With KV_Q8=1 (default) that is
-// Q8_0 position-major [n_full][seq_len][kv_dim/32 blocks][34 B]; with KV_Q8=0
-// it is the legacy f16 head-major [n_full][n_kv_heads][seq_len][head_dim].
-// quantize_q8_block reproduces the MSL store_kv_q8 kernel bit-for-bit, and
-// f16() reproduces the MSL (half) cast, so CPU- and Metal-saved snapshots of
-// the same fp32 values are byte-identical.
+// Q8_0 position-major [n_full][seq_len][kv_dim/32 blocks][34 B] for K. V is
+// the same Q8 layout when KV_V=q8, otherwise the 40-byte mixed block. With
+// KV_Q8=0 both are the legacy f16 head-major layout. The quantizers reproduce
+// the MSL store kernels bit-for-bit, and f16() reproduces the MSL (half) cast,
+// so CPU- and Metal-saved snapshots of the same fp32 values are byte-identical.
 cpu_save_full_state :: proc(t: ^Transformer) -> (kv_k: []u8, kv_v: []u8, conv: []u8, rec: []u8) {
 	c := &t.config
 	s := &t.state
@@ -277,17 +283,30 @@ cpu_save_full_state :: proc(t: ^Transformer) -> (kv_k: []u8, kv_v: []u8, conv: [
 	kv_dim := c.n_kv_heads * c.head_dim
 	if g_kv_q8 {
 		kv_k = make([]u8, kv_total_bytes_q8(c.n_full, c.seq_len, kv_dim))
-		kv_v = make([]u8, kv_total_bytes_q8(c.n_full, c.seq_len, kv_dim))
 		pos_bytes := kv_pos_bytes(kv_dim)
 		layer_bytes := kv_layer_bytes_q8(c.seq_len, kv_dim)
+		v_pos := pos_bytes
+		v_layer := layer_bytes
+		v_block := Q8_0_BLOCK_BYTES
+		if g_kv_v_mix {
+			v_pos = kv_v_mix_pos_bytes(kv_dim)
+			v_layer = kv_v_mix_layer_bytes(c.seq_len, kv_dim)
+			v_block = Q8_V_MIX_BLOCK_BYTES
+		}
+		kv_v = make([]u8, c.n_full * v_layer)
 		for l in 0 ..< c.n_full {
 			layer_off := l * c.seq_len * kv_dim
 			for p in 0 ..< c.seq_len {
 				row_off := layer_off + p * kv_dim
 				dst_off := l * layer_bytes + p * pos_bytes
+				v_off := l * v_layer + p * v_pos
 				for b in 0 ..< kv_dim / QK8_0 {
 					quantize_q8_block(s.key_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_k[dst_off + b * Q8_0_BLOCK_BYTES:dst_off + (b + 1) * Q8_0_BLOCK_BYTES])
-					quantize_q8_block(s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_v[dst_off + b * Q8_0_BLOCK_BYTES:dst_off + (b + 1) * Q8_0_BLOCK_BYTES])
+					if g_kv_v_mix {
+						quantize_q8_v_mix_block(s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_v[v_off + b * v_block:v_off + (b + 1) * v_block])
+					} else {
+						quantize_q8_block(s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0], kv_v[v_off + b * v_block:v_off + (b + 1) * v_block])
+					}
 				}
 			}
 		}
@@ -330,14 +349,27 @@ cpu_restore_full_state :: proc(t: ^Transformer, kv_k, kv_v, conv, rec: []u8) {
 	if g_kv_q8 {
 		pos_bytes := kv_pos_bytes(kv_dim)
 		layer_bytes := kv_layer_bytes_q8(c.seq_len, kv_dim)
+		v_pos := pos_bytes
+		v_layer := layer_bytes
+		v_block := Q8_0_BLOCK_BYTES
+		if g_kv_v_mix {
+			v_pos = kv_v_mix_pos_bytes(kv_dim)
+			v_layer = kv_v_mix_layer_bytes(c.seq_len, kv_dim)
+			v_block = Q8_V_MIX_BLOCK_BYTES
+		}
 		for l in 0 ..< c.n_full {
 			layer_off := l * c.seq_len * kv_dim
 			for p in 0 ..< c.seq_len {
 				row_off := layer_off + p * kv_dim
 				src_off := l * layer_bytes + p * pos_bytes
+				v_off := l * v_layer + p * v_pos
 				for b in 0 ..< kv_dim / QK8_0 {
 					dequantize_q8_block(kv_k[src_off + b * Q8_0_BLOCK_BYTES:src_off + (b + 1) * Q8_0_BLOCK_BYTES], s.key_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
-					dequantize_q8_block(kv_v[src_off + b * Q8_0_BLOCK_BYTES:src_off + (b + 1) * Q8_0_BLOCK_BYTES], s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+					if g_kv_v_mix {
+						dequantize_q8_v_mix_block(kv_v[v_off + b * v_block:v_off + (b + 1) * v_block], s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+					} else {
+						dequantize_q8_block(kv_v[v_off + b * v_block:v_off + (b + 1) * v_block], s.value_cache[row_off + b * QK8_0:row_off + (b + 1) * QK8_0])
+					}
 				}
 			}
 		}

@@ -29,6 +29,10 @@ Metal backend (`infer/metal.odin`) currently has no env-var knobs.
 | `QPROF_NOLIN`  | off     | Ablation: skip linear-layer per-token stateful loop (output garbage)  |
 | `QPROF_NOFULL` | off     | Ablation: skip full-attention per-token block                          |
 | `KV_Q8`        | `ON`    | Q8_0 KV cache. Set `=0` for the legacy f16 Metal KV (A/B, precision)   |
+| `KV_V`         | `mix`   | V cache format when `KV_Q8` is on. Default stores the peak value of each 32-block as f16 and Q8-quantizes the rest. Set `=q8` for symmetric Q8 V |
+| `QGEMVSPEC`    | `ON`    | Per-tensor GEMV shape kernels for Q4_K/Q6_K and the IQ family. Set `=0` to use the generic kernels |
+| `QMMQN`        | `ON`    | Wide-N prefill MMQ. Q4_K is 32×32×64, Q6_K is 16×64×64, and the eight IQ kinds are 32×32×64, when M/N/K divide. Set `=0` for the BN=8 tiles |
+| `QGEMVEXACT`   | off     | Dense prefill only. Set `=1` to recompute attention and linear projections with per-token GEMV so they match decode bit for bit. MoE prefill always does that overwrite |
 | `METAL_FALLBACK` | off   | Set `=1` to let a failed Metal init fall back to CPU. Default: `--metal`/`-g 1` + failed init = hard error |
 
 `QPROF_*` are GPU-kernel timing ablations — they produce wrong output but let
