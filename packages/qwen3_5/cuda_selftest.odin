@@ -32,10 +32,6 @@ s_ctx: bool
 s_mod: cu.Module
 
 cuda_nvrtc_check :: proc(arch: string) -> bool {
-	if cu.load_nvrtc() != cu.OK {
-		fmt.eprintln("cuda: NVRTC not found. Set NVRTC_DIR to the directory that contains libnvrtc.so.13 (or .12) before the bare libnvrtc.so")
-		return false
-	}
 	opt := fmt.tprintf("--gpu-architecture=%s", arch)
 	ptx, log, err := cu.compile_ptx(CUDA_KERNEL_SRC, "odinfer_cuda.cu", []string{opt})
 	if len(log) > 0 {
@@ -126,14 +122,40 @@ s_open :: proc() -> bool {
 	return true
 }
 
+Case_Err :: struct {
+	max_abs: f32,
+	tol:     f32,
+	bad:     bool,
+	printed: int,
+}
+
 @(private)
-s_fail :: proc(name: string, got, want, atol, rtol: f32) -> bool {
+s_note :: proc(st: ^Case_Err, name: string, got, want, atol, rtol: f32) {
 	d := math.abs(got - want)
-	if math.is_nan(got) || math.is_inf(got) || d > atol + rtol * math.abs(want) {
-		fmt.eprintf("cuda_selftest: %s got %.6g want %.6g diff %.3g\n", name, got, want, d)
-		return true
+	tol := atol + rtol * math.abs(want)
+	if math.is_nan(d) || d > st.max_abs {
+		st.max_abs = d
+		st.tol = tol
 	}
-	return false
+	if math.is_nan(got) || math.is_inf(got) || d > tol {
+		st.bad = true
+		if st.printed < 4 {
+			fmt.eprintf("cuda_selftest: %s got %.6g want %.6g diff %.3g tol %.3g\n", name, got, want, d, tol)
+			st.printed += 1
+		}
+	}
+}
+
+// Printed for every case, pass or fail. tol is the allowance at the element
+// with the largest absolute error (atol + rtol*|ref|).
+@(private)
+s_report :: proc(label: string, st: Case_Err, atol, rtol: f32) -> bool {
+	status := "PASS"
+	if st.bad {
+		status = "FAIL"
+	}
+	fmt.eprintfln("cuda_selftest: %s %s  max_abs=%.6g  tol=%.6g  (atol=%.3g rtol=%.3g)", status, label, st.max_abs, st.tol, atol, rtol)
+	return !st.bad
 }
 
 @(private)
@@ -242,17 +264,11 @@ run_gemv :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> bool
 	got := make([]f32, rows)
 	defer delete(got)
 	cu.download(raw_data(got), dy, rows * 4)
-	bad := false
+	st: Case_Err
 	for r in 0 ..< rows {
-		if s_fail(fmt.tprintf("gemv %s row %d", tag, r), got[r], ref[r], atol, rtol) {
-			bad = true
-			break
-		}
+		s_note(&st, fmt.tprintf("gemv %s row %d", tag, r), got[r], ref[r], atol, rtol)
 	}
-	if !bad {
-		fmt.eprintfln("cuda_selftest: gemv %s ok", tag)
-	}
-	return !bad
+	return s_report(fmt.tprintf("gemv %s", tag), st, atol, rtol)
 }
 
 @(private)
@@ -296,13 +312,12 @@ run_mmq :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 	got := make([]f32, T * rows)
 	defer delete(got)
 	cu.download(raw_data(got), dy, T * rows * 4)
+	st: Case_Err
+	atol, rtol := f32(2e-2), f32(1e-3)
 	for i in 0 ..< T * rows {
-		if s_fail(fmt.tprintf("mmq %s [%d]", tag, i), got[i], ref[i], 2e-2, 1e-3) {
-			return false
-		}
+		s_note(&st, fmt.tprintf("mmq %s [%d]", tag, i), got[i], ref[i], atol, rtol)
 	}
-	fmt.eprintfln("cuda_selftest: mmq %s T=%d ok", tag, T)
-	return true
+	return s_report(fmt.tprintf("mmq %s T=%d", tag, T), st, atol, rtol)
 }
 
 @(private)
@@ -343,10 +358,12 @@ run_elem :: proc() -> bool {
 	got := make([]f32, n)
 	defer delete(got)
 	cu.download(raw_data(got), dy, n * 4)
+	st_rms: Case_Err
 	for i in 0 ..< n {
-		if s_fail(fmt.tprintf("rmsnorm[%d]", i), got[i], ref[i], 1e-4, 1e-4) {
-			return false
-		}
+		s_note(&st_rms, fmt.tprintf("rmsnorm[%d]", i), got[i], ref[i], 1e-4, 1e-4)
+	}
+	if !s_report("rmsnorm", st_rms, 1e-4, 1e-4) {
+		return false
 	}
 
 	// RoPE, 2 heads, head_dim 8, rotary 4
@@ -384,10 +401,12 @@ run_elem :: proc() -> bool {
 	gotv := make([]f32, len(vec))
 	defer delete(gotv)
 	cu.download(raw_data(gotv), dv, len(vec) * 4)
+	st_rope: Case_Err
 	for i in 0 ..< len(vec) {
-		if s_fail(fmt.tprintf("rope[%d]", i), gotv[i], cpuv[i], 1e-4, 1e-4) {
-			return false
-		}
+		s_note(&st_rope, fmt.tprintf("rope[%d]", i), gotv[i], cpuv[i], 1e-4, 1e-4)
+	}
+	if !s_report("rope", st_rope, 1e-4, 1e-4) {
+		return false
 	}
 
 	// SwiGLU
@@ -424,13 +443,11 @@ run_elem :: proc() -> bool {
 	gout := make([]f32, m)
 	defer delete(gout)
 	cu.download(raw_data(gout), dh, m * 4)
+	st_swi: Case_Err
 	for i in 0 ..< m {
-		if s_fail(fmt.tprintf("swiglu[%d]", i), gout[i], want[i], 1e-5, 1e-5) {
-			return false
-		}
+		s_note(&st_swi, fmt.tprintf("swiglu[%d]", i), gout[i], want[i], 1e-5, 1e-5)
 	}
-	fmt.eprintln("cuda_selftest: rmsnorm rope swiglu ok")
-	return true
+	return s_report("swiglu", st_swi, 1e-5, 1e-5)
 }
 
 @(private)
@@ -526,13 +543,13 @@ run_kv_attn :: proc() -> bool {
 	dequantize_q8_v_mix_block(vc[:40], dvf)
 	dequantize_q8_block(refk, rkf)
 	dequantize_q8_v_mix_block(refv, rvf)
+	st_q8: Case_Err
 	for i in 0 ..< 32 {
-		if s_fail(fmt.tprintf("q8k[%d]", i), dkf[i], rkf[i], 2e-2, 1e-3) {
-			return false
-		}
-		if s_fail(fmt.tprintf("q8v[%d]", i), dvf[i], rvf[i], 2e-2, 1e-3) {
-			return false
-		}
+		s_note(&st_q8, fmt.tprintf("q8k[%d]", i), dkf[i], rkf[i], 2e-2, 1e-3)
+		s_note(&st_q8, fmt.tprintf("q8v[%d]", i), dvf[i], rvf[i], 2e-2, 1e-3)
+	}
+	if !s_report("q8v store", st_q8, 2e-2, 1e-3) {
+		return false
 	}
 
 	cu.upload(dq, raw_data(q), hd * 4)
@@ -578,14 +595,12 @@ run_kv_attn :: proc() -> bool {
 	e0 := math.exp_f32(s0 - m)
 	e1 := math.exp_f32(s1 - m)
 	inv := 1 / (e0 + e1)
+	st_attn: Case_Err
 	for i in 0 ..< hd {
 		want := (e0 * v0[i] + e1 * v1[i]) * inv
-		if s_fail(fmt.tprintf("attn[%d]", i), got[i], want, 2e-2, 1e-3) {
-			return false
-		}
+		s_note(&st_attn, fmt.tprintf("attn[%d]", i), got[i], want, 2e-2, 1e-3)
 	}
-	fmt.eprintln("cuda_selftest: q8v store + attention ok")
-	return true
+	return s_report("attention_q8v", st_attn, 2e-2, 1e-3)
 }
 
 @(private)
@@ -671,18 +686,18 @@ run_delta :: proc() -> bool {
 	defer delete(gstate)
 	cu.download(raw_data(gout), dout, hvd * 4)
 	cu.download(raw_data(gstate), ds, len(state) * 4)
+	st_out: Case_Err
 	for i in 0 ..< hvd {
-		if s_fail(fmt.tprintf("delta out[%d]", i), gout[i], out[i], 1e-4, 1e-4) {
-			return false
-		}
+		s_note(&st_out, fmt.tprintf("delta out[%d]", i), gout[i], out[i], 1e-4, 1e-4)
 	}
+	if !s_report("delta out", st_out, 1e-4, 1e-4) {
+		return false
+	}
+	st_state: Case_Err
 	for i in 0 ..< len(state) {
-		if s_fail(fmt.tprintf("delta state[%d]", i), gstate[i], cpu_state[i], 1e-4, 1e-4) {
-			return false
-		}
+		s_note(&st_state, fmt.tprintf("delta state[%d]", i), gstate[i], cpu_state[i], 1e-4, 1e-4)
 	}
-	fmt.eprintln("cuda_selftest: delta ok")
-	return true
+	return s_report("delta state", st_state, 1e-4, 1e-4)
 }
 
 cuda_selftest :: proc() -> bool {
