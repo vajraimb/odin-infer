@@ -4,8 +4,9 @@
 
 Linux x86_64 backend for the Qwen3.5 engine. It targets **sm_70 and newer**
 (validated for Tesla V100S, compute capability 7.0, driver CUDA 13.0).
-Accumulation is fp32. There is no bf16 and no tensor-core MMA, so V100's
-missing bf16 tensor cores are not a problem. dp4a is not required.
+Accumulation is fp32. There is no bf16. Prefill GEMM (`T>1`) can use Volta
+tensor cores (WMMA 16×16×16, fp16 operands, fp32 accumulate). Decode (`T==1`)
+stays on the GEMV kernels. dp4a is not required.
 
 macOS builds are unchanged: the default backend is still Metal. A single
 binary never contains both hot paths.
@@ -70,6 +71,71 @@ export ODINFER_NVRTC_PATH="$HOME/.local/lib/python3.12/site-packages/nvidia/cuda
 
 Every compile passes `--gpu-architecture=compute_XX` from the device.
 `CUDA_DEVICE` selects the ordinal (default 0).
+
+## Tensor cores
+
+Prefill and other batched GEMMs (`Y[T, rows] = X[T, cols] · W[rows, cols]`)
+dequantize a 64×32 fp16 tile of `W` into shared memory, narrow `X` to fp16,
+and issue `wmma.mma.sync.aligned.m16n16k16` (fp16 in, fp32 accumulate). The
+PTX is inline. NVRTC does not ship `mma.h`, and `mma.sync.m16n16k16` is not
+the Volta instruction; the WMMA form is what sm_70 JITs. `ldmatrix` is not
+used.
+
+The quant kinds with a tensor-core kernel are the same set as MMQ: F32, F16,
+Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K. The 9B
+Q4_K_M prefill is Q4_K (up/gate/attention) and Q6_K (down). The 0.8B MoE
+projections that are batched use Q4_K, Q8_0, and Q5_0. Expert GEMVs stay on
+the GEMV kernels.
+
+Selection, read at `cuda_init`:
+
+| `ODINFER_CUDA_TC` | Behaviour |
+|-------------------|-----------|
+| unset | tensor cores when compute capability ≥ 7.0 and `T ≥ 16` |
+| `1` | tensor cores for every `T > 1` (still GEMV at `T == 1`) |
+| `0` | MMQ for `T > 1`, GEMV for decode |
+
+`T == 1` is always GEMV. A missing tensor-core kernel falls back to MMQ.
+
+Correctness (`max_abs`, the tolerance at that element, `atol`, `rtol`) and
+the microbenchmark:
+
+```sh
+# build is the same command as bin/cuda_kernel_test in the check script
+bin/cuda_kernel_test
+bin/cuda_kernel_test --bench
+```
+
+`cuda_selftest` compares tensor-core GEMM to the CPU fp32 dot for F32, F16,
+Q8_0, Q4_0, Q5_0, Q4_K, Q6_K, Q5_K, Q8_K at `T=32`, `rows=64`, `cols=256`,
+plus partial tiles (`T=20`, `rows=40`) for Q4_K, Q8_0, and Q5_0. fp16
+rounding uses `atol=2e-2 rtol=1e-2` for F32/F16 and `atol=5e-2 rtol=5e-2`
+for the quantized kinds. A wrong tile mapping is far outside that.
+
+`--bench` prints milliseconds and TFLOPS (2·T·rows·cols) for tensor cores
+and MMQ:
+
+| Name | Kind | rows × T × cols |
+|------|------|-----------------|
+| 9B w1/w3 | Q4_K | 12288 × 64 × 4096 |
+| 9B wq | Q4_K | 8192 × 64 × 4096 |
+| 9B wo | Q4_K | 4096 × 64 × 4096 |
+| 9B w2 | Q6_K | 4096 × 64 × 12288 |
+| 0.8B Q8_0 | Q8_0 | 1024 × 32 × 1024 |
+| 0.8B Q5_0 | Q5_0 | 1024 × 32 × 1024 |
+
+End-to-end prefill, same prompt, tensor cores on and off. The smoke line
+`prefill N tok` is the number that has to be at least 16 for the default
+(auto) policy; `ODINFER_CUDA_TC=1` uses tensor cores for any `N > 1`.
+
+```sh
+ODINFER_CUDA_TC=0 bin/cuda_smoke "$MODEL" 8 2048
+bin/cuda_smoke "$MODEL" 8 2048
+ODINFER_CUDA_TC=1 bin/cuda_smoke "$MODEL" 8 2048
+```
+
+Decode tok/s should match across those three. The init line says
+`tensor cores auto (T>=16)`, `off`, or `on for T>1`.
 
 ## Check script
 

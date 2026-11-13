@@ -11,6 +11,7 @@ import "core:c"
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:time"
 
 @(private = "file")
 _cuda_self_import_keep :: proc() {
@@ -20,6 +21,7 @@ _cuda_self_import_keep :: proc() {
 	_ = fmt.tprintf("")
 	_ = math.abs(f32(0))
 	_ = os.O_RDONLY
+	_ = time.now()
 }
 
 when GPU_CUDA {
@@ -318,6 +320,57 @@ run_mmq :: proc(kind: ggml.GGML_Type, rows, cols, T: int) -> bool {
 		s_note(&st, fmt.tprintf("mmq %s [%d]", tag, i), got[i], ref[i], atol, rtol)
 	}
 	return s_report(fmt.tprintf("mmq %s T=%d", tag, T), st, atol, rtol)
+}
+
+@(private)
+run_tc :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bool {
+	tag := cuda_kind_tag(kind)
+	fn := s_fn(fmt.tprintf("tc_%s", tag))
+	if fn == nil {
+		fmt.eprintf("cuda_selftest: missing tc_%s\n", tag)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref := make([]f32, T * rows)
+	defer delete(ref)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw, x[t * cols:][:cols], rows, cols)
+		copy(ref[t * rows:][:rows], row)
+		delete(row)
+	}
+	dw, _ := cu.alloc(len(raw))
+	dx, _ := cu.alloc(T * cols * 4)
+	dy, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	wb, xx, yy := dw, dx, dy
+	nn, dd, tt := i32(cols), i32(rows), i32(T)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	gx := u32((rows + 63) / 64)
+	gy := u32((T + 63) / 64)
+	if cu.launch(fn, gx, gy, 1, 512, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: tc %s launch failed\n", tag)
+		return false
+	}
+	got := make([]f32, T * rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, T * rows * 4)
+	st: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st, fmt.tprintf("tc %s [%d]", tag, i), got[i], ref[i], atol, rtol)
+	}
+	return s_report(fmt.tprintf("tc %s T=%d rows=%d cols=%d", tag, T, rows, cols), st, atol, rtol)
 }
 
 @(private)
@@ -725,6 +778,30 @@ cuda_selftest :: proc() -> bool {
 			ok = false
 		}
 	}
+	// fp16 tiles vs the fp32 CPU dot. K=256, values O(0.1). A wrong WMMA
+	// layout is off by O(1), not by this tolerance.
+	tc_kinds := [?]ggml.GGML_Type{
+		.F32, .F16, .Q8_0, .Q4_0, .Q5_0, .Q4_K, .Q6_K, .Q5_K, .Q8_K,
+	}
+	for kind in tc_kinds {
+		atol, rtol: f32 = 5e-2, 5e-2
+		if kind == .F32 || kind == .F16 {
+			atol, rtol = 2e-2, 1e-2
+		}
+		if !run_tc(kind, 64, 256, 32, atol, rtol) {
+			ok = false
+		}
+	}
+	// Partial tile: T and rows are not multiples of 16.
+	if !run_tc(.Q4_K, 40, 256, 20, 5e-2, 5e-2) {
+		ok = false
+	}
+	if !run_tc(.Q8_0, 40, 64, 20, 5e-2, 5e-2) {
+		ok = false
+	}
+	if !run_tc(.Q5_0, 40, 64, 20, 5e-2, 5e-2) {
+		ok = false
+	}
 	if !run_elem() {
 		ok = false
 	}
@@ -740,6 +817,91 @@ cuda_selftest :: proc() -> bool {
 		fmt.eprintln("cuda_selftest: FAIL")
 	}
 	return ok
+}
+
+// Representative 9B prefill GEMMs (T=64) plus a small Q8_0 / Q5_0 pair for
+// the 0.8B MoE quants. Times tensor-core WMMA against the MMQ fallback.
+// FLOPs count a multiply and an add: 2*T*rows*cols.
+cuda_tc_bench :: proc() -> bool {
+	if !s_open() {
+		return false
+	}
+	defer s_close()
+	Shape :: struct {
+		kind:       ggml.GGML_Type,
+		rows, cols: int,
+		T:          int,
+		name:       string,
+	}
+	shapes := [?]Shape{
+		{.Q4_K, 12288, 4096, 64, "9B w1/w3"},
+		{.Q4_K, 8192, 4096, 64, "9B wq"},
+		{.Q4_K, 4096, 4096, 64, "9B wo"},
+		{.Q6_K, 4096, 12288, 64, "9B w2"},
+		{.Q8_0, 1024, 1024, 32, "0.8B Q8_0"},
+		{.Q5_0, 1024, 1024, 32, "0.8B Q5_0"},
+	}
+	fmt.eprintln("cuda_bench: TC is WMMA 16x16x16 fp16, fp32 acc. MMQ is the warp fallback.")
+	for s in shapes {
+		tag := cuda_kind_tag(s.kind)
+		tc := s_fn(fmt.tprintf("tc_%s", tag))
+		mmq := s_fn(fmt.tprintf("mmq_%s", tag))
+		if tc == nil || mmq == nil {
+			fmt.eprintf("cuda_bench: missing kernel for %s\n", tag)
+			return false
+		}
+		raw := fill_weight(s.kind, s.rows, s.cols)
+		x := make([]f32, s.T * s.cols)
+		for i in 0 ..< len(x) {
+			x[i] = (f32(i % 11) - 5) * 0.02
+		}
+		dw, e1 := cu.alloc(len(raw))
+		dx, e2 := cu.alloc(len(x) * 4)
+		dy, e3 := cu.alloc(s.T * s.rows * 4)
+		if e1 != cu.OK || e2 != cu.OK || e3 != cu.OK {
+			fmt.eprintln("cuda_bench: alloc failed")
+			delete(raw)
+			delete(x)
+			return false
+		}
+		cu.upload(dw, raw_data(raw), len(raw))
+		cu.upload(dx, raw_data(x), len(x) * 4)
+		delete(raw)
+		delete(x)
+		wb, xx, yy := dw, dx, dy
+		nn, dd, tt := i32(s.cols), i32(s.rows), i32(s.T)
+		args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+		gx := u32((s.rows + 63) / 64)
+		gy := u32((s.T + 63) / 64)
+		tc_ms := bench_ms(tc, args[:], gx, gy, 512)
+		mmq_ms := bench_ms(mmq, args[:], u32(s.rows), 1, 32)
+		cu.free(dw)
+		cu.free(dx)
+		cu.free(dy)
+		flops := 2 * f64(s.T) * f64(s.rows) * f64(s.cols)
+		tc_tflops := flops / (tc_ms * 1e-3) / 1e12
+		mmq_tflops := flops / (mmq_ms * 1e-3) / 1e12
+		fmt.eprintfln(
+			"cuda_bench: %s %s  %dx%dx%d  TC %.2f ms  %.2f TFLOPS   MMQ %.2f ms  %.2f TFLOPS   TC/MMQ %.2fx",
+			s.name, tag, s.rows, s.T, s.cols, tc_ms, tc_tflops, mmq_ms, mmq_tflops, mmq_ms / tc_ms,
+		)
+	}
+	return true
+}
+
+@(private)
+bench_ms :: proc(fn: cu.Function, args: []rawptr, gx, gy, bx: u32) -> f64 {
+	for _ in 0 ..< 2 {
+		cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args)
+	}
+	cu.sync()
+	iters := 5
+	t0 := time.now()
+	for _ in 0 ..< iters {
+		cu.launch(fn, gx, gy, 1, bx, 1, 1, 0, args)
+		cu.sync()
+	}
+	return f64(time.duration_milliseconds(time.since(t0))) / f64(iters)
 }
 
 } // GPU_CUDA

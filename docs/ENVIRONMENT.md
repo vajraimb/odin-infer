@@ -45,6 +45,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `ODINFER_NVRTC_PATH` | unset | Exclusive path to `libnvrtc.so.12` (sm_70) or `.13`, or the directory that contains it. CUDA 13 NVRTC cannot target compute_70; a V100 needs NVRTC 12.x (`pip install nvidia-cuda-nvrtc-cu12`). |
 | `NVRTC_DIR` | unset | Directory or soname path searched first when `ODINFER_NVRTC_PATH` is unset. For sm_70 a 13.x library there is skipped and the search continues to pip `libnvrtc.so.12` and the loader. |
 | `CUDA_DEVICE` | `0` | Device ordinal. |
+| `ODINFER_CUDA_TC` | auto | Prefill GEMM. Unset: Volta WMMA when `T≥16`. `1`: WMMA for every `T>1`. `0`: MMQ. Decode (`T==1`) stays GEMV. |
 | `QTIMING` | off | `=1` prints per-chunk CUDA wall time on stderr. |
 | `KV_Q8` / `KV_V` | Q8 K + mixed V | Same switches as Metal. The on-disk KV snapshot format is shared. |
 | `METAL_FALLBACK` | off | `=1` lets a failed CUDA init fall back to CPU. `--cuda` / `--metal` / `-g 1` otherwise hard-error. |

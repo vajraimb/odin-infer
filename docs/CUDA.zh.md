@@ -3,8 +3,9 @@
 [English](CUDA.md)
 
 Qwen3.5 引擎的 Linux x86_64 后端。目标是 **sm_70 及以上**（按 Tesla V100S、
-计算能力 7.0、驱动 CUDA 13.0 来写）。累加是 fp32，没有 bf16，也没有 tensor
-core MMA，所以 V100 没有 bf16 tensor core 不影响正确性。不依赖 dp4a。
+计算能力 7.0、驱动 CUDA 13.0 来写）。累加是 fp32，没有 bf16。预填充 GEMM
+（`T>1`）可以用 Volta tensor core（WMMA 16×16×16，fp16 乘、fp32 累加）。
+解码（`T==1`）仍走 GEMV。不依赖 dp4a。
 
 macOS 构建不变，默认仍是 Metal。同一个二进制不会同时带上两条热路径。
 
@@ -62,6 +63,51 @@ export ODINFER_NVRTC_PATH="$HOME/.local/lib/python3.12/site-packages/nvidia/cuda
 
 每次编译都带上从设备算力得到的 `--gpu-architecture=compute_XX`。
 `CUDA_DEVICE` 选设备序号，默认 0。
+
+## Tensor core
+
+预填充和其它批量 GEMM（`Y[T, rows] = X[T, cols] · W[rows, cols]`）把 `W`
+反量化成 shared memory 里的 fp16 小块（64×32），`X` 收成 fp16，再发
+`wmma.mma.sync.aligned.m16n16k16`（fp16 进、fp32 累加）。PTX 是内联的。
+NVRTC 不带 `mma.h`。`mma.sync.m16n16k16` 不是 Volta 的指令；sm_70 能 JIT 的
+是 WMMA 这条。不用 `ldmatrix`。
+
+有 tensor core 内核的量化种类和 MMQ 相同：F32、F16、Q4_0、Q4_1、Q5_0、Q5_1、
+Q8_0、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q8_K。9B Q4_K_M 的预填充是 Q4_K（up、
+gate、attention）和 Q6_K（down）。0.8B MoE 里走批量 GEMM 的投影是 Q4_K、
+Q8_0、Q5_0。专家 GEMV 仍是 GEMV。
+
+`cuda_init` 时读 `ODINFER_CUDA_TC`：
+
+| 值 | 行为 |
+|----|------|
+| 不设 | 算力 ≥ 7.0 且 `T ≥ 16` 时用 tensor core |
+| `1` | 所有 `T > 1` 用 tensor core（`T == 1` 仍是 GEMV） |
+| `0` | `T > 1` 用 MMQ，解码用 GEMV |
+
+`T == 1` 永远是 GEMV。没有对应内核时退回 MMQ。
+
+正确性（打印 `max_abs`、该元素的 tol、`atol`、`rtol`）和微基准：
+
+```sh
+bin/cuda_kernel_test
+bin/cuda_kernel_test --bench
+```
+
+`--bench` 对 9B 的 w1/w3、wq、wo（Q4_K）和 w2（Q6_K），以及 0.8B 规模的
+Q8_0、Q5_0，分别打印 tensor core 和 MMQ 的毫秒数和 TFLOPS（2·T·rows·cols）。
+
+端到端预填充对比（同一条 prompt）。`prefill N tok` 里的 N 至少要 16，默认
+策略才会走上 tensor core；`ODINFER_CUDA_TC=1` 则只要 N>1。
+
+```sh
+ODINFER_CUDA_TC=0 bin/cuda_smoke "$MODEL" 8 2048
+bin/cuda_smoke "$MODEL" 8 2048
+ODINFER_CUDA_TC=1 bin/cuda_smoke "$MODEL" 8 2048
+```
+
+这三次的解码 tok/s 应当一致。初始化日志会写 `tensor cores auto (T>=16)`、
+`off` 或 `on for T>1`。
 
 ## 检查脚本
 

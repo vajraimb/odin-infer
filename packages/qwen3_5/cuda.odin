@@ -36,6 +36,10 @@ _cuda_import_keep :: proc() {
 when GPU_CUDA {
 
 CUDA_MAX_BATCH :: 128
+// WMMA tile is 16. Below this, the fp16 quant round-trip does not pay for
+// itself against the 8-token MMQ. ODINFER_CUDA_TC=1 uses tensor cores for
+// every T>1; =0 stays on MMQ.
+TC_MIN_T :: 16
 
 @(private)
 Store_Fn :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool
@@ -103,6 +107,12 @@ moe_gpu: []Moe_GPU
 gemv_fn: [40]cu.Function
 @(private)
 mmq_fn: [40]cu.Function
+@(private)
+tc_fn: [40]cu.Function
+@(private)
+g_sm_major: int
+@(private)
+g_tc_mode: int // -1 auto, 0 off, 1 on for every T>1
 @(private)
 k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy: cu.Function
 @(private)
@@ -283,10 +293,38 @@ launch_mmq :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: i
 }
 
 @(private)
+use_tensor_cores :: proc(tcount: int) -> bool {
+	if g_sm_major < 7 || tcount <= 1 || g_tc_mode == 0 {
+		return false
+	}
+	if g_tc_mode == 1 {
+		return true
+	}
+	return tcount >= TC_MIN_T
+}
+
+@(private)
+launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
+	fn := tc_fn[int(kind)]
+	if fn == nil {
+		return false
+	}
+	wb, xx, yy := w, x, y
+	nn, dd, tt := i32(n), i32(d), i32(tcount)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	gx := u32((d + 63) / 64)
+	gy := u32((tcount + 63) / 64)
+	return ck(cu.launch(fn, gx, gy, 1, 512, 1, 1, 0, args[:]), "tc")
+}
+
+@(private)
 launch_mm :: proc(t: Tensor, x, y: cu.Device_Ptr, n, d, tcount: int) -> bool {
 	w := wptr(raw_data(t.data))
 	if tcount <= 1 {
 		return launch_gemv(t.kind, w, x, y, n, d)
+	}
+	if use_tensor_cores(tcount) && tc_fn[int(t.kind)] != nil {
+		return launch_tc(t.kind, w, x, y, n, d, tcount)
 	}
 	return launch_mmq(t.kind, w, x, y, n, d, tcount)
 }
@@ -470,7 +508,8 @@ bind_kernels :: proc() -> bool {
 	for tag, i in tags {
 		gemv_fn[int(kinds[i])] = get_fn(fmt.tprintf("gemv_%s", tag))
 		mmq_fn[int(kinds[i])] = get_fn(fmt.tprintf("mmq_%s", tag))
-		if gemv_fn[int(kinds[i])] == nil || mmq_fn[int(kinds[i])] == nil {
+		tc_fn[int(kinds[i])] = get_fn(fmt.tprintf("tc_%s", tag))
+		if gemv_fn[int(kinds[i])] == nil || mmq_fn[int(kinds[i])] == nil || tc_fn[int(kinds[i])] == nil {
 			return false
 		}
 	}
@@ -703,6 +742,15 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintf("cuda: sm_%d%d is below sm_70\n", major, minor)
 		return false
 	}
+	g_sm_major = int(major)
+	tc_env := os.get_env("ODINFER_CUDA_TC", context.temp_allocator)
+	if tc_env == "0" {
+		g_tc_mode = 0
+	} else if tc_env == "1" {
+		g_tc_mode = 1
+	} else {
+		g_tc_mode = -1
+	}
 	mem_bytes: c.size_t
 	cu.drv.DeviceTotalMem_v2(&mem_bytes, g_dev)
 	ctx: cu.Context
@@ -861,6 +909,13 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		kv_resident_tag(), chosen,
 	)
 	fmt.eprintfln("cuda: weights %d MiB from %s", len(mmap) / (1024 * 1024), model_path)
+	tc_note := "auto (T>=16)"
+	if g_tc_mode == 0 {
+		tc_note = "off (ODINFER_CUDA_TC=0)"
+	} else if g_tc_mode == 1 {
+		tc_note = "on for T>1 (ODINFER_CUDA_TC=1)"
+	}
+	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	return true
 }
 

@@ -1,7 +1,10 @@
-/* Qwen3.5 CUDA kernels. sm_70+ (Tesla V100). fp32 accumulate, no tensor cores,
-   no cp.async, no bf16. NVRTC-compiled at init with an explicit
-   --gpu-architecture=compute_XX from the device (CUDA 13 NVRTC defaults to
-   sm_75 and will not JIT on sm_70).
+/* Qwen3.5 CUDA kernels. sm_70+ (Tesla V100). fp32 accumulate. No bf16, no
+   cp.async, no ldmatrix (that is sm_75). Prefill GEMM (T>1) can use Volta
+   WMMA 16x16x16: wmma.mma.sync.aligned.m16n16k16, fp16 operands, fp32
+   accumulate. NVRTC does not ship mma.h, so the WMMA ops are inline PTX.
+   Decode stays on GEMV. NVRTC is given an explicit
+   --gpu-architecture=compute_XX (CUDA 13 NVRTC defaults to sm_75 and will
+   not JIT on sm_70).
 
    Quant layouts match packages/ggml/quant.odin. GEMV is one warp per output
    row. MMQ reuses the same accumulator over a tile of up to 8 tokens and
@@ -895,3 +898,354 @@ extern "C" __global__ void moe_softmax_topk(const float* logits, int* sel, float
         if (scale != 1.f && scale != 0.f) weights[t] *= scale;
     }
 }
+
+/* ---- Volta tensor-core GEMM -------------------------------------------------
+   Y[T, d] = X[T, n] * W[d, n], fp32 accumulate. W is dequantized into fp16
+   tiles in shared memory, X is narrowed to fp16, then one warp issues
+   wmma 16x16x16. A block owns 64 tokens by 64 rows. T==1 never launches this.
+   The hardware op under the WMMA is HMMA.884; the PTX we emit is the sm_70
+   WMMA form, which NVRTC 12.9 accepts for compute_70. */
+
+__device__ __forceinline__ unsigned short f32_to_f16(float v) {
+    unsigned short h;
+    st_f16((unsigned char*)&h, v);
+    return h;
+}
+
+__device__ __forceinline__ void wmma_load_a(unsigned& a0, unsigned& a1, unsigned& a2, unsigned& a3,
+                                            unsigned& a4, unsigned& a5, unsigned& a6, unsigned& a7,
+                                            const unsigned short* p, int stride) {
+    asm volatile(
+        "wmma.load.a.sync.aligned.row.m16n16k16.f16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8], %9;\n"
+        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3), "=r"(a4), "=r"(a5), "=r"(a6), "=r"(a7)
+        : "l"(p), "r"(stride));
+}
+
+__device__ __forceinline__ void wmma_load_b(unsigned& b0, unsigned& b1, unsigned& b2, unsigned& b3,
+                                            unsigned& b4, unsigned& b5, unsigned& b6, unsigned& b7,
+                                            const unsigned short* p, int stride) {
+    asm volatile(
+        "wmma.load.b.sync.aligned.col.m16n16k16.f16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8], %9;\n"
+        : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3), "=r"(b4), "=r"(b5), "=r"(b6), "=r"(b7)
+        : "l"(p), "r"(stride));
+}
+
+__device__ __forceinline__ void wmma_mma(float& c0, float& c1, float& c2, float& c3,
+                                         float& c4, float& c5, float& c6, float& c7,
+                                         unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                         unsigned a4, unsigned a5, unsigned a6, unsigned a7,
+                                         unsigned b0, unsigned b1, unsigned b2, unsigned b3,
+                                         unsigned b4, unsigned b5, unsigned b6, unsigned b7) {
+    asm volatile(
+        "wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+        "{%8,%9,%10,%11,%12,%13,%14,%15}, "
+        "{%16,%17,%18,%19,%20,%21,%22,%23}, "
+        "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3), "+f"(c4), "+f"(c5), "+f"(c6), "+f"(c7)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7),
+          "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+}
+
+__device__ __forceinline__ void wmma_store(float* p, int stride,
+                                           float c0, float c1, float c2, float c3,
+                                           float c4, float c5, float c6, float c7) {
+    asm volatile(
+        "wmma.store.d.sync.aligned.row.m16n16k16.f32 [%0], "
+        "{%1,%2,%3,%4,%5,%6,%7,%8}, %9;\n"
+        :: "l"(p), "f"(c0), "f"(c1), "f"(c2), "f"(c3), "f"(c4), "f"(c5), "f"(c6), "f"(c7), "r"(stride));
+}
+
+__device__ float w_f32(const unsigned char* wb, int row, int k, int n) {
+    return ld_f32(wb + ((size_t)row * (size_t)n + (size_t)k) * 4);
+}
+__device__ float w_f16(const unsigned char* wb, int row, int k, int n) {
+    return ld_f16(wb + ((size_t)row * (size_t)n + (size_t)k) * 2);
+}
+__device__ float w_q8_0(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 5;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 5)) * 34;
+    return ld_f16(blk) * (float)(signed char)blk[2 + (k & 31)];
+}
+__device__ float w_q4_0(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 5;
+    int inner = k & 31;
+    int j = inner & 15;
+    int hi = inner >> 4;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 5)) * 18;
+    unsigned char q = blk[2 + j];
+    int qv = hi ? (int)(q >> 4) - 8 : (int)(q & 0xF) - 8;
+    return ld_f16(blk) * (float)qv;
+}
+__device__ float w_q4_1(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 5;
+    int inner = k & 31;
+    int j = inner & 15;
+    int hi = inner >> 4;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 5)) * 20;
+    unsigned char q = blk[4 + j];
+    int qv = hi ? (int)(q >> 4) : (int)(q & 0xF);
+    return ld_f16(blk) * (float)qv + ld_f16(blk + 2);
+}
+__device__ float w_q5_0(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 5;
+    int inner = k & 31;
+    int j = inner & 15;
+    int hi = inner >> 4;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 5)) * 22;
+    unsigned qh = ld_u32(blk + 2);
+    unsigned char qs = blk[6 + j];
+    int qv;
+    if (hi == 0) {
+        unsigned xh = ((qh >> j) << 4) & 0x10u;
+        qv = (int)((qs & 0xF) | xh) - 16;
+    } else {
+        unsigned xh = (qh >> (j + 12)) & 0x10u;
+        qv = (int)((qs >> 4) | xh) - 16;
+    }
+    return ld_f16(blk) * (float)qv;
+}
+__device__ float w_q5_1(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 5;
+    int inner = k & 31;
+    int j = inner & 15;
+    int hi = inner >> 4;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 5)) * 24;
+    unsigned qh = ld_u32(blk + 4);
+    unsigned char qs = blk[8 + j];
+    int qv;
+    if (hi == 0) {
+        unsigned xh = ((qh >> j) << 4) & 0x10u;
+        qv = (int)((qs & 0xF) | xh);
+    } else {
+        unsigned xh = (qh >> (j + 12)) & 0x10u;
+        qv = (int)((qs >> 4) | xh);
+    }
+    return ld_f16(blk) * (float)qv + ld_f16(blk + 2);
+}
+__device__ float w_q4_k(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 8)) * 144;
+    int inner = k & 255;
+    int p = inner >> 6;
+    int within = inner & 63;
+    int hi = within >> 5;
+    int lane = within & 31;
+    int sc, m;
+    scale_min_k4(p * 2 + hi, blk + 4, &sc, &m);
+    unsigned char q = blk[16 + p * 32 + lane];
+    int qv = hi ? (int)(q >> 4) : (int)(q & 0xF);
+    float d = ld_f16(blk);
+    float dmin = ld_f16(blk + 2);
+    return (float)qv * (d * (float)sc) - (dmin * (float)m);
+}
+__device__ float w_q6_k(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 8)) * 210;
+    int inner = k & 255;
+    int half = inner >> 7;
+    int rem = inner & 127;
+    int group = rem >> 5;
+    int l = rem & 31;
+    const unsigned char* ql = blk;
+    const unsigned char* qh = blk + 128;
+    const unsigned char* scb = blk + 192;
+    int qloff = half * 64;
+    int qhoff = half * 32;
+    int scoff = half * 8;
+    unsigned char qh1 = qh[qhoff + l];
+    int qv, sc_i;
+    int is = l >> 4;
+    if (group == 0) {
+        qv = (int)((ql[qloff + l] & 0xF) | (((qh1 >> 0) & 3) << 4)) - 32;
+        sc_i = scoff + is;
+    } else if (group == 1) {
+        qv = (int)((ql[qloff + l + 32] & 0xF) | (((qh1 >> 2) & 3) << 4)) - 32;
+        sc_i = scoff + is + 2;
+    } else if (group == 2) {
+        qv = (int)((ql[qloff + l] >> 4) | (((qh1 >> 4) & 3) << 4)) - 32;
+        sc_i = scoff + is + 4;
+    } else {
+        qv = (int)((ql[qloff + l + 32] >> 4) | (((qh1 >> 6) & 3) << 4)) - 32;
+        sc_i = scoff + is + 6;
+    }
+    float d = ld_f16(blk + 208);
+    return d * (float)(signed char)scb[sc_i] * (float)qv;
+}
+__device__ float w_q8_k(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 8)) * 292;
+    return ld_f32(blk) * (float)(signed char)blk[4 + (k & 255)];
+}
+__device__ float w_q2_k(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 8)) * 84;
+    int inner = k & 255;
+    int group = inner >> 5;
+    int half = group >> 2;
+    int s = group & 3;
+    int shift = s * 2;
+    int qoff = half * 32;
+    int within = inner & 31;
+    int l = within & 15;
+    int hi = within >> 4;
+    unsigned char sc = blk[group * 2 + hi];
+    float d = ld_f16(blk + 80);
+    float dmin = ld_f16(blk + 82);
+    float dl = d * (float)(sc & 0xF);
+    float ml = dmin * (float)(sc >> 4);
+    unsigned char byte = blk[16 + qoff + hi * 16 + l];
+    return dl * (float)((byte >> shift) & 3) - ml;
+}
+__device__ float w_q3_k(const unsigned char* wb, int row, int k, int n) {
+    const unsigned KMASK1 = 0x03030303u;
+    const unsigned KMASK2 = 0x0f0f0f0fu;
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 8)) * 110;
+    int inner = k & 255;
+    unsigned aux0 = ld_u32(blk + 96);
+    unsigned aux1 = ld_u32(blk + 100);
+    unsigned tmp = ld_u32(blk + 104);
+    unsigned aux2 = ((aux0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+    unsigned aux3 = ((aux1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+    aux0 = (aux0 & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+    aux1 = (aux1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+    unsigned aux[4];
+    aux[0] = aux0; aux[1] = aux1; aux[2] = aux2; aux[3] = aux3;
+    int group = inner >> 5;
+    int half = group >> 2;
+    int s = group & 3;
+    int shift = s * 2;
+    int qoff = half * 32;
+    int within = inner & 31;
+    int l = within & 15;
+    int hi = within >> 4;
+    int is = group * 2 + hi;
+    int sc = (int)(signed char)((aux[is / 4] >> (8 * (is & 3))) & 0xff);
+    float dl = ld_f16(blk + 108) * (float)(sc - 32);
+    unsigned mbit = 1u << group;
+    const unsigned char* hm = blk + (hi ? 16 : 0);
+    const unsigned char* qs = blk + 32;
+    int q = (int)((qs[qoff + hi * 16 + l] >> shift) & 3) - ((hm[l] & mbit) == 0 ? 4 : 0);
+    return dl * (float)q;
+}
+__device__ float w_q5_k(const unsigned char* wb, int row, int k, int n) {
+    int nb = n >> 8;
+    const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)(k >> 8)) * 176;
+    int inner = k & 255;
+    int p = inner >> 6;
+    int within = inner & 63;
+    int hi = within >> 5;
+    int l = within & 31;
+    int sc, m;
+    scale_min_k4(p * 2 + hi, blk + 4, &sc, &m);
+    float d = ld_f16(blk);
+    float dmin = ld_f16(blk + 2);
+    const unsigned char* qh = blk + 16;
+    const unsigned char* ql = blk + 48;
+    unsigned u = 1u << (2 * p + hi);
+    int nib = hi ? (int)(ql[p * 32 + l] >> 4) : (int)(ql[p * 32 + l] & 0xF);
+    int v = nib + ((qh[l] & u) ? 16 : 0);
+    return (d * (float)sc) * (float)v - (dmin * (float)m);
+}
+
+template<int KIND>
+__device__ float tc_w(const unsigned char* wb, int row, int k, int n) {
+    if (KIND == 0) return w_f32(wb, row, k, n);
+    if (KIND == 1) return w_f16(wb, row, k, n);
+    if (KIND == 2) return w_q4_0(wb, row, k, n);
+    if (KIND == 3) return w_q4_1(wb, row, k, n);
+    if (KIND == 4) return w_q5_0(wb, row, k, n);
+    if (KIND == 5) return w_q5_1(wb, row, k, n);
+    if (KIND == 6) return w_q8_0(wb, row, k, n);
+    if (KIND == 7) return w_q2_k(wb, row, k, n);
+    if (KIND == 8) return w_q3_k(wb, row, k, n);
+    if (KIND == 9) return w_q4_k(wb, row, k, n);
+    if (KIND == 10) return w_q5_k(wb, row, k, n);
+    if (KIND == 11) return w_q6_k(wb, row, k, n);
+    return w_q8_k(wb, row, k, n);
+}
+
+/* KIND matches the order in bind_kernels. Block: 512 threads, 16 warps.
+   grid: (ceil(d/64), ceil(T/64)). */
+template<int KIND>
+__device__ void tc_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    const int BM = 64;
+    const int BN = 64;
+    const int BK = 32;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int wm = warp >> 2;
+    const int wn = warp & 3;
+    const int t0 = (int)blockIdx.y * BM;
+    const int n0 = (int)blockIdx.x * BN;
+    if (t0 >= T || n0 >= d) return;
+
+    __shared__ __align__(16) unsigned char sm[16 * 256 * 4];
+    unsigned short* Xs = (unsigned short*)sm;
+    unsigned short* Ws = (unsigned short*)(sm + BM * BK * 2);
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        for (int i = tid; i < BM * BK; i += 512) {
+            int t = i / BK;
+            int kk = i - t * BK;
+            float v = 0.f;
+            if (t0 + t < T && k0 + kk < n) v = x[((size_t)t0 + t) * (size_t)n + (size_t)k0 + kk];
+            Xs[i] = f32_to_f16(v);
+        }
+        for (int i = tid; i < BN * BK; i += 512) {
+            int row = i / BK;
+            int kk = i - row * BK;
+            float v = 0.f;
+            if (n0 + row < d && k0 + kk < n) v = tc_w<KIND>(wb, n0 + row, k0 + kk, n);
+            Ws[i] = f32_to_f16(v);
+        }
+        __syncthreads();
+        for (int kk = 0; kk < BK; kk += 16) {
+            unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+            unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+            wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
+            wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
+            wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+        }
+        __syncthreads();
+    }
+    float* tile = ((float*)sm) + warp * 256;
+    wmma_store(tile, 16, c0, c1, c2, c3, c4, c5, c6, c7);
+    __syncthreads();
+    for (int idx = tid; idx < 16 * 256; idx += 512) {
+        int w = idx >> 8;
+        int e = idx & 255;
+        int i = e >> 4;
+        int j = e & 15;
+        int tw = w >> 2;
+        int nw = w & 3;
+        int t = t0 + tw * 16 + i;
+        int row = n0 + nw * 16 + j;
+        if (t < T && row < d) out[(size_t)t * (size_t)d + row] = ((float*)sm)[idx];
+    }
+}
+
+#define DEF_TC(tag, kind) \
+extern "C" __global__ void tc_##tag(const unsigned char* wb, const float* x, float* out, int n, int d, int T) { \
+    tc_run<kind>(wb, x, out, n, d, T); \
+}
+
+DEF_TC(f32, 0)
+DEF_TC(f16, 1)
+DEF_TC(q4_0, 2)
+DEF_TC(q4_1, 3)
+DEF_TC(q5_0, 4)
+DEF_TC(q5_1, 5)
+DEF_TC(q8_0, 6)
+DEF_TC(q2_k, 7)
+DEF_TC(q3_k, 8)
+DEF_TC(q4_k, 9)
+DEF_TC(q5_k, 10)
+DEF_TC(q6_k, 11)
+DEF_TC(q8_k, 12)
+
+#undef DEF_TC
