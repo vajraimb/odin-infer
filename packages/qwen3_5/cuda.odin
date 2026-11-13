@@ -1,7 +1,9 @@
 /* CUDA forward for Qwen3.5. Compiled only with -define:ODINFER_BACKEND="cuda".
    The driver and NVRTC are dlopen'd; nothing here links against libcuda.
-   Decode (T==1) uses a bandwidth GEMV (dp4a, 4 rows/warp); ODINFER_CUDA_GEMV=old
-   restores one warp per row. Prefill uses WMMA when it pays. KV layout matches the
+   Decode (T==1) uses a bandwidth GEMV. Short Q4/Q6 matrices use one row per
+   warp; tall ones keep four. ODINFER_CUDA_GEMV=old restores the scalar kernel.
+   Dense decode can be one CUDA graph (ODINFER_CUDA_GRAPH=0 disables it).
+   Prefill stays eager and uses WMMA when it pays. KV layout matches the
    Metal/CPU snapshot bytes (Q8_0 K, mixed or Q8 V, or legacy f16). */
 
 package qwen3_5
@@ -37,6 +39,11 @@ _cuda_import_keep :: proc() {
 when GPU_CUDA {
 
 CUDA_MAX_BATCH :: 128
+// Q5_0 / Q8_0 below this stay on the old GEMV. The new kernel lost at 2048x2048.
+GEMV_SMALL_BYTES :: 16 * 1024 * 1024
+// Four rows per warp under-fills the V100 below this row count (wo, w2, 9B wq).
+GEMV_R1_ROWS :: 8192
+PROF_MAX :: 8192
 // WMMA tile is 16. Below this, the fp16 quant round-trip does not pay for
 // itself against the 8-token MMQ. ODINFER_CUDA_TC=1 uses tensor cores for
 // every T>1; =0 stays on MMQ.
@@ -117,11 +124,33 @@ g_tc_mode: int // -1 auto, 0 off, 1 on for every T>1
 @(private)
 g_gemv_new: bool
 @(private)
+g_gemv_force: int // 0 old, 1 auto, 2 always the new kernel
+@(private)
+g_gemv_rows: int // 0 auto, 1 one row/warp, 4 four rows/warp
+@(private)
 g_gemv_warps: int
 @(private)
 g_launches: int
 @(private)
 g_count_launches: bool
+@(private)
+g_profile: bool
+@(private)
+g_use_graph: bool
+@(private)
+g_capturing: bool
+@(private)
+g_graph_ready: bool
+@(private)
+g_stream: rawptr
+@(private)
+g_exec: rawptr
+@(private)
+g_graph_launches: int
+@(private)
+g_pos_sym: cu.Device_Ptr
+@(private)
+g_launch_stream: rawptr
 @(private)
 d_xq, d_xd, d_xs: cu.Device_Ptr
 @(private)
@@ -135,11 +164,31 @@ k_quant, k_rmsnorm_q8: cu.Function
 @(private)
 k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
+k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
+@(private)
 k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy: cu.Function
 @(private)
 k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v: cu.Function
 @(private)
 k_conv, k_l2, k_delta, k_rmsgate, k_moe_topk: cu.Function
+
+Prof_Bin :: struct {
+	name:  string,
+	count: int,
+	ms:    f64,
+}
+@(private)
+g_prof_ev: [PROF_MAX]rawptr
+@(private)
+g_prof_name: [PROF_MAX]string
+@(private)
+g_prof_n: int
+@(private)
+g_prof_ready: bool
+@(private)
+g_prof_trunc: bool
+@(private)
+g_bins: [48]Prof_Bin
 
 cuda_batch_max :: proc() -> int {
 	if g_max_t > 0 {
@@ -162,7 +211,26 @@ klaunch :: proc(fn: cu.Function, gx, gy, gz, bx, by, bz: u32, args: []rawptr, wh
 	if g_count_launches {
 		g_launches += 1
 	}
-	return ck(cu.launch(fn, gx, gy, gz, bx, by, bz, 0, args), what)
+	ok := ck(cu.launch(fn, gx, gy, gz, bx, by, bz, 0, args, g_launch_stream), what)
+	if ok && g_profile && g_prof_ready && !g_capturing {
+		if g_prof_n < PROF_MAX {
+			if cu.gapi.event_record(g_prof_ev[g_prof_n], g_launch_stream) == cu.OK {
+				g_prof_name[g_prof_n] = what
+				g_prof_n += 1
+			}
+		} else {
+			g_prof_trunc = true
+		}
+	}
+	return ok
+}
+
+@(private)
+decode_pos :: proc(pos: int) -> int {
+	if g_capturing {
+		return -1
+	}
+	return pos
 }
 
 @(private)
@@ -354,7 +422,73 @@ launch_gemv_old :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int)
 }
 
 @(private)
-launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr, n, d: int) -> bool {
+gemv_what :: proc(kind: ggml.GGML_Type, r1: bool) -> string {
+	if r1 {
+		if kind == .Q4_K {
+			return "gemv2r1_q4"
+		}
+		if kind == .Q6_K {
+			return "gemv2r1_q6"
+		}
+		return "gemv2r1"
+	}
+	if kind == .Q4_K {
+		return "gemv2_q4"
+	}
+	if kind == .Q6_K {
+		return "gemv2_q6"
+	}
+	if kind == .Q5_K {
+		return "gemv2_q5k"
+	}
+	if kind == .Q8_0 {
+		return "gemv2_q8"
+	}
+	if kind == .Q5_0 {
+		return "gemv2_q5_0"
+	}
+	return "gemv2"
+}
+
+// nil means "use the old GEMV". r1 is the one-row-per-warp kernel.
+@(private)
+gemv2_pick :: proc(kind: ggml.GGML_Type, n, d: int) -> (fn: cu.Function, r1: bool) {
+	if !g_gemv_new || !gemv2_aligned(kind, n) {
+		return nil, false
+	}
+	if g_gemv_force != 2 && (kind == .Q8_0 || kind == .Q5_0) {
+		elems, bsz := ggml.ggml_block_info(kind)
+		if elems > 0 && d * (n / elems) * bsz < GEMV_SMALL_BYTES {
+			return nil, false
+		}
+	}
+	base := gemv2_for(kind)
+	if base == nil {
+		return nil, false
+	}
+	want_r1 := false
+	if kind == .Q4_K || kind == .Q6_K {
+		if g_gemv_rows == 1 {
+			want_r1 = true
+		} else if g_gemv_rows == 4 {
+			want_r1 = false
+		} else {
+			want_r1 = d <= GEMV_R1_ROWS
+		}
+	}
+	if want_r1 {
+		if kind == .Q4_K && k_gemv2r1_q4 != nil {
+			return k_gemv2r1_q4, true
+		}
+		if kind == .Q6_K && k_gemv2r1_q6 != nil {
+			return k_gemv2r1_q6, true
+		}
+	}
+	return base, false
+}
+
+@(private)
+launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr, n, d: int, r1: bool, accumulate: int) -> bool {
 	warps := g_gemv_warps
 	if warps < 1 {
 		warps = 1
@@ -365,28 +499,43 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	wb, yy := w, y
 	qs, sc, sm := d_xq, d_xd, d_xs
 	nn, dd := i32(n), i32(d)
+	acc := i32(accumulate)
 	rows_per := warps * 4
+	if r1 {
+		rows_per = warps
+	}
 	gx := u32((d + rows_per - 1) / rows_per)
 	bx := u32(warps * 32)
+	what := gemv_what(kind, r1)
 	if kind == .Q4_K || kind == .Q5_K {
-		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd}
-		return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], "gemv2")
+		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+		return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], what)
 	}
-	args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd}
-	return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], "gemv2")
+	args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+	return klaunch(fn, gx, 1, 1, bx, 1, 1, args[:], what)
 }
 
 launch_gemv :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int) -> bool {
 	if d <= 0 || n <= 0 {
 		return true
 	}
-	if g_gemv_new {
-		fn := gemv2_for(kind)
-		if fn != nil && gemv2_aligned(kind, n) && q8_ensure(x, n) {
-			return launch_gemv2(fn, kind, w, y, n, d)
-		}
+	fn, r1 := gemv2_pick(kind, n, d)
+	if fn != nil && q8_ensure(x, n) {
+		return launch_gemv2(fn, kind, w, y, n, d, r1, 0)
 	}
 	return launch_gemv_old(kind, w, x, y, n, d)
+}
+
+// Writes y += W*x with the bandwidth GEMV and skips the residual kernel.
+// False leaves y untouched so the caller can run the two-kernel path.
+@(private)
+try_accum_gemv :: proc(t: Tensor, x, y: cu.Device_Ptr, n, d: int) -> bool {
+	fn, r1 := gemv2_pick(t.kind, n, d)
+	if fn == nil || !q8_ensure(x, n) {
+		return false
+	}
+	w := wptr(raw_data(t.data))
+	return launch_gemv2(fn, t.kind, w, y, n, d, r1, 1)
 }
 
 @(private)
@@ -488,7 +637,7 @@ launch_rope :: proc(vec: cu.Device_Ptr, head_dim, pos: int, theta: f32, rotary, 
 		return true
 	}
 	v := vec
-	hd, ps, rd, nh := i32(head_dim), i32(pos), i32(rotary), i32(nheads)
+	hd, ps, rd, nh := i32(head_dim), i32(decode_pos(pos)), i32(rotary), i32(nheads)
 	th := theta
 	args := [?]rawptr{&v, &hd, &ps, &th, &rd, &nh}
 	return klaunch(k_rope, grid_n(total, 128), 1, 1, 128, 1, 1, args[:], "rope")
@@ -532,7 +681,7 @@ launch_axpy :: proc(y, x: cu.Device_Ptr, a: f32, n: int) -> bool {
 @(private)
 store_f16_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
-	hd, sl, ps, nk := i32(g_head), i32(g_seq), i32(pos), i32(g_kv_heads)
+	hd, sl, ps, nk := i32(g_head), i32(g_seq), i32(decode_pos(pos)), i32(g_kv_heads)
 	args := [?]rawptr{&a, &b, &c, &d, &hd, &sl, &ps, &nk}
 	n := g_kv_heads * g_head
 	return klaunch(k_store_f16, grid_n(n, 128), 1, 1, 128, 1, 1, args[:], "store_f16")
@@ -542,7 +691,7 @@ store_f16_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 attn_f16_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := q, kc, vc, xb3
 	sc := d_scores
-	hd, sl, mul, ps := i32(g_head), i32(g_seq), i32(g_heads / g_kv_heads), i32(pos)
+	hd, sl, mul, ps := i32(g_head), i32(g_seq), i32(g_heads / g_kv_heads), i32(decode_pos(pos))
 	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &sl, &mul, &ps}
 	return klaunch(k_attn_f16, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_f16")
 }
@@ -550,7 +699,7 @@ attn_f16_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 @(private)
 store_q8_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
-	nb, pb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(pos)
+	nb, pb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(decode_pos(pos))
 	args := [?]rawptr{&a, &b, &c, &d, &nb, &pb, &ps}
 	return klaunch(k_store_q8, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, args[:], "store_q8")
 }
@@ -559,7 +708,7 @@ store_q8_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 attn_q8_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := q, kc, vc, xb3
 	sc := d_scores
-	hd, pb, mul, ps, sl := i32(g_head), i32(g_k_pos), i32(g_heads / g_kv_heads), i32(pos), i32(g_seq)
+	hd, pb, mul, ps, sl := i32(g_head), i32(g_k_pos), i32(g_heads / g_kv_heads), i32(decode_pos(pos)), i32(g_seq)
 	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &pb, &mul, &ps, &sl}
 	return klaunch(k_attn_q8, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8")
 }
@@ -567,7 +716,7 @@ attn_q8_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 @(private)
 store_q8v_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
-	nb, kb, vb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(g_v_pos), i32(pos)
+	nb, kb, vb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(g_v_pos), i32(decode_pos(pos))
 	args := [?]rawptr{&a, &b, &c, &d, &nb, &kb, &vb, &ps}
 	return klaunch(k_store_q8v, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, args[:], "store_q8v")
 }
@@ -578,7 +727,7 @@ attn_q8v_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	sc := d_scores
 	hd := i32(g_head)
 	kb, vb := i32(g_k_pos), i32(g_v_pos)
-	mul, ps, sl := i32(g_heads / g_kv_heads), i32(pos), i32(g_seq)
+	mul, ps, sl := i32(g_heads / g_kv_heads), i32(decode_pos(pos)), i32(g_seq)
 	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &kb, &vb, &mul, &ps, &sl}
 	return klaunch(k_attn_q8v, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8v")
 }
@@ -669,11 +818,14 @@ bind_kernels :: proc() -> bool {
 	k_gemv2_q5k = get_fn("gemv2_q5_k")
 	k_gemv2_q8 = get_fn("gemv2_q8_0")
 	k_gemv2_q50 = get_fn("gemv2_q5_0")
+	k_gemv2r1_q4 = get_fn("gemv2r1_q4_k")
+	k_gemv2r1_q6 = get_fn("gemv2r1_q6_k")
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
 		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v,
 		k_conv, k_l2, k_delta, k_rmsgate, k_moe_topk,
 		k_quant, k_rmsnorm_q8, k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
+		k_gemv2r1_q4, k_gemv2r1_q6,
 	}
 	for h in handles {
 		if h == nil {
@@ -864,6 +1016,29 @@ cuda_destroy :: proc() {
 	d_xq, d_xd, d_xs = 0, 0, 0
 	g_q8_valid = false
 	g_q8_cap = 0
+	g_graph_ready = false
+	g_capturing = false
+	g_launch_stream = nil
+	g_pos_sym = 0
+	if cu.gapi.ready && g_exec != nil {
+		cu.gapi.graph_exec_destroy(g_exec)
+	}
+	g_exec = nil
+	g_graph_launches = 0
+	if cu.gapi.ready && g_stream != nil {
+		cu.gapi.stream_destroy(g_stream)
+	}
+	g_stream = nil
+	if cu.gapi.ready {
+		for i in 0 ..< PROF_MAX {
+			if g_prof_ev[i] != nil {
+				cu.gapi.event_destroy(g_prof_ev[i])
+				g_prof_ev[i] = nil
+			}
+		}
+	}
+	g_prof_ready = false
+	g_prof_n = 0
 	delete(h_logits); h_logits = nil
 	delete(h_embed); h_embed = nil
 	delete(h_wt); h_wt = nil
@@ -911,14 +1086,32 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		g_tc_mode = -1
 	}
 	gemv_env := os.get_env("ODINFER_CUDA_GEMV", context.temp_allocator)
-	g_gemv_new = gemv_env != "old" && gemv_env != "0"
+	g_gemv_force = 1
+	g_gemv_new = true
+	if gemv_env == "old" || gemv_env == "0" {
+		g_gemv_new = false
+		g_gemv_force = 0
+	} else if gemv_env == "new" {
+		g_gemv_force = 2
+	}
 	g_gemv_warps = 8
 	if s := os.get_env("ODINFER_CUDA_GEMV_WARPS", context.temp_allocator); s != "" {
 		if v, ok := strconv.parse_int(s); ok && v >= 1 && v <= 16 {
 			g_gemv_warps = int(v)
 		}
 	}
+	g_gemv_rows = 0
+	if s := os.get_env("ODINFER_CUDA_GEMV_ROWS", context.temp_allocator); s != "" {
+		if v, ok := strconv.parse_int(s); ok && (v == 1 || v == 4) {
+			g_gemv_rows = int(v)
+		}
+	}
 	g_count_launches = os.get_env("ODINFER_CUDA_LAUNCHES", context.temp_allocator) == "1"
+	g_profile = os.get_env("ODINFER_CUDA_PROFILE", context.temp_allocator) == "1"
+	g_use_graph = os.get_env("ODINFER_CUDA_GRAPH", context.temp_allocator) != "0"
+	if g_profile {
+		g_use_graph = false
+	}
 	g_launches = 0
 	g_q8_valid = false
 	mem_bytes: c.size_t
@@ -974,7 +1167,8 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		return false
 	}
 	mmap := t.gguf.mmap
-	dp, aerr := cu.alloc(len(mmap))
+	// 64 bytes past the last block so a misaligned Q6 vector load stays in range.
+	dp, aerr := cu.alloc(len(mmap) + 64)
 	if aerr != cu.OK {
 		fmt.eprintf("cuda: weight alloc %d bytes: %s\n", len(mmap), cu.error_string(aerr))
 		cuda_destroy()
@@ -1087,9 +1281,49 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_gemv_new {
-		fmt.eprintfln("cuda: gemv dp4a  warps={}  4 rows/warp  q8 act  (ODINFER_CUDA_GEMV=old for the scalar kernel)", g_gemv_warps)
+		rows_note := "auto (1 row/warp when rows<=8192)"
+		if g_gemv_rows == 1 {
+			rows_note = "1 row/warp"
+		} else if g_gemv_rows == 4 {
+			rows_note = "4 rows/warp"
+		}
+		force_note := ""
+		if g_gemv_force == 2 {
+			force_note = "  small q5_0/q8_0 stay on this kernel"
+		}
+		fmt.eprintfln("cuda: gemv dp4a  warps={}  {}  q8 act{}  (ODINFER_CUDA_GEMV=old for the scalar kernel)", g_gemv_warps, rows_note, force_note)
 	} else {
 		fmt.eprintln("cuda: gemv old (ODINFER_CUDA_GEMV=old)")
+	}
+	if g_use_graph || g_profile {
+		if !cu.load_graph_api() {
+			fmt.eprintln("cuda: driver has no graph/event symbols; graph and profile off")
+			g_use_graph = false
+			g_profile = false
+		}
+	}
+	if g_use_graph {
+		st: rawptr
+		if cu.gapi.stream_create(&st, 0) != cu.OK {
+			fmt.eprintln("cuda: stream create failed; graph off")
+			g_use_graph = false
+		} else {
+			g_stream = st
+			nbytes: c.size_t
+			dptr: cu.Device_Ptr
+			sym := [?]u8{'g', 'd', 'e', 'c', 'o', 'd', 'e', '_', 'p', 'o', 's', 0}
+			if cu.gapi.module_global(&dptr, &nbytes, g_mod, cstring(&sym[0])) != cu.OK || dptr == 0 {
+				fmt.eprintln("cuda: g_decode_pos missing; graph off")
+				g_use_graph = false
+			} else {
+				g_pos_sym = dptr
+			}
+		}
+	}
+	if g_use_graph {
+		fmt.eprintln("cuda: graph on for dense T=1 (ODINFER_CUDA_GRAPH=0 disables it; MoE stays eager)")
+	} else if g_profile {
+		fmt.eprintln("cuda: profile on (graph off while profiling)")
 	}
 	return true
 }
@@ -1136,8 +1370,10 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 		must(do_attn(qrow, kc, vc, xb3, pos))
 		must(launch_gate(xb3, qproj, p.head_dim, p.n_heads))
 	}
-	must(launch_mm(fa.wo, d_xb3, d_xb2, attdim, dim, T))
-	must(launch_residual(d_x, d_xb2, T * dim))
+	if !(T == 1 && try_accum_gemv(fa.wo, d_xb3, d_x, attdim, dim)) {
+		must(launch_mm(fa.wo, d_xb3, d_xb2, attdim, dim, T))
+		must(launch_residual(d_x, d_xb2, T * dim))
+	}
 }
 
 @(private)
@@ -1176,8 +1412,10 @@ cuda_linear :: proc(tr: ^Transformer, l, pos0, T: int) {
 		lout := fp(d_lout, ti * val)
 		must(launch_gated(lout, lout, dev_f32(la.norm_w), fp(d_z, ti * val), p.lin_n_v_heads, p.lin_head_v_dim, eps))
 	}
-	must(launch_mm(la.out, d_lout, d_xb2, val, dim, T))
-	must(launch_residual(d_x, d_xb2, T * dim))
+	if !(T == 1 && try_accum_gemv(la.out, d_lout, d_x, val, dim)) {
+		must(launch_mm(la.out, d_lout, d_xb2, val, dim, T))
+		must(launch_residual(d_x, d_xb2, T * dim))
+	}
 }
 
 @(private)
@@ -1191,8 +1429,10 @@ cuda_mlp :: proc(tr: ^Transformer, l, T: int) {
 	must(launch_mm(lw.w3, d_xb, d_hb2, dim, hid, T))
 	// swiglu(gate, up): result lands in the gate buffer. w1 is gate, w3 is up.
 	must(launch_swiglu(d_hb, d_hb2, T * hid))
-	must(launch_mm(lw.w2, d_hb, d_xb2, hid, dim, T))
-	must(launch_residual(d_x, d_xb2, T * dim))
+	if !(T == 1 && try_accum_gemv(lw.w2, d_hb, d_x, hid, dim)) {
+		must(launch_mm(lw.w2, d_hb, d_xb2, hid, dim, T))
+		must(launch_residual(d_x, d_xb2, T * dim))
+	}
 }
 
 @(private)
@@ -1247,6 +1487,174 @@ cuda_moe_token :: proc(tr: ^Transformer, l, ti: int) {
 }
 
 @(private)
+cuda_forward_body :: proc(tr: ^Transformer, pos0, T: int) {
+	p := &tr.config
+	w := &tr.weights
+	g_q8_valid = false
+	for l in 0 ..< p.n_layers {
+		lw := &w.layers[l]
+		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.attn_norm), T, p.dim, p.rms_eps))
+		switch lw.layer_type {
+		case .Full_Attention:
+			cuda_full(tr, l, pos0, T)
+		case .Linear_Attention:
+			cuda_linear(tr, l, pos0, T)
+		}
+		if p.is_moe {
+			for ti in 0 ..< T {
+				cuda_moe_token(tr, l, ti)
+			}
+		} else {
+			cuda_mlp(tr, l, T)
+		}
+	}
+	last := (T - 1) * p.dim
+	must(launch_rmsnorm(fp(d_x, last), d_xb, dev_f32(w.output_norm), 1, p.dim, p.rms_eps))
+	must(launch_gemv(w.output.kind, wptr(raw_data(w.output.data)), d_xb, d_logits, p.dim, p.vocab_size))
+}
+
+@(private)
+profile_begin :: proc() {
+	if !g_profile || !cu.gapi.ready {
+		return
+	}
+	if !g_prof_ready {
+		for i in 0 ..< PROF_MAX {
+			ev: rawptr
+			if cu.gapi.event_create(&ev, 0) != cu.OK {
+				fmt.eprintln("cuda: event create failed; profile off")
+				g_profile = false
+				return
+			}
+			g_prof_ev[i] = ev
+		}
+		g_prof_ready = true
+	}
+	g_prof_n = 0
+	g_prof_trunc = false
+	if cu.gapi.event_record(g_prof_ev[0], nil) == cu.OK {
+		g_prof_name[0] = ""
+		g_prof_n = 1
+	}
+}
+
+@(private)
+profile_end :: proc(T, pos0: int, t0: time.Tick) {
+	if g_prof_n < 2 {
+		return
+	}
+	cu.gapi.event_sync(g_prof_ev[g_prof_n - 1])
+	wall := time.duration_milliseconds(time.tick_diff(t0, time.tick_now()))
+	for i in 0 ..< len(g_bins) {
+		g_bins[i].count = 0
+		g_bins[i].ms = 0
+		g_bins[i].name = ""
+	}
+	nbin := 0
+	gpu: f64
+	for i in 1 ..< g_prof_n {
+		ms: f32
+		if cu.gapi.event_elapsed(&ms, g_prof_ev[i - 1], g_prof_ev[i]) != cu.OK {
+			continue
+		}
+		gpu += f64(ms)
+		name := g_prof_name[i]
+		slot := -1
+		for b in 0 ..< nbin {
+			if g_bins[b].name == name {
+				slot = b
+				break
+			}
+		}
+		if slot < 0 {
+			if nbin >= len(g_bins) {
+				continue
+			}
+			slot = nbin
+			g_bins[slot].name = name
+			nbin += 1
+		}
+		g_bins[slot].count += 1
+		g_bins[slot].ms += f64(ms)
+	}
+	order := make([]int, nbin, context.temp_allocator)
+	for i in 0 ..< nbin {
+		order[i] = i
+	}
+	for i in 0 ..< nbin {
+		best := i
+		for j in i + 1 ..< nbin {
+			if g_bins[order[j]].ms > g_bins[order[best]].ms {
+				best = j
+			}
+		}
+		order[i], order[best] = order[best], order[i]
+	}
+	fmt.eprintfln("cuda: profile T={} pos={}  wall {:.2f} ms  kernels {:.2f} ms  ({} launches)", T, pos0, wall, gpu, g_prof_n - 1)
+	for i in order {
+		b := g_bins[i]
+		fmt.eprintfln("  {}  count {}  {:.3f} ms", b.name, b.count, b.ms)
+	}
+	if g_prof_trunc {
+		fmt.eprintln("cuda: profile truncated at 8192 events")
+	}
+}
+
+@(private)
+write_decode_pos :: proc(pos: int) -> bool {
+	v := i32(pos)
+	return ck(cu.drv.MemcpyHtoD_v2(g_pos_sym, &v, 4), "decode pos")
+}
+
+// Capture does not run the kernels. On success the caller replays the graph.
+// On failure the stream is left idle and the caller runs the body for real.
+@(private)
+capture_decode_graph :: proc(tr: ^Transformer, pos0: int) -> bool {
+	g_q8_valid = false
+	g_capturing = true
+	g_launch_stream = g_stream
+	if cu.gapi.stream_begin(g_stream, 0) != cu.OK {
+		fmt.eprintln("cuda: graph capture failed to start")
+		g_capturing = false
+		g_launch_stream = nil
+		return false
+	}
+	cuda_forward_body(tr, pos0, 1)
+	g_capturing = false
+	graph: rawptr
+	if cu.gapi.stream_end(g_stream, &graph) != cu.OK {
+		fmt.eprintln("cuda: graph capture failed to end")
+		g_launch_stream = nil
+		g_q8_valid = false
+		return false
+	}
+	logb := make([]u8, 1024, context.temp_allocator)
+	exec: rawptr
+	errnode: rawptr
+	ierr := cu.gapi.graph_instantiate(&exec, graph, &errnode, raw_data(logb), c.size_t(len(logb)))
+	cu.gapi.graph_destroy(graph)
+	if ierr != cu.OK {
+		n := 0
+		for n < len(logb) && logb[n] != 0 {
+			n += 1
+		}
+		if n > 0 {
+			fmt.eprintfln("cuda: graph instantiate: %s", string(logb[:n]))
+		} else {
+			fmt.eprintfln("cuda: graph instantiate failed ({})", ierr)
+		}
+		g_launch_stream = nil
+		g_q8_valid = false
+		return false
+	}
+	g_exec = exec
+	g_graph_ready = true
+	g_graph_launches = g_launches
+	g_launch_stream = nil
+	return true
+}
+
+@(private)
 cuda_forward_chunk :: proc(tr: ^Transformer, tokens: []int, pos0: int) -> []f32 {
 	p := &tr.config
 	w := &tr.weights
@@ -1275,33 +1683,55 @@ cuda_forward_chunk :: proc(tr: ^Transformer, tokens: []int, pos0: int) -> []f32 
 		get_embedding_row(&w.token_embedding, tok, p.dim, h_embed[ti * p.dim:][:p.dim])
 	}
 	must(ck(cu.upload(d_x, raw_data(h_embed), T * p.dim * 4), "embed"))
-	for l in 0 ..< p.n_layers {
-		lw := &w.layers[l]
-		must(launch_rmsnorm(d_x, d_xb, dev_f32(lw.attn_norm), T, p.dim, p.rms_eps))
-		switch lw.layer_type {
-		case .Full_Attention:
-			cuda_full(tr, l, pos0, T)
-		case .Linear_Attention:
-			cuda_linear(tr, l, pos0, T)
+	use_graph := g_use_graph && T == 1 && !p.is_moe && g_stream != nil && g_pos_sym != 0 && cu.gapi.ready
+	replayed := false
+	if use_graph {
+		if !write_decode_pos(pos0) {
+			os.exit(1)
 		}
-		if p.is_moe {
-			for ti in 0 ..< T {
-				cuda_moe_token(tr, l, ti)
+		if !g_graph_ready {
+			if !capture_decode_graph(tr, pos0) {
+				g_use_graph = false
+				fmt.eprintln("cuda: graph disabled; this token runs eager")
+				g_q8_valid = false
+				cuda_forward_body(tr, pos0, T)
+			} else if cu.gapi.graph_launch(g_exec, g_stream) != cu.OK {
+				fmt.eprintln("cuda: graph launch failed")
+				os.exit(1)
+			} else {
+				replayed = true
 			}
+		} else if cu.gapi.graph_launch(g_exec, g_stream) != cu.OK {
+			fmt.eprintln("cuda: graph launch failed")
+			os.exit(1)
 		} else {
-			cuda_mlp(tr, l, T)
+			replayed = true
+		}
+	} else {
+		tprof: time.Tick
+		if g_profile {
+			tprof = time.tick_now()
+			profile_begin()
+		}
+		cuda_forward_body(tr, pos0, T)
+		if g_profile {
+			profile_end(T, pos0, tprof)
 		}
 	}
-	last := (T - 1) * p.dim
-	must(launch_rmsnorm(fp(d_x, last), d_xb, dev_f32(w.output_norm), 1, p.dim, p.rms_eps))
-	must(launch_gemv(w.output.kind, wptr(raw_data(w.output.data)), d_xb, d_logits, p.dim, p.vocab_size))
+	if replayed {
+		must(ck(cu.sync(), "graph sync"))
+	}
 	must(ck(cu.download(raw_data(h_logits), d_logits, p.vocab_size * 4), "logits"))
 	if g_timing {
 		ms := time.duration_milliseconds(time.tick_diff(t0, time.tick_now()))
 		fmt.eprintfln("[timing] cuda_forward T={} pos={} wall={:.2f} ms ({:.2f} ms/tok)", T, pos0, ms, ms / f64(T))
 	}
 	if g_count_launches {
-		fmt.eprintfln("cuda: launches {} this forward (T={} pos={})", g_launches, T, pos0)
+		if replayed {
+			fmt.eprintfln("cuda: graph replay, {} launches captured (T={} pos={})", g_graph_launches, T, pos0)
+		} else {
+			fmt.eprintfln("cuda: launches {} this forward (T={} pos={})", g_launches, T, pos0)
+		}
 	}
 	return h_logits[:p.vocab_size]
 }

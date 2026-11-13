@@ -59,6 +59,30 @@ Driver :: struct {
 	__handle:                   dynlib.Library,
 }
 
+// Optional driver entry points. A missing symbol disables CUDA graphs and
+// the profile timer; the rest of the backend still loads. They are not part
+// of Driver, because load_driver rejects a library that lacks any field.
+Graph_API :: struct {
+	stream_create:     proc "c" (stream: ^rawptr, flags: c.uint) -> Error,
+	stream_destroy:    proc "c" (stream: rawptr) -> Error,
+	stream_begin:      proc "c" (stream: rawptr, mode: c.uint) -> Error,
+	stream_end:        proc "c" (stream: rawptr, graph: ^rawptr) -> Error,
+	graph_destroy:     proc "c" (graph: rawptr) -> Error,
+	graph_instantiate: proc "c" (exec: ^rawptr, graph: rawptr, error_node: ^rawptr, log: rawptr, log_size: c.size_t) -> Error,
+	graph_launch:      proc "c" (exec: rawptr, stream: rawptr) -> Error,
+	graph_exec_destroy: proc "c" (exec: rawptr) -> Error,
+	module_global:     proc "c" (dptr: ^Device_Ptr, bytes: ^c.size_t, mod: Module, name: cstring) -> Error,
+	htod_async:        proc "c" (dst: Device_Ptr, src: rawptr, bytes: c.size_t, stream: rawptr) -> Error,
+	event_create:      proc "c" (event: ^rawptr, flags: c.uint) -> Error,
+	event_destroy:     proc "c" (event: rawptr) -> Error,
+	event_record:      proc "c" (event: rawptr, stream: rawptr) -> Error,
+	event_sync:        proc "c" (event: rawptr) -> Error,
+	event_elapsed:     proc "c" (ms: ^f32, start: rawptr, end: rawptr) -> Error,
+	ready:             bool,
+}
+
+gapi: Graph_API
+
 Nvrtc :: struct {
 	Version:           proc "c" (major, minor: ^c.int) -> Error,
 	GetErrorString:    proc "c" (result: Error) -> cstring,
@@ -509,11 +533,109 @@ module_function :: proc(mod: Module, name: string) -> (fn: Function, err: Error)
 	return
 }
 
-launch :: proc(fn: Function, gx, gy, gz, bx, by, bz: u32, shared: u32, args: []rawptr) -> Error {
+launch :: proc(fn: Function, gx, gy, gz, bx, by, bz: u32, shared: u32, args: []rawptr, stream: rawptr = nil) -> Error {
 	if gx == 0 || bx == 0 {
 		return OK
 	}
-	return drv.LaunchKernel(fn, c.uint(gx), c.uint(gy), c.uint(gz), c.uint(bx), c.uint(by), c.uint(bz), c.uint(shared), nil, raw_data(args), nil)
+	return drv.LaunchKernel(fn, c.uint(gx), c.uint(gy), c.uint(gz), c.uint(bx), c.uint(by), c.uint(bz), c.uint(shared), stream, raw_data(args), nil)
+}
+
+@(private)
+bind_sym :: proc(name: string, $T: typeid) -> (T, bool) {
+	p := dynlib.symbol_address(drv.__handle, name)
+	if p == nil {
+		return nil, false
+	}
+	return cast(T)p, true
+}
+
+// Looks up graph and event symbols on the already-loaded driver. False means
+// the decode path stays eager and ODINFER_CUDA_PROFILE stays off.
+load_graph_api :: proc() -> bool {
+	if gapi.ready {
+		return true
+	}
+	if drv.__handle == nil {
+		return false
+	}
+	ok := true
+	if p, got := bind_sym("cuStreamCreate", type_of(gapi.stream_create)); got {
+		gapi.stream_create = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuStreamDestroy_v2", type_of(gapi.stream_destroy)); got {
+		gapi.stream_destroy = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuStreamBeginCapture", type_of(gapi.stream_begin)); got {
+		gapi.stream_begin = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuStreamEndCapture", type_of(gapi.stream_end)); got {
+		gapi.stream_end = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuGraphDestroy", type_of(gapi.graph_destroy)); got {
+		gapi.graph_destroy = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuGraphInstantiate", type_of(gapi.graph_instantiate)); got {
+		gapi.graph_instantiate = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuGraphLaunch", type_of(gapi.graph_launch)); got {
+		gapi.graph_launch = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuGraphExecDestroy", type_of(gapi.graph_exec_destroy)); got {
+		gapi.graph_exec_destroy = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuModuleGetGlobal_v2", type_of(gapi.module_global)); got {
+		gapi.module_global = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuMemcpyHtoDAsync_v2", type_of(gapi.htod_async)); got {
+		gapi.htod_async = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuEventCreate", type_of(gapi.event_create)); got {
+		gapi.event_create = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuEventDestroy_v2", type_of(gapi.event_destroy)); got {
+		gapi.event_destroy = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuEventRecord", type_of(gapi.event_record)); got {
+		gapi.event_record = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuEventSynchronize", type_of(gapi.event_sync)); got {
+		gapi.event_sync = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuEventElapsedTime", type_of(gapi.event_elapsed)); got {
+		gapi.event_elapsed = p
+	} else {
+		ok = false
+	}
+	gapi.ready = ok
+	return ok
 }
 
 alloc :: proc(nbytes: int) -> (Device_Ptr, Error) {

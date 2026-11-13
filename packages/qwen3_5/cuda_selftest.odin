@@ -293,7 +293,7 @@ run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> boo
 	}
 	ref := cpu_gemv(kind, raw, x, rows, cols)
 	defer delete(ref)
-	dw, e1 := cu.alloc(len(raw))
+	dw, e1 := cu.alloc(len(raw) + 64)
 	dx, e2 := cu.alloc(cols * 4)
 	dy, e3 := cu.alloc(rows * 4)
 	ng := cols / 32
@@ -321,15 +321,16 @@ run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> boo
 	}
 	wb, yy := dw, dy
 	dd := i32(rows)
+	acc := i32(0)
 	warps := 4
 	gx := u32((rows + warps * 4 - 1) / (warps * 4))
 	bx := u32(warps * 32)
 	launched: bool
 	if kind == .Q4_K || kind == .Q5_K {
-		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd}
+		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
 		launched = cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
 	} else {
-		args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd}
+		args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
 		launched = cu.launch(fn, gx, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
 	}
 	if !launched || cu.sync() != cu.OK {
@@ -343,7 +344,71 @@ run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> boo
 	for r in 0 ..< rows {
 		s_note(&st, fmt.tprintf("gemv2 %s row %d", tag, r), got[r], ref[r], atol, rtol)
 	}
-	return s_report(fmt.tprintf("gemv2 %s %dx%d", tag, rows, cols), st, atol, rtol)
+	ok := s_report(fmt.tprintf("gemv2 %s %dx%d", tag, rows, cols), st, atol, rtol)
+	if !ok {
+		return false
+	}
+	if kind == .Q4_K || kind == .Q6_K {
+		rname := "gemv2r1_q4_k"
+		if kind == .Q6_K {
+			rname = "gemv2r1_q6_k"
+		}
+		rfn := s_fn(rname)
+		if rfn == nil {
+			fmt.eprintfln("cuda_selftest: %s missing", rname)
+			return false
+		}
+		gx1 := u32((rows + warps - 1) / warps)
+		acc = 0
+		launched = false
+		if kind == .Q4_K {
+			args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+			launched = cu.launch(rfn, gx1, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
+		} else {
+			args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+			launched = cu.launch(rfn, gx1, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
+		}
+		if !launched || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: %s launch failed", rname)
+			return false
+		}
+		cu.download(raw_data(got), dy, rows * 4)
+		st = {}
+		for r in 0 ..< rows {
+			s_note(&st, fmt.tprintf("%s row %d", rname, r), got[r], ref[r], atol, rtol)
+		}
+		if !s_report(fmt.tprintf("%s %dx%d", rname, rows, cols), st, atol, rtol) {
+			return false
+		}
+		// accumulate=1 adds onto whatever is already in the output.
+		bias := make([]f32, rows)
+		defer delete(bias)
+		for r in 0 ..< rows {
+			bias[r] = 0.25
+		}
+		cu.upload(dy, raw_data(bias), rows * 4)
+		acc = 1
+		if kind == .Q4_K {
+			args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+			launched = cu.launch(rfn, gx1, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
+		} else {
+			args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+			launched = cu.launch(rfn, gx1, 1, 1, bx, 1, 1, 0, args[:]) == cu.OK
+		}
+		if !launched || cu.sync() != cu.OK {
+			fmt.eprintfln("cuda_selftest: %s accumulate launch failed", rname)
+			return false
+		}
+		cu.download(raw_data(got), dy, rows * 4)
+		st = {}
+		for r in 0 ..< rows {
+			s_note(&st, fmt.tprintf("%s accum row %d", rname, r), got[r], ref[r] + 0.25, atol, rtol)
+		}
+		if !s_report(fmt.tprintf("%s accumulate %dx%d", rname, rows, cols), st, atol, rtol) {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -1061,7 +1126,7 @@ gemv_bench_one :: proc(sh: Gemv_Shape, peak: f64) {
 	for i in 0 ..< sh.cols {
 		x[i] = (f32(i % 7) - 3) * 0.02
 	}
-	dw, e1 := cu.alloc(nbytes)
+	dw, e1 := cu.alloc(nbytes + 64)
 	dx, e2 := cu.alloc(sh.cols * 4)
 	dy, e3 := cu.alloc(sh.rows * 4)
 	ng := sh.cols / 32
@@ -1096,18 +1161,41 @@ gemv_bench_one :: proc(sh: Gemv_Shape, peak: f64) {
 	warps := 8
 	gx := u32((sh.rows + warps * 4 - 1) / (warps * 4))
 	bx := u32(warps * 32)
+	acc := i32(0)
 	new_ms: f64
 	if sh.kind == .Q4_K || sh.kind == .Q5_K {
-		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd}
+		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
 		new_ms = gemv_time(nw, args[:], gx, 1, bx, warm, iters)
 	} else {
-		args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd}
+		args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
 		new_ms = gemv_time(nw, args[:], gx, 1, bx, warm, iters)
+	}
+	r1_ms := f64(-1)
+	if sh.kind == .Q4_K || sh.kind == .Q6_K {
+		rname := "gemv2r1_q4_k"
+		if sh.kind == .Q6_K {
+			rname = "gemv2r1_q6_k"
+		}
+		rfn := s_fn(rname)
+		if rfn != nil {
+			gx1 := u32((sh.rows + warps - 1) / warps)
+			if sh.kind == .Q4_K {
+				args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
+				r1_ms = gemv_time(rfn, args[:], gx1, 1, bx, warm, iters)
+			} else {
+				args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+				r1_ms = gemv_time(rfn, args[:], gx1, 1, bx, warm, iters)
+			}
+		}
 	}
 	_, old_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, old_ms)
 	bytes, new_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, new_ms)
 	fmt.eprintfln("  %s %s  %dx%d  %.1f MiB", sh.name, tag, sh.rows, sh.cols, bytes / (1024.0 * 1024.0))
-	fmt.eprintfln("    new  %.3f ms  %.1f GB/s  %.1f%% of peak", new_ms, new_gbs, new_gbs / peak * 100)
+	fmt.eprintfln("    r4   %.3f ms  %.1f GB/s  %.1f%% of peak", new_ms, new_gbs, new_gbs / peak * 100)
+	if r1_ms > 0 {
+		_, r1_gbs := gemv_gbs(sh.kind, sh.rows, sh.cols, r1_ms)
+		fmt.eprintfln("    r1   %.3f ms  %.1f GB/s  %.1f%% of peak", r1_ms, r1_gbs, r1_gbs / peak * 100)
+	}
 	fmt.eprintfln("    old  %.3f ms  %.1f GB/s  %.1f%% of peak", old_ms, old_gbs, old_gbs / peak * 100)
 }
 

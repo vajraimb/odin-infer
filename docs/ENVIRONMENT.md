@@ -46,9 +46,12 @@ you isolate per-stage GPU time. Never enable in production.
 | `NVRTC_DIR` | unset | Directory or soname path searched first when `ODINFER_NVRTC_PATH` is unset. For sm_70 a 13.x library there is skipped and the search continues to pip `libnvrtc.so.12` and the loader. |
 | `CUDA_DEVICE` | `0` | Device ordinal. |
 | `ODINFER_CUDA_TC` | auto | Prefill GEMM. Unset: Volta WMMA when `T≥16`. `1`: WMMA for every `T>1`. `0`: MMQ. Decode (`T==1`) stays GEMV. |
-| `ODINFER_CUDA_GEMV` | new | Decode GEMV. Unset: dp4a bandwidth kernel (Q4_K, Q5_K, Q6_K, Q8_0, Q5_0). `old` or `0`: scalar one-warp-per-row kernel. |
+| `ODINFER_CUDA_GEMV` | auto | Decode GEMV. Unset: dp4a bandwidth kernel; Q5_0 and Q8_0 under 16 MiB stay on the scalar kernel. `new`: bandwidth kernel for those small shapes too. `old` or `0`: scalar GEMV for everything. |
+| `ODINFER_CUDA_GEMV_ROWS` | auto | Q4_K / Q6_K rows per warp. Unset: 1 when `rows≤8192`, else 4. `1` or `4` forces it. |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
-| `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. |
+| `ODINFER_CUDA_GRAPH` | on | Dense `T==1` decode is one CUDA graph. `=0` runs eager. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
+| `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). |
+| `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. A graph replay prints the captured count. |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | HBM peak for `cuda_kernel_test --bench-gemv` (percent of peak). |
 | `QTIMING` | off | `=1` prints per-chunk CUDA wall time on stderr. |
 | `KV_Q8` / `KV_V` | Q8 K + mixed V | Same switches as Metal. The on-disk KV snapshot format is shared. |

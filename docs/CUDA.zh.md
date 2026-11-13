@@ -5,8 +5,10 @@
 Qwen3.5 引擎的 Linux x86_64 后端。目标是 **sm_70 及以上**（按 Tesla V100S、
 计算能力 7.0、驱动 CUDA 13.0 来写）。累加是 fp32，没有 bf16。预填充 GEMM
 （`T>1`）可以用 Volta tensor core（WMMA 16×16×16，fp16 乘、fp32 累加）。
-解码（`T==1`）走带宽 GEMV：128 位加载、每个 warp 四行、`dp4a`，激活每条向量
-只量化成 q8 一次。`ODINFER_CUDA_GEMV=old` 回到原来的一行一个 warp。
+解码（`T==1`）走带宽 GEMV：128 位加载、`dp4a`，激活每条向量只量化成 q8
+一次。短的 Q4_K / Q6_K 每个 warp 一行，更高的矩阵仍是四行。
+`ODINFER_CUDA_GEMV=old` 回到标量内核。稠密解码默认是一张 CUDA graph，
+`ODINFER_CUDA_GRAPH=0` 关掉。
 
 macOS 构建不变，默认仍是 Metal。同一个二进制不会同时带上两条热路径。
 
@@ -113,10 +115,22 @@ ODINFER_CUDA_TC=1 bin/cuda_smoke "$MODEL" 8 2048
 ## 解码 GEMV
 
 `T==1` 是访存 GEMV。标量内核（一行一个 warp、按字节加载）留在
-`ODINFER_CUDA_GEMV=old`。默认内核每个 warp 算四行，每行 8 个线程，每个线程
-一次 `ld.global.v4`，一行的量化数据是一次 128 字节的合并读。点积是
-`dp4a.s32.s32`。Q6_K 和 Q8_0 / Q5_0 的块不是 16 字节对齐的，加载前会看地址，
-sm_70 上不会发出未对齐的 `v4`。
+`ODINFER_CUDA_GEMV=old`。带宽内核有两种形状。四行一个 warp、每行 8 个线程，
+用于高矩阵（FFN up、27B 的 Q、logits）。这 8 个线程各发一次 `ld.global.v4`，
+一行的量化数据是一次 128 字节的合并读，点积是 `dp4a.s32.s32`。Q6_K 的块是
+210 字节，16 字节加载是两个对齐窗口的移位；权重分配多留 64 字节，sm_70 上
+不会发出未对齐的 `v4`。Q6 用 `vsub4` 拆码，scale 不再进 local memory。
+
+8192 行及以下用一行一个 warp（注意力输出、FFN down、9B 的 Q）。4096 行配
+四行一个 warp 只有 1024 个 warp，V100S 上大约每个 SM 13 个，所以这些形状
+只有 1134 GB/s 的大约 20%。一行一个 warp 是 4096 个 warp。总 warp 数是
+`rows / rows_per_warp`，改每块的 warp 数并不改变它，所以没有加 split-K。
+再发一次 kernel 填不满更多 SM，融合的 split 还要原子加。
+`ODINFER_CUDA_GEMV_ROWS=1` 或 `=4` 强制 Q4_K / Q6_K 的形状。
+
+16 MiB 以下的 Q8_0 和 Q5_0 留在标量内核。2048×2048 上新内核更慢（Q8_0
+118.5 对 121.8 GB/s，Q5_0 49.2 对 69.7）。9B 和 27B 的热权重是 Q4_K 和
+Q6_K，不走这条。`ODINFER_CUDA_GEMV=new` 让这些小形状也用新内核。
 
 激活按 32 个一组量化成 q8（有符号 int8，scale 是 `amax/127`），每条向量一次。
 Q4_K 和 Q5_K 另外记下每 16 个 float 的精确和，`dmin` 那一项不量化。单行
@@ -124,20 +138,28 @@ RMSNorm 在同一个内核里写出这份 q8；Q、K、V 和两路 FFN up 共用
 和多行 norm 会使缓存失效。没有带宽内核的种类（F32、Q2_K、Q3_K、Q8_K、
 Q4_0 这一族）仍走标量 GEMV。K 不是量化块的整数倍时也走标量。
 
-块大小是 `ODINFER_CUDA_GEMV_WARPS` 个 warp（默认 8，范围 1..16）。8 个 warp
-是 256 个线程、每块 32 行。V100S 有 80 个 SM、每个 SM 64 个 warp 槽，32
-线程的块填不满。
+块大小是 `ODINFER_CUDA_GEMV_WARPS` 个 warp（默认 8，范围 1..16）。四行时
+每块 32 行；一行时每块的每个 warp 一行。V100S 有 80 个 SM、每个 SM 64 个
+warp 槽。
+
+稠密 `T==1` 时，注意力输出、FFN down 和线性层输出的 GEMV 直接加进残差，
+这一步不再单独发 residual。预填充（`T>1`）和标量回退仍用单独的加。logits
+的 GEMV 不累加。
 
 | 变量 | 默认 | 作用 |
 |------|------|------|
-| `ODINFER_CUDA_GEMV` | new | `old` 或 `0` 用标量 GEMV |
+| `ODINFER_CUDA_GEMV` | auto | `old` 或 `0`：标量 GEMV。`new`：小 Q5_0 / Q8_0 也用带宽内核。不设：带宽内核，但 16 MiB 以下的 Q5_0 / Q8_0 用标量 |
+| `ODINFER_CUDA_GEMV_ROWS` | auto | Q4_K / Q6_K 每个 warp 的行数。不设：`rows≤8192` 用 1，否则 4。`1` 或 `4` 强制 |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | 带宽 GEMV 每块的 warp 数（1..16） |
 | `ODINFER_CUDA_LAUNCHES` | 关 | `=1` 时每次 forward 打印内核启动次数 |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | `--bench-gemv` 用来算峰值百分比 |
+| `ODINFER_CUDA_GRAPH` | 开 | 稠密 `T==1` 是一张 CUDA graph。`=0` 每次都即时启动。MoE 和预填充仍即时。`ODINFER_CUDA_PROFILE=1` 会关掉 graph |
+| `ODINFER_CUDA_PROFILE` | 关 | `=1` 打印这次 forward 每个内核的 GPU 时间，最慢的在前 |
 
-`cuda_selftest` 用 CPU fp32 点积对 Q4_K、Q6_K、Q8_0、Q5_0、Q5_K 做 64×512
-和 6×256（行数不是 4 的倍数）。容差是 `1 + 0.05*|ref|`。和 CPU 的差来自
-`x` 的 q8；半字节或 scale 对调会差到 `|ref|` 这一量级。
+`cuda_selftest` 用 CPU fp32 点积对四行内核做 Q4_K、Q6_K、Q8_0、Q5_0、Q5_K
+的 64×512 和 6×256（行数不是 4 的倍数）。Q4_K 和 Q6_K 再跑一行内核，包括
+`accumulate=1`（输出先写成 0.25，期望 `ref+0.25`）。容差是 `1 + 0.05*|ref|`。
+和 CPU 的差来自 `x` 的 q8；半字节或 scale 对调会差到 `|ref|` 这一量级。
 
 ```sh
 bin/cuda_kernel_test
@@ -146,8 +168,9 @@ ODINFER_CUDA_GEMV_WARPS=4 bin/cuda_kernel_test --bench-gemv
 ```
 
 `--bench` 先打 tensor core 的 TFLOPS，再打同一张 GEMV 表。`--bench-gemv`
-只打 GEMV：毫秒、GB/s、占峰值的百分比，旧内核对比新内核，形状是 `T=1` 的
-9B / 27B（w1、wq、wo、w2、logits）以及 2048 的 Q8_0 / Q5_0 和 5120 的 Q5_K。
+只打 GEMV：毫秒、GB/s、占峰值的百分比。四行内核是 `r4`，有一行内核的形状再打
+`r1`，标量内核是 `old`。形状是 `T=1` 的 9B / 27B（w1、wq、wo、w2、logits）
+以及 2048 的 Q8_0 / Q5_0 和 5120 的 Q5_K。
 GB/s 只算这一次启动读的权重字节。`x` 的 q8 在计时循环外面，和缓存命中一样。
 两行 logits 大约 1 GB，分配失败会打印并继续其余形状。设备不是 V100S 时用
 `ODINFER_CUDA_PEAK_GBS` 改峰值。
@@ -164,12 +187,17 @@ bin/cuda_smoke "$MODEL27B" 16 2048
 ODINFER_CUDA_LAUNCHES=1 bin/cuda_smoke "$MODEL9B" 8 2048
 ```
 
-初始化日志是 `gemv dp4a  warps=8` 或 `gemv old`。
+初始化日志会写 GEMV 的行策略，以及 `graph on for dense T=1` 或 `gemv old`。
 
-没有用 CUDA graph。稠密 27B 一个 token 大约一千次启动，每次几微秒，一共
-几毫秒。15.8 GB 的 Q4_K_M 测到 5.28 tok/s，大约 190 ms，几乎全是权重流，
-大约是 1134 GB/s 的 7%。驱动绑定里没有 graph API。`ODINFER_CUDA_LAUNCHES=1`
-是给 V100 上核对这个次数的。几千 token 的 KV 注意力搬不了这么多字节。
+稠密解码（`T==1`，不是 MoE）捕获一次 CUDA graph，之后重放。捕获本身不跑
+内核；第一个 token 付出捕获的代价，然后启动这张图。token 位置是设备符号
+`g_decode_pos`，每次重放前写入，因为内核参数会在捕获时被写死。预填充传入
+真实位置，并且保持即时启动，所以 graph 改不了 `T>1` 的结果。捕获或实例化
+失败时，这个 token 改走即时路径，之后也不再捕获。`ODINFER_CUDA_GRAPH=0`
+就是即时路径。`ODINFER_CUDA_PROFILE=1` 关掉 graph，并按从慢到快打印每个
+内核的 GPU 时间（名字、次数、毫秒），以及墙钟和内核时间之和。采样仍在
+CPU 上，在 logits 拷回之后。graph 和 event 符号是单独查找的；驱动里没有
+它们时，graph 和 profiler 关掉，GEMV 照常加载。
 
 ## 检查脚本
 
@@ -253,7 +281,7 @@ delta，RMSNormGated，MoE softmax top-k、逐专家 GEMV，以及可选的共�
 IQ1_S、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_NL、IQ4_XS、Q8_1。
 
 也不在这个后端里：Metal 按形状特化的 GEMV（`QGEMVSPEC`）、宽 N 自动调优和
-tune 缓存、fast-math、MoE 分组 GEMM（`forward_gpu_batch_moe`）、CUDA graph、
+tune 缓存、fast-math、MoE 分组 GEMM（`forward_gpu_batch_moe`）、
 `engine_verify_batch`（投机校验）。CUDA 的单行 RMSNorm 会写下一次 GEMV 读的
 q8 缓存。MoE 预填的注意力投影走 MMQ，专家走逐 token GEMV。稠密预填按
 `CUDA_MAX_BATCH`（128，激活缓冲分配失败时更小）分块。解码用 GEMV，不用 MMQ。

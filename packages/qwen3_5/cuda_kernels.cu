@@ -1,8 +1,10 @@
 /* Qwen3.5 CUDA kernels. sm_70+ (Tesla V100). fp32 accumulate. No bf16, no
    cp.async, no ldmatrix (that is sm_75). Prefill GEMM (T>1) can use Volta
-   WMMA 16x16x16. Decode GEMV (T==1) has a bandwidth path: 128-bit loads,
-   several rows per warp, dp4a against an activation quantized to q8.
-   The original one-warp GEMV stays compiled for ODINFER_CUDA_GEMV=old.
+   WMMA 16x16x16. Decode GEMV (T==1) has a bandwidth path: 128-bit loads, dp4a against an
+   activation quantized to q8. Tall matrices use four rows per warp; short
+   ones use gemv2r1_* (one row per warp). The original one-warp GEMV stays
+   compiled for ODINFER_CUDA_GEMV=old. g_decode_pos is the token index when
+   a kernel is launched with pos=-1 (CUDA graph replay).
    NVRTC does not ship mma.h or cuda_fp16.h, so WMMA and dp4a are inline
    PTX. NVRTC is given --gpu-architecture=compute_XX (CUDA 13 NVRTC
    defaults to sm_75 and will not JIT on sm_70).
@@ -15,6 +17,14 @@
    wheel (nvidia-cuda-nvrtc) does not ship that header, and CUDA 12.9's
    libnvrtc-builtins does not register it as a builtin include. Round-to-
    nearest-even matches CUDA __float2half and Odin's f16 cast. */
+
+/* Engine decode stores the token position here and passes pos=-1 so a CUDA
+   graph can replay every token. A non-negative argument is the position. */
+__device__ int g_decode_pos;
+
+__device__ __forceinline__ int live_pos(int pos) {
+    return pos >= 0 ? pos : g_decode_pos;
+}
 
 __device__ __forceinline__ float ld_f16(const unsigned char* p) {
     unsigned short u = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
@@ -546,7 +556,7 @@ extern "C" __global__ void rope_partial(float* vec, int head_dim, int pos, float
     int i = gid - h * half;
     float* q = vec + (size_t)h * (size_t)head_dim;
     float freq = 1.f / powf(rope_freq, (float)i / (float)half);
-    float ang = (float)pos * freq;
+    float ang = (float)live_pos(pos) * freq;
     float c = cosf(ang), s = sinf(ang);
     float x0 = q[i], y0 = q[i + half];
     q[i] = x0 * c - y0 * s;
@@ -589,7 +599,7 @@ extern "C" __global__ void store_kv_f16(const float* k, const float* v, unsigned
     if (gid >= n) return;
     int kvh = gid / head_dim;
     int i = gid - kvh * head_dim;
-    size_t dst = (((size_t)kvh * (size_t)seq_len + (size_t)pos) * (size_t)head_dim + (size_t)i) * 2;
+    size_t dst = (((size_t)kvh * (size_t)seq_len + (size_t)live_pos(pos)) * (size_t)head_dim + (size_t)i) * 2;
     st_f16(kc + dst, k[gid]);
     st_f16(vc + dst, v[gid]);
 }
@@ -603,7 +613,7 @@ extern "C" __global__ void attention_f16(const float* q, const unsigned char* kc
     const unsigned char* kbase = kc + (size_t)kvh * (size_t)seq_len * (size_t)head_dim * 2;
     const unsigned char* vbase = vc + (size_t)kvh * (size_t)seq_len * (size_t)head_dim * 2;
     float scale = rsqrtf((float)head_dim);
-    int npos = pos + 1;
+    int npos = live_pos(pos) + 1;
     float* sc = scores + (size_t)h * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kk = kbase + (size_t)t * (size_t)head_dim * 2;
@@ -647,8 +657,9 @@ extern "C" __global__ void store_kv_q8(const float* k, const float* v, unsigned 
     float kd = kamax / 127.f, vd = vamax / 127.f;
     float kid = kd != 0.f ? 1.f / kd : 0.f;
     float vid = vd != 0.f ? 1.f / vd : 0.f;
-    unsigned char* kb = kc + (size_t)pos * (size_t)pos_bytes + (size_t)gid * 34;
-    unsigned char* vb = vc + (size_t)pos * (size_t)pos_bytes + (size_t)gid * 34;
+    int pslot = live_pos(pos);
+    unsigned char* kb = kc + (size_t)pslot * (size_t)pos_bytes + (size_t)gid * 34;
+    unsigned char* vb = vc + (size_t)pslot * (size_t)pos_bytes + (size_t)gid * 34;
     st_f16(kb, kd);
     st_f16(vb, vd);
     for (int j = 0; j < 32; ++j) {
@@ -666,7 +677,7 @@ extern "C" __global__ void attention_q8(const float* q, const unsigned char* kc,
     int hb = kvh * nb;
     const float* qh = q + (size_t)h * (size_t)head_dim;
     float scale = rsqrtf((float)head_dim);
-    int npos = pos + 1;
+    int npos = live_pos(pos) + 1;
     float* sc = scores + (size_t)h * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kb = kc + (size_t)t * (size_t)pos_bytes + (size_t)hb * 34;
@@ -714,7 +725,8 @@ extern "C" __global__ void store_kv_q8v(const float* k, const float* v, unsigned
     for (int j = 0; j < 32; ++j) kamax = fmaxf(kamax, fabsf(k32[j]));
     float kd = kamax / 127.f;
     float kid = kd != 0.f ? 1.f / kd : 0.f;
-    unsigned char* kb = kc + (size_t)pos * (size_t)k_pos_bytes + (size_t)gid * 34;
+    int pslot = live_pos(pos);
+    unsigned char* kb = kc + (size_t)pslot * (size_t)k_pos_bytes + (size_t)gid * 34;
     st_f16(kb, kd);
     for (int j = 0; j < 32; ++j) kb[2 + j] = (unsigned char)(signed char)(int)roundf(k32[j] * kid);
 
@@ -728,7 +740,7 @@ extern "C" __global__ void store_kv_q8v(const float* k, const float* v, unsigned
     for (int j = 0; j < 32; ++j) if (j != jmax) amax2 = fmaxf(amax2, fabsf(v32[j]));
     float vd = amax2 / 127.f;
     float vid = vd != 0.f ? 1.f / vd : 0.f;
-    unsigned char* vb = vc + (size_t)pos * (size_t)v_pos_bytes + (size_t)gid * 40;
+    unsigned char* vb = vc + (size_t)pslot * (size_t)v_pos_bytes + (size_t)gid * 40;
     for (int j = 0; j < 40; ++j) vb[j] = 0;
     st_f16(vb, vd);
     vb[2] = (unsigned char)jmax;
@@ -747,7 +759,7 @@ extern "C" __global__ void attention_q8v(const float* q, const unsigned char* kc
     int hb = kvh * nb;
     const float* qh = q + (size_t)h * (size_t)head_dim;
     float scale = rsqrtf((float)head_dim);
-    int npos = pos + 1;
+    int npos = live_pos(pos) + 1;
     float* sc = scores + (size_t)h * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kb = kc + (size_t)t * (size_t)k_pos_bytes + (size_t)hb * 34;
@@ -1294,6 +1306,88 @@ __device__ __forceinline__ uint4 ld_u4_any(const unsigned char* p) {
     return v;
 }
 
+/* 16 bytes at p, using only aligned ld.global.v4. Misaligned p (Q6 blocks are
+   210 bytes) is a 2-byte shift of two aligned windows. The caller must pad the
+   allocation by 32 bytes so the second window stays in range. */
+__device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p) {
+    unsigned long long a = (unsigned long long)p;
+    unsigned mis = (unsigned)(a & 15ull);
+    if (mis == 0u) return *(const uint4*)p;
+    const uint4* base = (const uint4*)(a & ~15ull);
+    uint4 lo = base[0];
+    uint4 hi = base[1];
+    unsigned long long L0 = (unsigned long long)lo.x | ((unsigned long long)lo.y << 32);
+    unsigned long long L1 = (unsigned long long)lo.z | ((unsigned long long)lo.w << 32);
+    unsigned long long H0 = (unsigned long long)hi.x | ((unsigned long long)hi.y << 32);
+    unsigned long long H1 = (unsigned long long)hi.z | ((unsigned long long)hi.w << 32);
+    unsigned long long A, B;
+    if (mis < 8u) {
+        unsigned sh = mis * 8u;
+        A = (L0 >> sh) | (L1 << (64u - sh));
+        B = (L1 >> sh) | (H0 << (64u - sh));
+    } else if (mis == 8u) {
+        A = L1;
+        B = H0;
+    } else {
+        unsigned sh = (mis - 8u) * 8u;
+        A = (L1 >> sh) | (H0 << (64u - sh));
+        B = (H0 >> sh) | (H1 << (64u - sh));
+    }
+    uint4 o;
+    o.x = (unsigned)A;
+    o.y = (unsigned)(A >> 32);
+    o.z = (unsigned)B;
+    o.w = (unsigned)(B >> 32);
+    return o;
+}
+
+__device__ __forceinline__ int vsub4_bias32(int a) {
+    int d;
+    asm("vsub4.s32.s32.s32 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(0x20202020));
+    return d;
+}
+
+/* Four Q6 codes from one ql word and the matching qh word. hi_pair 0 is
+   q1/q3 (qh bits 0 and 4); hi_pair 1 is q2/q4 (qh bits 2 and 6). */
+__device__ __forceinline__ void q6_pack(unsigned ql, unsigned qh, int hi_pair, int* qa, int* qb) {
+    unsigned lo = ql & 0x0f0f0f0fu;
+    unsigned hi = (ql >> 4) & 0x0f0f0f0fu;
+    unsigned hs = hi_pair ? 2u : 0u;
+    unsigned hb = hi_pair ? 6u : 4u;
+    *qa = vsub4_bias32((int)(lo | (((qh >> hs) & 0x03030303u) << 4)));
+    *qb = vsub4_bias32((int)(hi | (((qh >> hb) & 0x03030303u) << 4)));
+}
+
+__device__ __forceinline__ unsigned hdr_scale_byte(uint4 hdr, int i) {
+    unsigned w = (i < 4) ? hdr.y : (i < 8) ? hdr.z : hdr.w;
+    return (w >> ((i & 3) * 8)) & 0xffu;
+}
+
+__device__ __forceinline__ void scale_min_hdr(int j, uint4 hdr, int* sc, int* m) {
+    if (j < 4) {
+        *sc = (int)(hdr_scale_byte(hdr, j) & 63u);
+        *m = (int)(hdr_scale_byte(hdr, j + 4) & 63u);
+    } else {
+        unsigned qj4 = hdr_scale_byte(hdr, j + 4);
+        unsigned qjm = hdr_scale_byte(hdr, j - 4);
+        unsigned qj = hdr_scale_byte(hdr, j);
+        *sc = (int)((qj4 & 0xFu) | ((qjm >> 6) << 4));
+        *m = (int)((qj4 >> 4) | ((qj >> 6) << 4));
+    }
+}
+
+__device__ __forceinline__ int scv_i8(uint4 scv, int idx) {
+    unsigned w = idx < 4 ? scv.x : idx < 8 ? scv.y : idx < 12 ? scv.z : scv.w;
+    return (int)(signed char)((w >> ((idx & 3) * 8)) & 0xffu);
+}
+
+__device__ __forceinline__ void store_row(float* out, int row, int d, int writer, float acc, int accumulate) {
+    if (writer && row < d) {
+        if (accumulate) out[row] += acc;
+        else out[row] = acc;
+    }
+}
+
 __device__ __forceinline__ int dot_nib(uint4 q, uint4 x, int hi) {
     unsigned qw[4] = {q.x, q.y, q.z, q.w};
     unsigned xw[4] = {x.x, x.y, x.z, x.w};
@@ -1311,17 +1405,6 @@ __device__ __forceinline__ float f16_bits(unsigned bits) {
     p[0] = (unsigned char)(bits & 0xff);
     p[1] = (unsigned char)((bits >> 8) & 0xff);
     return ld_f16(p);
-}
-
-__device__ __forceinline__ void scales_from_hdr(uint4 hdr, unsigned char* sc) {
-    unsigned w[3] = {hdr.y, hdr.z, hdr.w};
-#pragma unroll
-    for (int i = 0; i < 3; ++i) {
-        sc[i * 4 + 0] = (unsigned char)(w[i] & 0xff);
-        sc[i * 4 + 1] = (unsigned char)((w[i] >> 8) & 0xff);
-        sc[i * 4 + 2] = (unsigned char)((w[i] >> 16) & 0xff);
-        sc[i * 4 + 3] = (unsigned char)((w[i] >> 24) & 0xff);
-    }
 }
 
 __device__ __forceinline__ uint4 shfl_u4(uint4 v, int src) {
@@ -1407,7 +1490,7 @@ extern "C" __global__ void rmsnorm_quant_q8(const float* inp, float* out, const 
 }
 
 extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
-                                      float* out, int n, int d) {
+                                      float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
     int sub = lane >> 3;
@@ -1430,11 +1513,9 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
         if (row < d) {
             float dW = f16_bits(hdr.x & 0xffff);
             float dmin = f16_bits(hdr.x >> 16);
-            unsigned char scb[12];
-            scales_from_hdr(hdr, scb);
             int sc0, m0, sc1, m1;
-            scale_min_k4(p * 2, scb, &sc0, &m0);
-            scale_min_k4(p * 2 + 1, scb, &sc1, &m1);
+            scale_min_hdr(p * 2, hdr, &sc0, &m0);
+            scale_min_hdr(p * 2 + 1, hdr, &sc1, &m1);
             int group = b * 8 + p * 2;
             int off = half * 16;
             uint4 xlo = *(const uint4*)(xq + (size_t)group * 32 + off);
@@ -1450,11 +1531,11 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
         }
     }
     acc = warp8_sum(acc);
-    if (t == 0 && row < d) out[row] = acc;
+    store_row(out, row, d, t == 0, acc, accumulate);
 }
 
 extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char* xq, const float* xd,
-                                      float* out, int n, int d) {
+                                      float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
     int sub = lane >> 3;
@@ -1473,10 +1554,10 @@ extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char
         float dW = 0.f;
         if (row < d) {
             const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 210;
-            ql = ld_u4_any(blk + t * 16);
-            qh = ld_u4_any(blk + 128 + half * 32 + l0);
+            ql = ld_u4_aligned(blk + t * 16);
+            qh = ld_u4_aligned(blk + 128 + half * 32 + l0);
             if (t == 0) {
-                scv = ld_u4_any(blk + 192);
+                scv = ld_u4_aligned(blk + 192);
                 dW = ld_f16(blk + 208);
             }
         }
@@ -1484,21 +1565,12 @@ extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char
         scv = shfl_u4(scv, src);
         dW = __shfl_sync(0xffffffff, dW, src);
         if (row < d) {
-            unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
-            signed char scb[16];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                scb[i * 4 + 0] = (signed char)(scw[i] & 0xff);
-                scb[i * 4 + 1] = (signed char)((scw[i] >> 8) & 0xff);
-                scb[i * 4 + 2] = (signed char)((scw[i] >> 16) & 0xff);
-                scb[i * 4 + 3] = (signed char)((scw[i] >> 24) & 0xff);
-            }
             int scoff = half * 8;
             int is = l0 >> 4;
             int s_a = scoff + is + (hi_pair ? 2 : 0);
             int s_b = scoff + is + (hi_pair ? 6 : 4);
-            float sa = dW * (float)scb[s_a];
-            float sb = dW * (float)scb[s_b];
+            float sa = dW * (float)scv_i8(scv, s_a);
+            float sb = dW * (float)scv_i8(scv, s_b);
             int group0 = b * 8 + half * 4 + (hi_pair ? 1 : 0);
             int off = l0;
             uint4 xa = *(const uint4*)(xq + (size_t)group0 * 32 + off);
@@ -1508,37 +1580,23 @@ extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char
             unsigned aw[4] = {xa.x, xa.y, xa.z, xa.w};
             unsigned bw[4] = {xb.x, xb.y, xb.z, xb.w};
             int dot_a = 0, dot_b = 0;
-            int hshift_a = hi_pair ? 2 : 0;
-            int hshift_b = hi_pair ? 6 : 4;
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                int pa = 0, pb = 0;
-#pragma unroll
-                for (int k = 0; k < 4; ++k) {
-                    unsigned byte = (qw[i] >> (8 * k)) & 0xff;
-                    unsigned hb = (hw[i] >> (8 * k)) & 0xff;
-                    /* Low nibble is q1 (hi_pair 0) or q2 (hi_pair 1).
-                       High nibble is q3 or q4. hshift selects the matching qh bits. */
-                    int nib_a = (int)(byte & 0xf);
-                    int nib_b = (int)(byte >> 4);
-                    int qa = (nib_a | (int)(((hb >> hshift_a) & 3) << 4)) - 32;
-                    int qb = (nib_b | (int)(((hb >> hshift_b) & 3) << 4)) - 32;
-                    pa |= (qa & 0xff) << (8 * k);
-                    pb |= (qb & 0xff) << (8 * k);
-                }
-                dot_a = dp4a_s32(pa, (int)aw[i], dot_a);
-                dot_b = dp4a_s32(pb, (int)bw[i], dot_b);
+                int qa, qb;
+                q6_pack(qw[i], hw[i], hi_pair, &qa, &qb);
+                dot_a = dp4a_s32(qa, (int)aw[i], dot_a);
+                dot_b = dp4a_s32(qb, (int)bw[i], dot_b);
             }
             acc += sa * xd[group0] * (float)dot_a;
             acc += sb * xd[group0 + 2] * (float)dot_b;
         }
     }
     acc = warp8_sum(acc);
-    if (t == 0 && row < d) out[row] = acc;
+    store_row(out, row, d, t == 0, acc, accumulate);
 }
 
 extern "C" __global__ void gemv2_q5_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
-                                      float* out, int n, int d) {
+                                      float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
     int sub = lane >> 3;
@@ -1563,11 +1621,9 @@ extern "C" __global__ void gemv2_q5_k(const unsigned char* wb, const signed char
         if (row < d) {
             float dW = f16_bits(hdr.x & 0xffff);
             float dmin = f16_bits(hdr.x >> 16);
-            unsigned char scb[12];
-            scales_from_hdr(hdr, scb);
             int sc0, m0, sc1, m1;
-            scale_min_k4(p * 2, scb, &sc0, &m0);
-            scale_min_k4(p * 2 + 1, scb, &sc1, &m1);
+            scale_min_hdr(p * 2, hdr, &sc0, &m0);
+            scale_min_hdr(p * 2 + 1, hdr, &sc1, &m1);
             unsigned bit_lo = 1u << (2 * p);
             unsigned bit_hi = bit_lo << 1;
             int group = b * 8 + p * 2;
@@ -1603,11 +1659,11 @@ extern "C" __global__ void gemv2_q5_k(const unsigned char* wb, const signed char
         }
     }
     acc = warp8_sum(acc);
-    if (t == 0 && row < d) out[row] = acc;
+    store_row(out, row, d, t == 0, acc, accumulate);
 }
 
 extern "C" __global__ void gemv2_q8_0(const unsigned char* wb, const signed char* xq, const float* xd,
-                                      float* out, int n, int d) {
+                                      float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
     int sub = lane >> 3;
@@ -1626,11 +1682,11 @@ extern "C" __global__ void gemv2_q8_0(const unsigned char* wb, const signed char
         }
     }
     acc = warp8_sum(acc);
-    if (t == 0 && row < d) out[row] = acc;
+    store_row(out, row, d, t == 0, acc, accumulate);
 }
 
 extern "C" __global__ void gemv2_q5_0(const unsigned char* wb, const signed char* xq, const float* xd,
-                                      float* out, int n, int d) {
+                                      float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
     int sub = lane >> 3;
@@ -1670,5 +1726,96 @@ extern "C" __global__ void gemv2_q5_0(const unsigned char* wb, const signed char
         }
     }
     acc = warp8_sum(acc);
-    if (t == 0 && row < d) out[row] = acc;
+    store_row(out, row, d, t == 0, acc, accumulate);
+}
+
+/* One output row per warp. Used when the matrix is short (wo, w2, 9B wq):
+   four rows per warp leaves the V100 under-occupied. One lane owns one
+   element of each 32-wide group, so the loads are coalesced. The Q4 min
+   term is the full 32-element sum and is subtracted once, on lane 0. */
+extern "C" __global__ void gemv2r1_q4_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,
+                                        float* out, int n, int d, int accumulate) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int row = (int)blockIdx.x * ((int)blockDim.x >> 5) + warp;
+    int nb = n >> 8;
+    float acc = 0.f;
+    if (row < d) {
+        for (int b = 0; b < nb; ++b) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 144;
+            uint4 hdr = make_uint4(0, 0, 0, 0);
+            if (lane == 0) hdr = *(const uint4*)blk;
+            hdr = shfl_u4(hdr, 0);
+            float dW = f16_bits(hdr.x & 0xffff);
+            float dmin = f16_bits(hdr.x >> 16);
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                int sc0, m0, sc1, m1;
+                scale_min_hdr(p * 2, hdr, &sc0, &m0);
+                scale_min_hdr(p * 2 + 1, hdr, &sc1, &m1);
+                unsigned char q = blk[16 + p * 32 + lane];
+                int g0 = b * 8 + p * 2;
+                int xlo = (int)xq[(size_t)g0 * 32 + lane];
+                int xhi = (int)xq[(size_t)(g0 + 1) * 32 + lane];
+                acc += (dW * (float)sc0) * xd[g0] * (float)(q & 0xf) * (float)xlo;
+                acc += (dW * (float)sc1) * xd[g0 + 1] * (float)(q >> 4) * (float)xhi;
+                if (lane == 0) {
+                    float2 s0 = sum16[g0];
+                    float2 s1 = sum16[g0 + 1];
+                    acc -= (dmin * (float)m0) * (s0.x + s0.y);
+                    acc -= (dmin * (float)m1) * (s1.x + s1.y);
+                }
+            }
+        }
+    }
+    acc = warp_sum(acc);
+    store_row(out, row, d, lane == 0, acc, accumulate);
+}
+
+extern "C" __global__ void gemv2r1_q6_k(const unsigned char* wb, const signed char* xq, const float* xd,
+                                        float* out, int n, int d, int accumulate) {
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    int row = (int)blockIdx.x * ((int)blockDim.x >> 5) + warp;
+    int nb = n >> 8;
+    float acc = 0.f;
+    if (row < d) {
+        for (int b = 0; b < nb; ++b) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 210;
+            uint4 scv = make_uint4(0, 0, 0, 0);
+            float dW = 0.f;
+            if (lane == 0) {
+                scv = ld_u4_aligned(blk + 192);
+                dW = ld_f16(blk + 208);
+            }
+            scv = shfl_u4(scv, 0);
+            dW = __shfl_sync(0xffffffff, dW, 0);
+            const unsigned char* ql = blk;
+            const unsigned char* qh = blk + 128;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                int is = lane >> 4;
+                int qloff = half * 64;
+                int qhoff = half * 32;
+                int scoff = half * 8;
+                int xelem = lane;
+                unsigned char qhb = qh[qhoff + lane];
+                int q1 = (int)((ql[qloff + lane] & 0xF) | (((qhb >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql[qloff + lane + 32] & 0xF) | (((qhb >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql[qloff + lane] >> 4) | (((qhb >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql[qloff + lane + 32] >> 4) | (((qhb >> 6) & 3) << 4)) - 32;
+                float s0 = dW * (float)scv_i8(scv, scoff + is + 0);
+                float s1 = dW * (float)scv_i8(scv, scoff + is + 2);
+                float s2 = dW * (float)scv_i8(scv, scoff + is + 4);
+                float s3 = dW * (float)scv_i8(scv, scoff + is + 6);
+                int g = b * 8 + half * 4;
+                acc += s0 * xd[g + 0] * (float)q1 * (float)(int)xq[(size_t)(g + 0) * 32 + xelem];
+                acc += s1 * xd[g + 1] * (float)q2 * (float)(int)xq[(size_t)(g + 1) * 32 + xelem];
+                acc += s2 * xd[g + 2] * (float)q3 * (float)(int)xq[(size_t)(g + 2) * 32 + xelem];
+                acc += s3 * xd[g + 3] * (float)q4 * (float)(int)xq[(size_t)(g + 3) * 32 + xelem];
+            }
+        }
+    }
+    acc = warp_sum(acc);
+    store_row(out, row, d, lane == 0, acc, accumulate);
 }

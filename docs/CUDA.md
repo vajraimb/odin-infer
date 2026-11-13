@@ -6,9 +6,10 @@ Linux x86_64 backend for the Qwen3.5 engine. It targets **sm_70 and newer**
 (validated for Tesla V100S, compute capability 7.0, driver CUDA 13.0).
 Accumulation is fp32. There is no bf16. Prefill GEMM (`T>1`) can use Volta
 tensor cores (WMMA 16×16×16, fp16 operands, fp32 accumulate). Decode (`T==1`)
-uses a bandwidth GEMV: 128-bit loads, four rows per warp, `dp4a`, and the
-activation quantized to q8 once per vector. `ODINFER_CUDA_GEMV=old` restores
-the scalar one-warp-per-row kernel.
+uses a bandwidth GEMV: 128-bit loads, `dp4a`, and the activation quantized to
+q8 once per vector. Short Q4_K / Q6_K matrices use one row per warp; taller
+ones keep four. `ODINFER_CUDA_GEMV=old` restores the scalar kernel. Dense
+decode is one CUDA graph unless `ODINFER_CUDA_GRAPH=0`.
 
 macOS builds are unchanged: the default backend is still Metal. A single
 binary never contains both hot paths.
@@ -142,12 +143,30 @@ Decode tok/s should match across those three. The init line says
 ## Decode GEMV
 
 `T==1` is a memory-bound GEMV. The scalar kernel (one warp per row, byte
-loads) is the `ODINFER_CUDA_GEMV=old` fallback. The default kernel keeps
-four rows in each warp and eight threads on each row. Those eight threads
-issue one `ld.global.v4` each, so a row's quant payload is a single
-coalesced 128-byte read. The dot is `dp4a.s32.s32`. Q6_K and Q8_0 / Q5_0
-blocks are not 16-byte aligned, so those loads go through an alignment
-check and never emit a misaligned `v4` on sm_70.
+loads) is the `ODINFER_CUDA_GEMV=old` fallback. The bandwidth kernel has two
+shapes. Four rows per warp, eight threads per row, is the tall-matrix path
+(FFN up, the 27B Q projection, the logits row). Those eight threads issue
+one `ld.global.v4` each, so a row's quant payload is a single coalesced
+128-byte read, and the dot is `dp4a.s32.s32`. Q6_K blocks are 210 bytes, so
+the 16-byte load is a shift of two aligned windows; the weight allocation
+is padded by 64 bytes and the load never emits a misaligned `v4` on sm_70.
+Q6 codes are unpacked with `vsub4` and there is no scale array in local
+memory.
+
+One row per warp is used when the matrix has 8192 rows or fewer (attention
+out, FFN down, the 9B Q projection). Four rows per warp on a 4096-row
+matrix is only 1024 warps, about 13 per SM on a V100S, which is why those
+shapes sat near 20% of 1134 GB/s. One row per warp is 4096 warps. Total
+warps are `rows / rows_per_warp`; changing warps per block does not change
+that, so split-K was not added. A second sequential launch would not fill
+more SMs, and a fused split would need atomics. `ODINFER_CUDA_GEMV_ROWS=1`
+or `=4` forces one shape for Q4_K and Q6_K.
+
+Q8_0 and Q5_0 matrices under 16 MiB stay on the scalar kernel. At
+2048×2048 the new kernel was slower (Q8_0 118.5 vs 121.8 GB/s, Q5_0 49.2
+vs 69.7). The 9B and 27B hot weights are Q4_K and Q6_K, so they are not
+on this path. `ODINFER_CUDA_GEMV=new` keeps the new kernel for those small
+shapes too.
 
 The activation is quantized to q8 (groups of 32, signed int8, scale
 `amax/127`) once per vector. Q4_K and Q5_K also keep the exact sum of each
@@ -159,20 +178,31 @@ stay on the scalar GEMV. So does a K that is not a multiple of the quant
 block.
 
 Block size is `ODINFER_CUDA_GEMV_WARPS` warps (default 8, range 1..16).
-Eight warps is 256 threads, four rows each, 32 rows per block. V100S has
-80 SMs and 64 warp slots per SM; a 32-thread block cannot fill that.
+With four rows per warp that is 32 rows per block. With one row per warp
+it is one row per warp in the block. V100S has 80 SMs and 64 warp slots
+per SM.
+
+On a dense `T==1` step the attention out, the FFN down, and the linear
+out add their GEMV straight into the residual, so that token skips the
+separate residual kernel. Prefill (`T>1`) and the scalar fallback still
+add with their own kernel. The logits GEMV does not accumulate.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `ODINFER_CUDA_GEMV` | new | `old` or `0` selects the scalar GEMV |
+| `ODINFER_CUDA_GEMV` | auto | `old` or `0`: scalar GEMV. `new`: bandwidth kernel even for small Q5_0 / Q8_0. Unset: bandwidth, except Q5_0 / Q8_0 under 16 MiB |
+| `ODINFER_CUDA_GEMV_ROWS` | auto | `1` or `4` forces rows per warp for Q4_K and Q6_K. Unset: one row when `rows≤8192`, else four |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16) |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count for each forward |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | Peak used by `--bench-gemv` to print % of HBM |
+| `ODINFER_CUDA_GRAPH` | on | Dense `T==1` is one CUDA graph. `=0` runs every kernel eager. MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
+| `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for that forward, slowest first |
 
-`cuda_selftest` runs the bandwidth GEMV against the CPU fp32 dot for Q4_K,
+`cuda_selftest` runs the four-row kernel against the CPU fp32 dot for Q4_K,
 Q6_K, Q8_0, Q5_0, and Q5_K at 64×512 and at 6×256 (the tail that is not a
-multiple of four rows). Allowance is `1 + 0.05*|ref|`. The gap against the
-CPU is the q8 of `x`; a swapped nibble or scale is on the order of `|ref|`.
+multiple of four rows). Q4_K and Q6_K also run the one-row kernel, including
+`accumulate=1` (output starts at 0.25, expect `ref+0.25`). Allowance is
+`1 + 0.05*|ref|`. The gap against the CPU is the q8 of `x`; a swapped
+nibble or scale is on the order of `|ref|`.
 
 ```sh
 bin/cuda_kernel_test
@@ -182,7 +212,8 @@ ODINFER_CUDA_GEMV_WARPS=4 bin/cuda_kernel_test --bench-gemv
 
 `--bench` still prints the tensor-core TFLOPS table, then the same GEMV
 table. `--bench-gemv` prints only the GEMV table: milliseconds, GB/s, and
-percent of peak, old kernel against new, for these `T=1` shapes.
+percent of peak, for the four-row kernel (`r4`), the one-row kernel where
+it exists (`r1`), and the scalar kernel (`old`).
 
 | Name | Kind | rows × cols | Where it shows up |
 |------|------|-------------|-------------------|
@@ -218,15 +249,22 @@ bin/cuda_smoke "$MODEL27B" 16 2048
 ODINFER_CUDA_LAUNCHES=1 bin/cuda_smoke "$MODEL9B" 8 2048
 ```
 
-Init prints `gemv dp4a  warps=8` or `gemv old`.
+Init prints the GEMV row policy and either `graph on for dense T=1` or
+`gemv old`.
 
-CUDA graphs are not used. A dense 27B token is on the order of a thousand
-launches. At a few microseconds each that is a few milliseconds, and the
-measured 5.28 tok/s on the 15.8 GB Q4_K_M was about 190 ms, almost all of
-it the weight stream at ~7% of 1134 GB/s. The driver bindings have no
-graph API. `ODINFER_CUDA_LAUNCHES=1` is there so a V100 run can confirm
-the count. Attention over the KV cache at a few thousand tokens does not
-move enough bytes to explain that gap.
+Dense decode (`T==1`, not MoE) is captured once into a CUDA graph and
+replayed. Capture does not run the kernels; the first token pays for
+capture and then launches the graph. The token position is a device
+symbol (`g_decode_pos`), written before each replay, because a kernel
+argument would be baked in at capture. Prefill passes the real position
+and stays eager, so a graph cannot change a `T>1` result. If capture or
+instantiate fails, that token runs eager and graphs stay off.
+`ODINFER_CUDA_GRAPH=0` is the eager path. `ODINFER_CUDA_PROFILE=1`
+disables the graph and prints each kernel's GPU time (name, count,
+milliseconds), slowest first, plus wall time against the sum. Sampling
+stays on the CPU, after the logits copy. The graph and event symbols are
+looked up on their own; a driver without them disables graphs and the
+profiler and still loads the GEMV.
 
 ## Check script
 
@@ -320,7 +358,7 @@ IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q8_1.
 
 Also not in this backend: Metal's shape-specialized GEMV (`QGEMVSPEC`),
 wide-N autotune and the tune cache, fast-math, MoE grouped GEMM
-(`forward_gpu_batch_moe`), CUDA graphs, and `engine_verify_batch`
+(`forward_gpu_batch_moe`), and `engine_verify_batch`
 (speculative verify). A one-row RMSNorm on CUDA does feed the q8 cache
 the next GEMV reads. MoE prefill runs the attention projections as MMQ
 and the experts as per-token GEMV. Dense prefill chunks by
