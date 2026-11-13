@@ -9,6 +9,9 @@
 
    Default model search is done by scripts/cuda_check.sh. This tool requires
    the path. n_tokens defaults to 16, max_ctx to 2048.
+   ODINFER_CUDA_SMOKE_PREFILL=N builds a deterministic prompt and prefills
+   N tokens (the short 2+2 prompt is the default). max_ctx must cover
+   N plus the decoded tokens.
 */
 
 package main
@@ -61,10 +64,54 @@ main :: proc() {
 		tok35.build_tokenizer(&tok)
 		defer tok35.free_tokenizer(&tok)
 		prompt := "<|im_start|>user\nWhat is 2+2? Answer with one number.<|im_end|>\n<|im_start|>assistant\n"
-		encoded, enc_err := tok35.encode(&tok, prompt)
-		if enc_err != nil || len(encoded) < 2 {
-			fmt.eprintln("cuda_smoke: encode failed")
-			os.exit(1)
+		want_prefill := 0
+		if s := os.get_env("ODINFER_CUDA_SMOKE_PREFILL", context.temp_allocator); s != "" {
+			if v, ok := strconv.parse_int(s); ok && v > 1 {
+				want_prefill = int(v)
+			}
+		}
+		encoded: []int
+		if want_prefill > 0 {
+			// Repeat a fixed sentence so the token stream is deterministic
+			// and old-vs-new text still compares. Slice to exactly N prefill
+			// tokens plus the token that starts decode.
+			need := want_prefill + 1
+			if need > max_ctx {
+				fmt.eprintfln("cuda_smoke: prefill %d plus the first decode token needs max_ctx >= %d", want_prefill, need)
+				os.exit(1)
+			}
+			head := "<|im_start|>user\n"
+			tail := "\nWhat is 2+2? Answer with one number.<|im_end|>\n<|im_start|>assistant\n"
+			body := "The quick brown fox jumps over the lazy dog. "
+			filled := head
+			built := false
+			for _ in 0 ..< 12 {
+				prompt = strings.concatenate({filled, tail})
+				enc, eerr := tok35.encode(&tok, prompt)
+				if eerr != nil {
+					fmt.eprintln("cuda_smoke: encode failed")
+					os.exit(1)
+				}
+				if len(enc) >= need {
+					encoded = enc
+					built = true
+					break
+				}
+				delete(enc)
+				filled = strings.concatenate({filled, body, body, body, body})
+			}
+			if !built {
+				fmt.eprintfln("cuda_smoke: could not build a %d-token prompt", want_prefill)
+				os.exit(1)
+			}
+			encoded = encoded[:need]
+		} else {
+			enc, eerr := tok35.encode(&tok, prompt)
+			if eerr != nil || len(enc) < 2 {
+				fmt.eprintln("cuda_smoke: encode failed")
+				os.exit(1)
+			}
+			encoded = enc
 		}
 		defer delete(encoded)
 

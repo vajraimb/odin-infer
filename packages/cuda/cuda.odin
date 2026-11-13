@@ -16,6 +16,7 @@ package cuda
 import "core:c"
 import "core:dynlib"
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 
@@ -557,6 +558,91 @@ jit_log_after_failure :: proc(image: rawptr) -> string {
 		return strings.clone(a)
 	}
 	return strings.concatenate({a, "\n", b})
+}
+
+// cuLink* is optional. A direct cuModuleLoadData of NVRTC PTX JITs the
+// image but does not export `.visible .global` symbols, so
+// cuModuleGetGlobal_v2 returns CUDA_ERROR_NOT_FOUND (500) for
+// `g_decode_pos`. Linking the PTX first keeps that name.
+Link_API :: struct {
+	create:   proc "c" (nopts: c.uint, opts: [^]c.int, vals: [^]rawptr, state: ^rawptr) -> Error,
+	add_data: proc "c" (state: rawptr, kind: c.int, data: rawptr, size: c.size_t, name: cstring, nopts: c.uint, opts: [^]c.int, vals: [^]rawptr) -> Error,
+	complete: proc "c" (state: rawptr, cubin: ^rawptr, size: ^c.size_t) -> Error,
+	destroy:  proc "c" (state: rawptr) -> Error,
+	ready:    bool,
+}
+
+link_api: Link_API
+
+JIT_INPUT_PTX :: c.int(1)
+
+load_link_api :: proc() -> bool {
+	if link_api.ready {
+		return true
+	}
+	if drv.__handle == nil {
+		return false
+	}
+	ok := true
+	if p, got := bind_sym("cuLinkCreate_v2", type_of(link_api.create)); got {
+		link_api.create = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuLinkAddData_v2", type_of(link_api.add_data)); got {
+		link_api.add_data = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuLinkComplete", type_of(link_api.complete)); got {
+		link_api.complete = p
+	} else {
+		ok = false
+	}
+	if p, got := bind_sym("cuLinkDestroy", type_of(link_api.destroy)); got {
+		link_api.destroy = p
+	} else {
+		ok = false
+	}
+	link_api.ready = ok
+	return ok
+}
+
+// Links PTX to a cubin and loads that. The cubin pointer from cuLinkComplete
+// is only valid until cuLinkDestroy, so it is copied first.
+module_load_linked :: proc(ptx: string) -> (mod: Module, err: Error) {
+	if !load_link_api() {
+		return nil, ERR_SYMBOL
+	}
+	img := make([]u8, len(ptx) + 1, context.temp_allocator)
+	copy(img, transmute([]u8)(ptx))
+	state: rawptr
+	err = link_api.create(0, nil, nil, &state)
+	if err != OK || state == nil {
+		return nil, err
+	}
+	defer link_api.destroy(state)
+	name := cstring("odinfer.ptx")
+	err = link_api.add_data(state, JIT_INPUT_PTX, raw_data(img), c.size_t(len(ptx)), name, 0, nil, nil)
+	if err != OK {
+		return nil, err
+	}
+	cubin: rawptr
+	nbytes: c.size_t
+	err = link_api.complete(state, &cubin, &nbytes)
+	if err != OK || cubin == nil || nbytes == 0 {
+		return nil, err
+	}
+	copy_buf := make([]u8, int(nbytes))
+	mem.copy(raw_data(copy_buf), cubin, int(nbytes))
+	err = drv.ModuleLoadData(&mod, raw_data(copy_buf))
+	if err != OK {
+		delete(copy_buf)
+		return nil, err
+	}
+	// ModuleLoadData copies the image. The host buffer can go.
+	delete(copy_buf)
+	return mod, OK
 }
 
 module_load_ptx :: proc(ptx: string) -> (mod: Module, jit_log: string, err: Error) {

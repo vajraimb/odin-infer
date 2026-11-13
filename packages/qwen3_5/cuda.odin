@@ -155,6 +155,10 @@ g_graph_launches: int
 @(private)
 g_pos_sym: cu.Device_Ptr
 @(private)
+g_pos_arg: cu.Device_Ptr // passed into kernels when the module symbol is not exported
+@(private)
+g_pos_buf: cu.Device_Ptr // fallback device int, not part of the weight mmap
+@(private)
 g_launch_stream: rawptr
 @(private)
 d_xq, d_xd, d_xs: cu.Device_Ptr
@@ -171,11 +175,11 @@ k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
-k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy: cu.Function
+k_rmsnorm, k_qnorm, k_rope, k_gate, k_gate_q, k_swiglu, k_swiglu_q, k_residual, k_axpy: cu.Function
 @(private)
 k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v: cu.Function
 @(private)
-k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_moe_topk: cu.Function
+k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
 k_tc2_q4, k_tc2_q6: cu.Function
 
@@ -595,8 +599,9 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 			fn = k_tc2_q6
 		}
 		if fn != nil {
+			// 32 rows by 128 tokens (two 64-token WMMA chunks share the fp16 tile).
 			gx := u32((d + 31) / 32)
-			gy := u32((tcount + 31) / 32)
+			gy := u32((tcount + 127) / 128)
 			return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "tc2")
 		}
 	}
@@ -660,6 +665,14 @@ launch_qnorm :: proc(qproj, q, qn: cu.Device_Ptr, nheads, head: int, eps: f32) -
 }
 
 @(private)
+pos_slot :: proc() -> cu.Device_Ptr {
+	if g_capturing {
+		return g_pos_arg
+	}
+	return 0
+}
+
+@(private)
 launch_rope :: proc(vec: cu.Device_Ptr, head_dim, pos: int, theta: f32, rotary, nheads: int) -> bool {
 	half := rotary / 2
 	total := nheads * half
@@ -669,24 +682,48 @@ launch_rope :: proc(vec: cu.Device_Ptr, head_dim, pos: int, theta: f32, rotary, 
 	v := vec
 	hd, ps, rd, nh := i32(head_dim), i32(decode_pos(pos)), i32(rotary), i32(nheads)
 	th := theta
-	args := [?]rawptr{&v, &hd, &ps, &th, &rd, &nh}
+	slot := pos_slot()
+	args := [?]rawptr{&v, &hd, &ps, &th, &rd, &nh, &slot}
 	return klaunch(k_rope, grid_n(total, 128), 1, 1, 128, 1, 1, args[:], "rope")
 }
 
 @(private)
-launch_gate :: proc(xb3, qproj: cu.Device_Ptr, head_dim, nheads: int) -> bool {
+launch_gate :: proc(xb3, qproj: cu.Device_Ptr, head_dim, nheads: int, quant: bool) -> bool {
+	n := nheads * head_dim
 	a, b := xb3, qproj
 	hd, nh := i32(head_dim), i32(nheads)
+	if quant && g_gemv_new && n % 32 == 0 && n <= g_q8_cap && k_gate_q != nil && d_xq != 0 {
+		qs, sc, sm := d_xq, d_xd, d_xs
+		args := [?]rawptr{&a, &b, &qs, &sc, &sm, &hd, &nh}
+		if !klaunch(k_gate_q, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "attn_gate") {
+			return false
+		}
+		g_q8_src = xb3
+		g_q8_n = n
+		g_q8_valid = true
+		return true
+	}
+	q8_drop()
 	args := [?]rawptr{&a, &b, &hd, &nh}
-	n := nheads * head_dim
 	return klaunch(k_gate, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "attn_gate")
 }
 
 @(private)
-launch_swiglu :: proc(hb, hb2: cu.Device_Ptr, n: int) -> bool {
-	q8_drop()
+launch_swiglu :: proc(hb, hb2: cu.Device_Ptr, n: int, quant: bool) -> bool {
 	a, b := hb, hb2
 	nn := i32(n)
+	if quant && g_gemv_new && n % 32 == 0 && n <= g_q8_cap && k_swiglu_q != nil && d_xq != 0 {
+		qs, sc, sm := d_xq, d_xd, d_xs
+		args := [?]rawptr{&a, &b, &qs, &sc, &sm, &nn}
+		if !klaunch(k_swiglu_q, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "swiglu") {
+			return false
+		}
+		g_q8_src = hb
+		g_q8_n = n
+		g_q8_valid = true
+		return true
+	}
+	q8_drop()
 	args := [?]rawptr{&a, &b, &nn}
 	return klaunch(k_swiglu, grid_n(n, 256), 1, 1, 256, 1, 1, args[:], "swiglu")
 }
@@ -712,7 +749,8 @@ launch_axpy :: proc(y, x: cu.Device_Ptr, a: f32, n: int) -> bool {
 store_f16_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
 	hd, sl, ps, nk := i32(g_head), i32(g_seq), i32(decode_pos(pos)), i32(g_kv_heads)
-	args := [?]rawptr{&a, &b, &c, &d, &hd, &sl, &ps, &nk}
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &c, &d, &hd, &sl, &ps, &nk, &slot}
 	n := g_kv_heads * g_head
 	return klaunch(k_store_f16, grid_n(n, 128), 1, 1, 128, 1, 1, args[:], "store_f16")
 }
@@ -722,7 +760,8 @@ attn_f16_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := q, kc, vc, xb3
 	sc := d_scores
 	hd, sl, mul, ps := i32(g_head), i32(g_seq), i32(g_heads / g_kv_heads), i32(decode_pos(pos))
-	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &sl, &mul, &ps}
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &sl, &mul, &ps, &slot}
 	return klaunch(k_attn_f16, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_f16")
 }
 
@@ -730,7 +769,8 @@ attn_f16_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 store_q8_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
 	nb, pb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(decode_pos(pos))
-	args := [?]rawptr{&a, &b, &c, &d, &nb, &pb, &ps}
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &c, &d, &nb, &pb, &ps, &slot}
 	return klaunch(k_store_q8, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, args[:], "store_q8")
 }
 
@@ -739,7 +779,8 @@ attn_q8_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := q, kc, vc, xb3
 	sc := d_scores
 	hd, pb, mul, ps, sl := i32(g_head), i32(g_k_pos), i32(g_heads / g_kv_heads), i32(decode_pos(pos)), i32(g_seq)
-	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &pb, &mul, &ps, &sl}
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &pb, &mul, &ps, &sl, &slot}
 	return klaunch(k_attn_q8, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8")
 }
 
@@ -747,7 +788,8 @@ attn_q8_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 store_q8v_call :: proc(k, v, kc, vc: cu.Device_Ptr, pos: int) -> bool {
 	a, b, c, d := k, v, kc, vc
 	nb, kb, vb, ps := i32(g_kv_dim / 32), i32(g_k_pos), i32(g_v_pos), i32(decode_pos(pos))
-	args := [?]rawptr{&a, &b, &c, &d, &nb, &kb, &vb, &ps}
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &c, &d, &nb, &kb, &vb, &ps, &slot}
 	return klaunch(k_store_q8v, grid_n(g_kv_dim / 32, 64), 1, 1, 64, 1, 1, args[:], "store_q8v")
 }
 
@@ -758,7 +800,8 @@ attn_q8v_call :: proc(q, kc, vc, xb3: cu.Device_Ptr, pos: int) -> bool {
 	hd := i32(g_head)
 	kb, vb := i32(g_k_pos), i32(g_v_pos)
 	mul, ps, sl := i32(g_heads / g_kv_heads), i32(decode_pos(pos)), i32(g_seq)
-	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &kb, &vb, &mul, &ps, &sl}
+	slot := pos_slot()
+	args := [?]rawptr{&a, &b, &c, &d, &sc, &hd, &kb, &vb, &mul, &ps, &sl, &slot}
 	return klaunch(k_attn_q8v, u32(g_heads), 1, 1, 128, 1, 1, args[:], "attn_q8v")
 }
 
@@ -798,10 +841,23 @@ launch_delta_chunk :: proc(outp, state, q, k, v, b, a, decay, dt: cu.Device_Ptr,
 }
 
 @(private)
-launch_gated :: proc(outp, inp, weight, gate: cu.Device_Ptr, n_vh, hvd: int, eps: f32) -> bool {
+launch_gated :: proc(outp, inp, weight, gate: cu.Device_Ptr, n_vh, hvd: int, eps: f32, quant: bool) -> bool {
 	a, b, c, d := outp, inp, weight, gate
 	sz := i32(hvd)
 	ep := eps
+	n := n_vh * hvd
+	if quant && g_gemv_new && hvd % 32 == 0 && n <= g_q8_cap && k_rmsgate_q != nil && d_xq != 0 {
+		qs, sc, sm := d_xq, d_xd, d_xs
+		args := [?]rawptr{&a, &b, &c, &d, &qs, &sc, &sm, &sz, &ep}
+		if !klaunch(k_rmsgate_q, u32(n_vh), 1, 1, 128, 1, 1, args[:], "rmsnorm_gated") {
+			return false
+		}
+		g_q8_src = outp
+		g_q8_n = n
+		g_q8_valid = true
+		return true
+	}
+	q8_drop()
 	args := [?]rawptr{&a, &b, &c, &d, &sz, &ep}
 	return klaunch(k_rmsgate, u32(n_vh), 1, 1, 128, 1, 1, args[:], "rmsnorm_gated")
 }
@@ -837,7 +893,9 @@ bind_kernels :: proc() -> bool {
 	k_qnorm = get_fn("qnorm_extract")
 	k_rope = get_fn("rope_partial")
 	k_gate = get_fn("attn_gate")
+	k_gate_q = get_fn("attn_gate_quant")
 	k_swiglu = get_fn("swiglu")
+	k_swiglu_q = get_fn("swiglu_quant")
 	k_residual = get_fn("residual")
 	k_axpy = get_fn("axpy_k")
 	k_store_f16 = get_fn("store_kv_f16")
@@ -853,6 +911,7 @@ bind_kernels :: proc() -> bool {
 	k_tc2_q4 = get_fn("tc2_q4_k")
 	k_tc2_q6 = get_fn("tc2_q6_k")
 	k_rmsgate = get_fn("rmsnorm_gated")
+	k_rmsgate_q = get_fn("rmsnorm_gated_quant")
 	k_moe_topk = get_fn("moe_softmax_topk")
 	k_quant = get_fn("quant_q8")
 	k_rmsnorm_q8 = get_fn("rmsnorm_quant_q8")
@@ -866,7 +925,8 @@ bind_kernels :: proc() -> bool {
 	handles := [?]cu.Function{
 		k_rmsnorm, k_qnorm, k_rope, k_gate, k_swiglu, k_residual, k_axpy,
 		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v,
-		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_moe_topk,
+		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
+		k_gate_q, k_swiglu_q,
 		k_tc2_q4, k_tc2_q6,
 		k_quant, k_rmsnorm_q8, k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
@@ -1059,6 +1119,11 @@ cuda_destroy :: proc() {
 	g_capturing = false
 	g_launch_stream = nil
 	g_pos_sym = 0
+	g_pos_arg = 0
+	if g_pos_buf != 0 {
+		cu.free(g_pos_buf)
+		g_pos_buf = 0
+	}
 	if cu.gapi.ready && g_stream != nil {
 		cu.gapi.stream_destroy(g_stream)
 	}
@@ -1204,14 +1269,27 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	} else {
 		ptx_load, _ = strings.replace(ptx, needle, ".visible .global .align 4 .u32 g_decode_pos;", 1)
 	}
-	mod, jit, merr := cu.module_load_ptx(ptx_load)
-	if len(jit) > 0 {
-		fmt.eprintfln("cuda: jit: %s", jit)
-	}
-	if merr != cu.OK {
-		fmt.eprintf("cuda: cuModuleLoadData failed: %s (%d)\n", cu.error_string(merr), int(merr))
-		cuda_destroy()
-		return false
+	// Link first so `.visible .global g_decode_pos` survives into the cubin.
+	// Direct PTX load JITs without exporting that name (CUresult 500).
+	linked, lerr := cu.module_load_linked(ptx_load)
+	mod: cu.Module
+	if lerr == cu.OK && linked != nil {
+		mod = linked
+		fmt.eprintln("cuda: module linked (g_decode_pos stays exported)")
+	} else {
+		if lerr != cu.OK && lerr != cu.ERR_SYMBOL {
+			fmt.eprintf("cuda: cuLink failed: %s (%d); loading PTX directly\n", cu.error_string(lerr), int(lerr))
+		}
+		loaded, jit, merr := cu.module_load_ptx(ptx_load)
+		if len(jit) > 0 {
+			fmt.eprintfln("cuda: jit: %s", jit)
+		}
+		if merr != cu.OK {
+			fmt.eprintf("cuda: cuModuleLoadData failed: %s (%d)\n", cu.error_string(merr), int(merr))
+			cuda_destroy()
+			return false
+		}
+		mod = loaded
 	}
 	g_mod = mod
 	if !bind_kernels() {
@@ -1343,7 +1421,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_tc2 {
-		fmt.eprintln("cuda: tc2 on for Q4_K/Q6_K when K is a multiple of 256 (ODINFER_CUDA_TC2=0 uses the scalar dequant tile)")
+		fmt.eprintln("cuda: tc2 on for Q4_K/Q6_K (128-token fp16 tile, ODINFER_CUDA_TC2=0 uses the scalar dequant tile)")
 	}
 	if g_gemv_split {
 		fmt.eprintln("cuda: gemv split-K on for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLIT=0 disables it)")
@@ -1379,14 +1457,26 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			dptr: cu.Device_Ptr
 			sym := [?]u8{'g', 'd', 'e', 'c', 'o', 'd', 'e', '_', 'p', 'o', 's', 0}
 			gerr := cu.gapi.module_global(&dptr, &nbytes, g_mod, cstring(&sym[0]))
-			if gerr != cu.OK || dptr == 0 {
-				fmt.eprintf("cuda: g_decode_pos missing: %s (%d); graph off\n", cu.error_string(gerr), int(gerr))
-				cu.gapi.stream_destroy(st)
-				g_stream = nil
-				g_use_graph = false
-			} else {
+			if gerr == cu.OK && dptr != 0 {
 				g_pos_sym = dptr
+				g_pos_arg = 0
 				fmt.eprintfln("cuda: g_decode_pos %d bytes", int(nbytes))
+			} else {
+				// The name is g_decode_pos. Driver 580 still returns 500 after
+				// a direct PTX load. A device int captured as a kernel pointer
+				// is the same graph slot: the host writes it before each replay.
+				buf, aerr := cu.alloc(4)
+				if aerr != cu.OK || buf == 0 {
+					fmt.eprintf("cuda: g_decode_pos missing: %s (%d); graph off\n", cu.error_string(gerr), int(gerr))
+					cu.gapi.stream_destroy(st)
+					g_stream = nil
+					g_use_graph = false
+				} else {
+					g_pos_buf = buf
+					g_pos_sym = buf
+					g_pos_arg = buf
+					fmt.eprintf("cuda: g_decode_pos via device buffer (%s %d); graph on\n", cu.error_string(gerr), int(gerr))
+				}
 			}
 		}
 	}
@@ -1438,7 +1528,7 @@ cuda_full :: proc(tr: ^Transformer, l, pos0, T: int) {
 		must(launch_rope(krow, p.head_dim, pos, p.rope_theta, p.rotary_dim, p.n_kv_heads))
 		must(do_store(krow, vrow, kc, vc, pos))
 		must(do_attn(qrow, kc, vc, xb3, pos))
-		must(launch_gate(xb3, qproj, p.head_dim, p.n_heads))
+		must(launch_gate(xb3, qproj, p.head_dim, p.n_heads, T == 1))
 	}
 	if !(T == 1 && try_accum_gemv(fa.wo, d_xb3, d_x, attdim, dim)) {
 		must(launch_mm(fa.wo, d_xb3, d_xb2, attdim, dim, T))
@@ -1492,7 +1582,7 @@ cuda_linear :: proc(tr: ^Transformer, l, pos0, T: int) {
 	}
 	for ti in 0 ..< T {
 		lout := fp(d_lout, ti * val)
-		must(launch_gated(lout, lout, dev_f32(la.norm_w), fp(d_z, ti * val), p.lin_n_v_heads, p.lin_head_v_dim, eps))
+		must(launch_gated(lout, lout, dev_f32(la.norm_w), fp(d_z, ti * val), p.lin_n_v_heads, p.lin_head_v_dim, eps, T == 1))
 	}
 	if !(T == 1 && try_accum_gemv(la.out, d_lout, d_x, val, dim)) {
 		must(launch_mm(la.out, d_lout, d_xb2, val, dim, T))
@@ -1510,7 +1600,7 @@ cuda_mlp :: proc(tr: ^Transformer, l, T: int) {
 	must(launch_mm(lw.w1, d_xb, d_hb, dim, hid, T))
 	must(launch_mm(lw.w3, d_xb, d_hb2, dim, hid, T))
 	// swiglu(gate, up): result lands in the gate buffer. w1 is gate, w3 is up.
-	must(launch_swiglu(d_hb, d_hb2, T * hid))
+	must(launch_swiglu(d_hb, d_hb2, T * hid, T == 1))
 	if !(T == 1 && try_accum_gemv(lw.w2, d_hb, d_x, hid, dim)) {
 		must(launch_mm(lw.w2, d_hb, d_xb2, hid, dim, T))
 		must(launch_residual(d_x, d_xb2, T * dim))
@@ -1550,7 +1640,7 @@ cuda_moe_token :: proc(tr: ^Transformer, l, ti: int) {
 		must(launch_gemv(mw.up_exps.kind, up, d_xb, d_hb, dim, p.n_ff_exp))
 		must(launch_gemv(mw.gate_exps.kind, gate, d_xb, d_hb2, dim, p.n_ff_exp))
 		// result in the gate buffer: silu(gate) * up
-		must(launch_swiglu(d_hb2, d_hb, p.n_ff_exp))
+		must(launch_swiglu(d_hb2, d_hb, p.n_ff_exp, false))
 		must(launch_gemv(mw.down_exps.kind, down, d_hb2, d_partial, p.n_ff_exp, dim))
 		must(launch_axpy(d_xb2, d_partial, wgt, dim))
 	}
@@ -1558,7 +1648,7 @@ cuda_moe_token :: proc(tr: ^Transformer, l, ti: int) {
 		nf := p.n_ff_shexp
 		must(launch_gemv(.F32, moe_gpu[l].up, d_xb, d_hb, dim, nf))
 		must(launch_gemv(.F32, moe_gpu[l].gate_w, d_xb, d_hb2, dim, nf))
-		must(launch_swiglu(d_hb2, d_hb, nf))
+		must(launch_swiglu(d_hb2, d_hb, nf, false))
 		must(launch_gemv(.F32, moe_gpu[l].down, d_hb2, d_partial, nf, dim))
 		must(launch_gemv(.F32, moe_gpu[l].ginp, d_xb, d_moe_logits, dim, 1))
 		gsum: f32

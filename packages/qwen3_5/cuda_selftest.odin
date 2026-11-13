@@ -577,7 +577,7 @@ run_tc2 :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bo
 	nn, dd, tt := i32(cols), i32(rows), i32(T)
 	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
 	gx := u32((rows + 31) / 32)
-	gy := u32((T + 31) / 32)
+	gy := u32((T + 127) / 128)
 	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 0, args[:]) != cu.OK {
 		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
 		return false
@@ -664,7 +664,8 @@ run_elem :: proc() -> bool {
 	vv := dv
 	ihd, ipos, irot, inh := i32(hd), i32(pos), i32(rot), i32(nh)
 	theta := f32(10000)
-	rargs := [?]rawptr{&vv, &ihd, &ipos, &theta, &irot, &inh}
+	slot: cu.Device_Ptr
+	rargs := [?]rawptr{&vv, &ihd, &ipos, &theta, &irot, &inh, &slot}
 	total := nh * (rot / 2)
 	if cu.launch(rf, u32((total + 127) / 128), 1, 1, 128, 1, 1, 0, rargs[:]) != cu.OK {
 		fmt.eprintln("cuda_selftest: rope launch failed")
@@ -784,7 +785,8 @@ run_kv_attn :: proc() -> bool {
 		cu.upload(dv, raw_data(vs), hd * 4)
 		a, b, c0, d := dk, dv, dkc, dvc
 		nb, kb, vb, ps := i32(1), i32(k_pos), i32(v_pos), i32(pos)
-		args := [?]rawptr{&a, &b, &c0, &d, &nb, &kb, &vb, &ps}
+		slot: cu.Device_Ptr
+		args := [?]rawptr{&a, &b, &c0, &d, &nb, &kb, &vb, &ps, &slot}
 		if cu.launch(store, 1, 1, 1, 1, 1, 1, 0, args[:]) != cu.OK {
 			fmt.eprintln("cuda_selftest: store_kv_q8v failed")
 			delete(ks)
@@ -831,7 +833,8 @@ run_kv_attn :: proc() -> bool {
 	}
 	qa, kca, vca, xb, sc := dq, dkc, dvc, dxb, dsc
 	ihd, ikb, ivb, mul, ps, sl := i32(hd), i32(k_pos), i32(v_pos), i32(1), i32(1), i32(seq)
-	aargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl}
+	slot: cu.Device_Ptr
+	aargs := [?]rawptr{&qa, &kca, &vca, &xb, &sc, &ihd, &ikb, &ivb, &mul, &ps, &sl, &slot}
 	if cu.launch(attn, 1, 1, 1, 128, 1, 1, 0, aargs[:]) != cu.OK {
 		fmt.eprintln("cuda_selftest: attention_q8v failed")
 		return false
@@ -1159,6 +1162,10 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_tc2(.Q4_K, 40, 256, 20, 5e-2, 5e-2) || !run_tc2(.Q6_K, 40, 512, 20, 5e-2, 5e-2) {
+		ok = false
+	}
+	// 80 tokens forces the second 64-token chunk that reuses the fp16 weight tile.
+	if !run_tc2(.Q4_K, 64, 256, 80, 5e-2, 5e-2) || !run_tc2(.Q6_K, 48, 512, 160, 5e-2, 5e-2) {
 		ok = false
 	}
 	if !run_delta_chunk() {

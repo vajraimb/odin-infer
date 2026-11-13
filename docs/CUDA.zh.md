@@ -129,7 +129,7 @@ Q4_K 和 Q6_K 默认都是四行一个 warp。一行一个 warp 在 V100S 上每
 行数不超过 8192 的 Q4_K / Q6_K 把这段 K 拆到 `gridDim.y`（默认 4 路，
 `atomicAdd` 汇总）。`ODINFER_CUDA_GEMV_SPLIT=0` 关掉。K 是 256 倍数的
 Q4_K / Q6_K 预填充走 `tc2`：每个量化块展开成 fp16 一次再做 WMMA。
-`ODINFER_CUDA_TC2=0` 回到逐元素反量化。预填充的线性注意力一层一次
+`ODINFER_CUDA_TC2=0` 回到逐元素反量化。`tc2` 的一块覆盖 32 行和 128 个 token，同一份 fp16 权重给两个 64-token 的 WMMA 用。预填充的线性注意力一层一次
 `delta_recurrent_chunk`；解码 `T==1` 仍是原来的单 token 内核。
 
 16 MiB 以下的 Q8_0 和 Q5_0 留在标量内核。2048×2048 上新内核更慢（Q8_0

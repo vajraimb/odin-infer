@@ -20,16 +20,23 @@
 
 /* Engine decode stores the token position here and passes pos=-1 so a CUDA
    graph can replay every token. A non-negative argument is the position.
-   volatile: the host writes this with cuMemcpyHtoD between replays, and
-   ptxas must not fold the load to 0. extern "C" keeps the PTX name. The
-   host also rewrites the declaration to `.visible .global`, because NVRTC
-   emits a plain `.global` and cuModuleGetGlobal does not see that. */
+   extern "C" keeps the PTX name `g_decode_pos` (no C++ mangling). NVRTC emits
+   a plain `.global`; the host rewrites it to `.visible .global` and links
+   the PTX so cuModuleGetGlobal_v2 can see that name. volatile: the host
+   writes the symbol between replays. pos_slot is the fallback device int
+   when the driver still will not export the symbol (error 500). */
 extern "C" {
 __device__ volatile int g_decode_pos;
 }
 
-__device__ __forceinline__ int live_pos(int pos) {
-    return pos >= 0 ? pos : g_decode_pos;
+__device__ __forceinline__ int live_pos(int pos, const int* pos_slot) {
+    if (pos >= 0) return pos;
+    if (pos_slot != 0) {
+        int v;
+        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(v) : "l"(pos_slot));
+        return v;
+    }
+    return g_decode_pos;
 }
 
 __device__ __forceinline__ float ld_f16(const unsigned char* p) {
@@ -553,7 +560,7 @@ extern "C" __global__ void qnorm_extract(const float* qproj, float* q, const flo
     for (int j = tid; j < n; j += 128) dst[j] = qn[j] * (inv * src[j]);
 }
 
-extern "C" __global__ void rope_partial(float* vec, int head_dim, int pos, float rope_freq, int rotary_dim, int n_heads) {
+extern "C" __global__ void rope_partial(float* vec, int head_dim, int pos, float rope_freq, int rotary_dim, int n_heads, const int* pos_slot) {
     int half = rotary_dim >> 1;
     int total = n_heads * half;
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -562,11 +569,35 @@ extern "C" __global__ void rope_partial(float* vec, int head_dim, int pos, float
     int i = gid - h * half;
     float* q = vec + (size_t)h * (size_t)head_dim;
     float freq = 1.f / powf(rope_freq, (float)i / (float)half);
-    float ang = (float)live_pos(pos) * freq;
+    float ang = (float)live_pos(pos, pos_slot) * freq;
     float c = cosf(ang), s = sinf(ang);
     float x0 = q[i], y0 = q[i + half];
     q[i] = x0 * c - y0 * s;
     q[i + half] = x0 * s + y0 * c;
+}
+
+/* Same groups as quant_q8: scale amax/127, rintf, sum of each 16-float half. */
+__device__ void quant_store_group(const float* xi, signed char* qs, float* scale, float2* sum16, int group) {
+    float amax = 0.f, s0 = 0.f, s1 = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        float a = xi[j];
+        float b = xi[j + 16];
+        amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
+        s0 += a;
+        s1 += b;
+    }
+    float d = amax / 127.f;
+    float id = d > 0.f ? 1.f / d : 0.f;
+    scale[group] = d;
+    sum16[group] = make_float2(s0, s1);
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        int q = (int)rintf(xi[j] * id);
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        qs[(size_t)group * 32 + j] = (signed char)q;
+    }
 }
 
 extern "C" __global__ void attn_gate(float* xb3, const float* qproj, int head_dim, int n_heads) {
@@ -579,11 +610,41 @@ extern "C" __global__ void attn_gate(float* xb3, const float* qproj, int head_di
     xb3[(size_t)h * (size_t)head_dim + i] *= sigmoid_stable(g);
 }
 
+/* Decode attention gate plus the q8 cache the output GEMV reads. n % 32 == 0. */
+extern "C" __global__ void attn_gate_quant(float* xb3, const float* qproj, signed char* qs, float* scale, float2* sum16,
+                                           int head_dim, int n_heads) {
+    int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int lane = (int)threadIdx.x & 31;
+    int n = n_heads * head_dim;
+    if (gid < n) {
+        int h = gid / head_dim;
+        int i = gid - h * head_dim;
+        float g = qproj[(size_t)h * (size_t)(2 * head_dim) + head_dim + i];
+        xb3[gid] *= sigmoid_stable(g);
+    }
+    __syncwarp();
+    int group = gid >> 5;
+    if (lane == 0 && (group << 5) < n) quant_store_group(xb3 + (group << 5), qs, scale, sum16, group);
+}
+
 extern "C" __global__ void swiglu(float* hb, const float* hb2, int n) {
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (gid >= n) return;
     float v = hb[gid];
     hb[gid] = (v * sigmoid_stable(v)) * hb2[gid];
+}
+
+/* Decode SwiGLU plus the q8 cache the down GEMV reads. n % 32 == 0. */
+extern "C" __global__ void swiglu_quant(float* hb, const float* hb2, signed char* qs, float* scale, float2* sum16, int n) {
+    int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int lane = (int)threadIdx.x & 31;
+    if (gid < n) {
+        float v = hb[gid];
+        hb[gid] = (v * sigmoid_stable(v)) * hb2[gid];
+    }
+    __syncwarp();
+    int group = gid >> 5;
+    if (lane == 0 && (group << 5) < n) quant_store_group(hb + (group << 5), qs, scale, sum16, group);
 }
 
 extern "C" __global__ void residual(float* x, const float* y, int n) {
@@ -599,19 +660,19 @@ extern "C" __global__ void axpy_k(float* y, const float* x, float a, int n) {
 
 /* f16 KV: head-major [kvh, seq_len, head_dim], little-endian half. */
 extern "C" __global__ void store_kv_f16(const float* k, const float* v, unsigned char* kc, unsigned char* vc,
-                                        int head_dim, int seq_len, int pos, int n_kv) {
+                                        int head_dim, int seq_len, int pos, int n_kv, const int* pos_slot) {
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int n = n_kv * head_dim;
     if (gid >= n) return;
     int kvh = gid / head_dim;
     int i = gid - kvh * head_dim;
-    size_t dst = (((size_t)kvh * (size_t)seq_len + (size_t)live_pos(pos)) * (size_t)head_dim + (size_t)i) * 2;
+    size_t dst = (((size_t)kvh * (size_t)seq_len + (size_t)live_pos(pos, pos_slot)) * (size_t)head_dim + (size_t)i) * 2;
     st_f16(kc + dst, k[gid]);
     st_f16(vc + dst, v[gid]);
 }
 
 extern "C" __global__ void attention_f16(const float* q, const unsigned char* kc, const unsigned char* vc, float* xb3, float* scores,
-                                         int head_dim, int seq_len, int kv_mul, int pos) {
+                                         int head_dim, int seq_len, int kv_mul, int pos, const int* pos_slot) {
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
     int kvh = h / kv_mul;
@@ -619,7 +680,7 @@ extern "C" __global__ void attention_f16(const float* q, const unsigned char* kc
     const unsigned char* kbase = kc + (size_t)kvh * (size_t)seq_len * (size_t)head_dim * 2;
     const unsigned char* vbase = vc + (size_t)kvh * (size_t)seq_len * (size_t)head_dim * 2;
     float scale = rsqrtf((float)head_dim);
-    int npos = live_pos(pos) + 1;
+    int npos = live_pos(pos, pos_slot) + 1;
     float* sc = scores + (size_t)h * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kk = kbase + (size_t)t * (size_t)head_dim * 2;
@@ -650,7 +711,7 @@ extern "C" __global__ void attention_f16(const float* q, const unsigned char* kc
 }
 
 extern "C" __global__ void store_kv_q8(const float* k, const float* v, unsigned char* kc, unsigned char* vc,
-                                       int nblocks, int pos_bytes, int pos) {
+                                       int nblocks, int pos_bytes, int pos, const int* pos_slot) {
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (gid >= nblocks) return;
     const float* k32 = k + (size_t)gid * 32;
@@ -663,7 +724,7 @@ extern "C" __global__ void store_kv_q8(const float* k, const float* v, unsigned 
     float kd = kamax / 127.f, vd = vamax / 127.f;
     float kid = kd != 0.f ? 1.f / kd : 0.f;
     float vid = vd != 0.f ? 1.f / vd : 0.f;
-    int pslot = live_pos(pos);
+    int pslot = live_pos(pos, pos_slot);
     unsigned char* kb = kc + (size_t)pslot * (size_t)pos_bytes + (size_t)gid * 34;
     unsigned char* vb = vc + (size_t)pslot * (size_t)pos_bytes + (size_t)gid * 34;
     st_f16(kb, kd);
@@ -675,7 +736,7 @@ extern "C" __global__ void store_kv_q8(const float* k, const float* v, unsigned 
 }
 
 extern "C" __global__ void attention_q8(const float* q, const unsigned char* kc, const unsigned char* vc, float* xb3, float* scores,
-                                        int head_dim, int pos_bytes, int kv_mul, int pos, int seq_len) {
+                                        int head_dim, int pos_bytes, int kv_mul, int pos, int seq_len, const int* pos_slot) {
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
     int nb = head_dim >> 5;
@@ -683,7 +744,7 @@ extern "C" __global__ void attention_q8(const float* q, const unsigned char* kc,
     int hb = kvh * nb;
     const float* qh = q + (size_t)h * (size_t)head_dim;
     float scale = rsqrtf((float)head_dim);
-    int npos = live_pos(pos) + 1;
+    int npos = live_pos(pos, pos_slot) + 1;
     float* sc = scores + (size_t)h * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kb = kc + (size_t)t * (size_t)pos_bytes + (size_t)hb * 34;
@@ -722,7 +783,7 @@ extern "C" __global__ void attention_q8(const float* q, const unsigned char* kc,
 }
 
 extern "C" __global__ void store_kv_q8v(const float* k, const float* v, unsigned char* kc, unsigned char* vc,
-                                        int nblocks, int k_pos_bytes, int v_pos_bytes, int pos) {
+                                        int nblocks, int k_pos_bytes, int v_pos_bytes, int pos, const int* pos_slot) {
     int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (gid >= nblocks) return;
     const float* k32 = k + (size_t)gid * 32;
@@ -731,7 +792,7 @@ extern "C" __global__ void store_kv_q8v(const float* k, const float* v, unsigned
     for (int j = 0; j < 32; ++j) kamax = fmaxf(kamax, fabsf(k32[j]));
     float kd = kamax / 127.f;
     float kid = kd != 0.f ? 1.f / kd : 0.f;
-    int pslot = live_pos(pos);
+    int pslot = live_pos(pos, pos_slot);
     unsigned char* kb = kc + (size_t)pslot * (size_t)k_pos_bytes + (size_t)gid * 34;
     st_f16(kb, kd);
     for (int j = 0; j < 32; ++j) kb[2 + j] = (unsigned char)(signed char)(int)roundf(k32[j] * kid);
@@ -757,7 +818,7 @@ extern "C" __global__ void store_kv_q8v(const float* k, const float* v, unsigned
 }
 
 extern "C" __global__ void attention_q8v(const float* q, const unsigned char* kc, const unsigned char* vc, float* xb3, float* scores,
-                                         int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int pos, int seq_len) {
+                                         int head_dim, int k_pos_bytes, int v_pos_bytes, int kv_mul, int pos, int seq_len, const int* pos_slot) {
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
     int nb = head_dim >> 5;
@@ -765,7 +826,7 @@ extern "C" __global__ void attention_q8v(const float* q, const unsigned char* kc
     int hb = kvh * nb;
     const float* qh = q + (size_t)h * (size_t)head_dim;
     float scale = rsqrtf((float)head_dim);
-    int npos = live_pos(pos) + 1;
+    int npos = live_pos(pos, pos_slot) + 1;
     float* sc = scores + (size_t)h * (size_t)seq_len;
     for (int t = tid; t < npos; t += 128) {
         const unsigned char* kb = kc + (size_t)t * (size_t)k_pos_bytes + (size_t)hb * 34;
@@ -913,6 +974,30 @@ extern "C" __global__ void rmsnorm_gated(float* out, const float* inp, const flo
         float normed = weight[j] * (inv * xi[j]);
         float gz = zi[j] * sigmoid_stable(zi[j]);
         oi[j] = normed * gz;
+    }
+}
+
+/* Same norm, then q8 of this head. size % 32 == 0 so groups do not cross heads. */
+extern "C" __global__ void rmsnorm_gated_quant(float* out, const float* inp, const float* weight, const float* gate,
+                                               signed char* qs, float* scale, float2* sum16, int size, float eps) {
+    int vh = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    const float* xi = inp + (size_t)vh * (size_t)size;
+    float* oi = out + (size_t)vh * (size_t)size;
+    const float* zi = gate + (size_t)vh * (size_t)size;
+    float ss = 0.f;
+    for (int j = tid; j < size; j += 128) ss += xi[j] * xi[j];
+    ss = block_sum_128(ss);
+    float inv = rsqrtf(ss / (float)size + eps);
+    for (int j = tid; j < size; j += 128) {
+        float normed = weight[j] * (inv * xi[j]);
+        float gz = zi[j] * sigmoid_stable(zi[j]);
+        oi[j] = normed * gz;
+    }
+    __syncthreads();
+    int ng = size >> 5;
+    for (int g = tid; g < ng; g += 128) {
+        quant_store_group(oi + (g << 5), qs, scale, sum16, vh * ng + g);
     }
 }
 
@@ -1301,10 +1386,12 @@ DEF_TC(q8_k, 12)
 
 #undef DEF_TC
 
-/* Q4_K / Q6_K prefill. One K-block is 256 values, so the tile is 32 tokens
-   by 32 rows by 256 K. The weight block is expanded to fp16 once per row
-   and reused for every WMMA step along that K. The scalar tc_* kernel stays
-   for other kinds and for K that is not a multiple of 256. */
+/* Q4_K / Q6_K prefill. A block owns 32 output rows and 128 tokens, in two
+   64-token WMMA chunks that share one fp16 weight tile. K steps by 128
+   (half a quant block). Prefill chunks are 128 tokens, so each weight
+   block is expanded once per chunk instead of once per 32 tokens. The
+   scalar tc_* kernel stays for other kinds and for K that is not a
+   multiple of 256. ODINFER_CUDA_TC2=0 selects that kernel. */
 template<int Q6>
 __device__ void tc2_dequant_row(const unsigned char* blk, int part, unsigned short* dst) {
     if (Q6 == 0) {
@@ -1352,30 +1439,60 @@ __device__ void tc2_dequant_row(const unsigned char* blk, int part, unsigned sho
 }
 
 template<int Q6>
+__device__ void tc2_mma_k(unsigned short* Xs, unsigned short* Ws, int BK, int warp,
+                          float& c0, float& c1, float& c2, float& c3, float& c4, float& c5, float& c6, float& c7) {
+    /* 8 warps cover a 64x32 tile: warp>>1 is the token group, warp&1 the row group. */
+    int wm = warp >> 1;
+    int wn = warp & 1;
+#pragma unroll 1
+    for (int kk = 0; kk < BK; kk += 16) {
+        unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+        unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+        wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
+        wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
+        wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+    }
+}
+
+__device__ void tc2_scatter(float* tile, float* out, int tid, int nwarps, int tbase, int n0, int T, int d) {
+    for (int idx = tid; idx < nwarps * 256; idx += 256) {
+        int w = idx >> 8;
+        int e = idx & 255;
+        int i = e >> 4;
+        int j = e & 15;
+        int wm = w >> 1;
+        int wn = w & 1;
+        int t = tbase + wm * 16 + i;
+        int orow = n0 + wn * 16 + j;
+        if (t < T && orow < d) out[(size_t)t * (size_t)d + orow] = tile[idx];
+    }
+}
+
+template<int Q6>
 __device__ void tc2_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
-    const int BM = 32;
+    const int BM = 64;
     const int BN = 32;
-    const int BK = 256;
+    const int BK = 128;
     const int tid = (int)threadIdx.x;
-    const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int t0 = (int)blockIdx.y * BM;
+    const int t0 = (int)blockIdx.y * (BM * 2);
     const int n0 = (int)blockIdx.x * BN;
     if (t0 >= T || n0 >= d) return;
-    int sub = lane >> 3;
-    int part = lane & 7;
-    int row = warp * 4 + sub;
     int bbytes = Q6 ? 210 : 144;
     int nb = n >> 8;
+    int second = (t0 + BM) < T;
 
-    __shared__ __align__(16) unsigned char raw[32 * 256 * 4];
+    __shared__ __align__(16) unsigned char raw[64 * 128 * 2 + 32 * 128 * 2];
     unsigned short* Xs = (unsigned short*)raw;
     unsigned short* Ws = Xs + BM * BK;
 
-    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f, a4 = 0.f, a5 = 0.f, a6 = 0.f, a7 = 0.f;
+    float b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f, b4 = 0.f, b5 = 0.f, b6 = 0.f, b7 = 0.f;
     for (int k0 = 0; k0 < n; k0 += BK) {
-        if (row < BN) {
-            unsigned short* dst = Ws + row * BK + part * 32;
+        if (tid < BN * 4) {
+            int row = tid & (BN - 1);
+            int part = ((k0 & 255) >> 5) + (tid >> 5);
+            unsigned short* dst = Ws + row * BK + (tid >> 5) * 32;
             if (n0 + row < d) {
                 const unsigned char* blk = wb + ((size_t)(n0 + row) * (size_t)nb + (size_t)(k0 >> 8)) * (size_t)bbytes;
                 tc2_dequant_row<Q6>(blk, part, dst);
@@ -1384,45 +1501,58 @@ __device__ void tc2_run(const unsigned char* wb, const float* x, float* out, int
                 for (int j = 0; j < 32; ++j) dst[j] = 0;
             }
         }
-        for (int i = tid; i < BM * BK; i += 256) {
-            int tr = i >> 8;
-            int kk = i & 255;
-            float v = 0.f;
+        for (int e = tid; e < (BM * BK) / 4; e += 256) {
+            int elem = e << 2;
+            int tr = elem >> 7;
+            int kk = elem & 127;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
             int tt = t0 + tr;
             int kkabs = k0 + kk;
-            if (tt < T && kkabs < n) v = x[(size_t)tt * (size_t)n + (size_t)kkabs];
-            Xs[i] = f32_to_f16(v);
-        }
-        __syncthreads();
-        if (warp < 4) {
-            int wm = warp >> 1;
-            int wn = warp & 1;
-            for (int kk = 0; kk < BK; kk += 16) {
-                unsigned a0, a1, a2, a3, a4, a5, a6, a7;
-                unsigned b0, b1, b2, b3, b4, b5, b6, b7;
-                wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
-                wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
-                wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+            if (tt < T && kkabs + 3 < n) {
+                const float* xp = x + (size_t)tt * (size_t)n + (size_t)kkabs;
+                v = *reinterpret_cast<const float4*>(xp);
             }
+            unsigned short* dp = Xs + elem;
+            dp[0] = f32_to_f16(v.x);
+            dp[1] = f32_to_f16(v.y);
+            dp[2] = f32_to_f16(v.z);
+            dp[3] = f32_to_f16(v.w);
+        }
+        __syncthreads();
+        tc2_mma_k<Q6>(Xs, Ws, BK, warp, a0, a1, a2, a3, a4, a5, a6, a7);
+        if (second) {
+            __syncthreads();
+            for (int e = tid; e < (BM * BK) / 4; e += 256) {
+                int elem = e << 2;
+                int tr = elem >> 7;
+                int kk = elem & 127;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                int tt = t0 + BM + tr;
+                int kkabs = k0 + kk;
+                if (tt < T && kkabs + 3 < n) {
+                    const float* xp = x + (size_t)tt * (size_t)n + (size_t)kkabs;
+                    v = *reinterpret_cast<const float4*>(xp);
+                }
+                unsigned short* dp = Xs + elem;
+                dp[0] = f32_to_f16(v.x);
+                dp[1] = f32_to_f16(v.y);
+                dp[2] = f32_to_f16(v.z);
+                dp[3] = f32_to_f16(v.w);
+            }
+            __syncthreads();
+            tc2_mma_k<Q6>(Xs, Ws, BK, warp, b0, b1, b2, b3, b4, b5, b6, b7);
         }
         __syncthreads();
     }
-    if (warp < 4) {
-        float* tile = (float*)raw;
-        wmma_store(tile + warp * 256, 16, c0, c1, c2, c3, c4, c5, c6, c7);
-    }
-    __syncthreads();
     float* tile = (float*)raw;
-    for (int idx = tid; idx < 4 * 256; idx += 256) {
-        int w = idx >> 8;
-        int e = idx & 255;
-        int i = e >> 4;
-        int j = e & 15;
-        int wm = w >> 1;
-        int wn = w & 1;
-        int t = t0 + wm * 16 + i;
-        int orow = n0 + wn * 16 + j;
-        if (t < T && orow < d) out[(size_t)t * (size_t)d + orow] = tile[idx];
+    wmma_store(tile + warp * 256, 16, a0, a1, a2, a3, a4, a5, a6, a7);
+    __syncthreads();
+    tc2_scatter(tile, out, tid, 8, t0, n0, T, d);
+    if (second) {
+        __syncthreads();
+        wmma_store(tile + warp * 256, 16, b0, b1, b2, b3, b4, b5, b6, b7);
+        __syncthreads();
+        tc2_scatter(tile, out, tid, 8, t0 + BM, n0, T, d);
     }
 }
 
@@ -1726,6 +1856,15 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
     store_row(out, row, d, t == 0, acc, accumulate);
 }
 
+/* 16 smem bytes. Q6 rows are 2-byte aligned, so a uint4 at `mis` is not. */
+__device__ __forceinline__ uint4 ld_u4_bytes(const unsigned char* p) {
+    uint4 o;
+    unsigned char* d = (unsigned char*)&o;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) d[i] = p[i];
+    return o;
+}
+
 extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char* xq, const float* xd,
                                       float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
@@ -1740,19 +1879,34 @@ extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char
     int nb = n >> 8;
     int b0s, b1s;
     k_range(nb, &b0s, &b1s);
+    /* Stage each 210-byte block through aligned global loads. A 210-byte
+       stride is misaligned for 7 of 8 rows, and ld.global.v4 then splits. */
+    __shared__ __align__(16) unsigned char q6sm[16 * 4 * 224];
     float acc = 0.f;
     for (int b = b0s; b < b1s; ++b) {
         uint4 ql = make_uint4(0, 0, 0, 0);
         uint4 qh = make_uint4(0, 0, 0, 0);
         uint4 scv = make_uint4(0, 0, 0, 0);
         float dW = 0.f;
+        unsigned char* staged = q6sm + (warp * 4 + sub) * 224;
         if (row < d) {
             const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 210;
-            ql = ld_u4_aligned(blk + t * 16);
-            qh = ld_u4_aligned(blk + 128 + half * 32 + l0);
+            unsigned long long addr = (unsigned long long)blk;
+            unsigned mis = (unsigned)(addr & 15ull);
+            const unsigned char* base = (const unsigned char*)(addr & ~15ull);
+            for (int v = t; v < 14; v += 8) {
+                uint4 u = *(const uint4*)(base + (size_t)v * 16);
+                *(uint4*)(staged + v * 16) = u;
+            }
+        }
+        __syncwarp();
+        if (row < d) {
+            unsigned mis = (unsigned)(((unsigned long long)(wb + ((size_t)row * (size_t)nb + (size_t)b) * 210)) & 15ull);
+            ql = ld_u4_bytes(staged + mis + t * 16);
+            qh = ld_u4_bytes(staged + mis + 128 + half * 32 + l0);
             if (t == 0) {
-                scv = ld_u4_aligned(blk + 192);
-                dW = ld_f16(blk + 208);
+                scv = ld_u4_bytes(staged + mis + 192);
+                dW = ld_f16(staged + mis + 208);
             }
         }
         int src = lane & ~7;
