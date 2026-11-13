@@ -1,11 +1,15 @@
 /* Runtime-loaded CUDA driver API + NVRTC.
    No nvcc and no libcuda link at Odin compile time. The .so is dlopen'd.
-   NVRTC load order (learned the hard way on CUDA 13):
-     1. $NVRTC_DIR if set (directory or a full soname path)
-     2. versioned sonames libnvrtc.so.13, libnvrtc.so.12
-     3. bare libnvrtc.so last (it is often a linker script or the wrong major)
-   Callers must pass an explicit --gpu-architecture=compute_XX. CUDA 13 NVRTC
-   defaults to sm_75, which will not JIT on sm_70 (V100). */
+   NVRTC load order:
+     1. $ODINFER_NVRTC_PATH if set (file or directory). Exclusive.
+     2. $NVRTC_DIR if set (directory or a full soname path), then the
+        loader sonames, then a pip nvidia-cuda-nvrtc-cu12 tree.
+     3. otherwise versioned sonames, then bare libnvrtc.so, then pip.
+   compute_70 / compute_72 (sm_70, Tesla V100) cannot be compiled by CUDA 13
+   NVRTC, which dropped archs below sm_75. Those compiles search NVRTC 12.x
+   only (libnvrtc.so.12, then a pip nvidia-cuda-nvrtc-cu12 tree). A 13.x
+   driver can still JIT the 12.9 PTX. Callers pass
+   --gpu-architecture=compute_XX; CUDA 13's default is sm_75. */
 
 package cuda
 
@@ -177,50 +181,88 @@ preload_builtins :: proc(dir: string) {
 	}
 }
 
-// load_nvrtc opens NVRTC. `dir` overrides NVRTC_DIR when non-empty (tests).
-load_nvrtc :: proc(dir := "") -> Error {
+@(private)
+is_soname_path :: proc(path: string) -> bool {
+	return strings.has_suffix(path, ".so") || strings.contains(path, ".so.")
+}
+
+@(private)
+nvrtc_major :: proc() -> int {
+	if nv.Version == nil {
+		return 0
+	}
+	maj, min: c.int
+	if nv.Version(&maj, &min) != OK {
+		return 0
+	}
+	return int(maj)
+}
+
+@(private)
+unload_nv :: proc() {
 	if nv.__handle != nil {
-		return OK
+		dynlib.unload_library(nv.__handle)
 	}
-	from := dir
-	if from == "" {
-		from = os.get_env("NVRTC_DIR", context.temp_allocator)
+	nv = {}
+	if nv_loaded_from != "" {
+		delete(nv_loaded_from)
+		nv_loaded_from = ""
 	}
-	candidates := make([dynamic]string, context.temp_allocator)
-	defer delete(candidates)
+}
 
-	when ODIN_OS == .Windows {
-		if from != "" {
-			append(&candidates, from)
-			append(&candidates, join_path(from, "nvrtc64_130_0.dll"))
-			append(&candidates, join_path(from, "nvrtc64_120_0.dll"))
-		}
-		append(&candidates, "nvrtc64_130_0.dll")
-		append(&candidates, "nvrtc64_120_0.dll")
-	} else 	when ODIN_OS == .Linux {
-		if from != "" {
-			bdir := from
-			if strings.has_suffix(from, ".so") || strings.contains(from, ".so.") {
-				bdir = parent_dir(from)
-			}
-			preload_builtins(bdir)
-			// A full path to the library itself, then versioned names inside the dir.
-			if strings.has_suffix(from, ".so") || strings.contains(from, ".so.") {
-				append(&candidates, from)
-			}
-			append(&candidates, join_path(from, "libnvrtc.so.13"))
-			append(&candidates, join_path(from, "libnvrtc.so.12"))
-			append(&candidates, join_path(from, "libnvrtc.so"))
-		}
-		// Versioned sonames before the unversioned name. The bare libnvrtc.so
-		// on a CUDA 13 box can resolve to a stub that will not compile for sm_70.
-		append(&candidates, "libnvrtc.so.13")
-		append(&candidates, "libnvrtc.so.12")
-		append(&candidates, "libnvrtc.so")
-	}
+// CUDA 13 NVRTC cannot emit compute_70 / compute_72. A 13.x driver can JIT
+// PTX produced by NVRTC 12.9.
+nvrtc12_hint :: proc() {
+	fmt.eprintln("cuda: CUDA 13 NVRTC cannot target compute_70 (sm_70, Tesla V100). Archs below sm_75 were removed.")
+	fmt.eprintln("cuda: a 13.x driver can still JIT PTX from NVRTC 12.9. Install that library and set ODINFER_NVRTC_PATH:")
+	fmt.eprintln("cuda:   python3 -m pip install --user nvidia-cuda-nvrtc-cu12")
+	fmt.eprintln("cuda:   export ODINFER_NVRTC_PATH=\"$HOME/.local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12\"")
+}
 
+@(private)
+append_linux_names :: proc(dst: ^[dynamic]string, dir: string, prefer12: bool) {
+	if prefer12 {
+		append(dst, join_path(dir, "libnvrtc.so.12"))
+		append(dst, join_path(dir, "libnvrtc.so"))
+		return
+	}
+	append(dst, join_path(dir, "libnvrtc.so.13"))
+	append(dst, join_path(dir, "libnvrtc.so.12"))
+	append(dst, join_path(dir, "libnvrtc.so"))
+}
+
+// pip nvidia-cuda-nvrtc-cu12 drops libnvrtc.so.12 under site-packages.
+@(private)
+append_pip_nvrtc :: proc(dst: ^[dynamic]string, prefer12: bool) {
+	home := os.get_env("HOME", context.temp_allocator)
+	py3 := "/usr/lib/python3/dist-packages/nvidia/cuda_nvrtc/lib"
+	if os.exists(py3) {
+		append_linux_names(dst, py3, prefer12)
+	}
+	vers := [?]string{"3.14", "3.13", "3.12", "3.11", "3.10", "3.9", "3.8"}
+	for v in vers {
+		cands := [3]string{
+			fmt.tprintf("%s/.local/lib/python%s/site-packages/nvidia/cuda_nvrtc/lib", home, v),
+			fmt.tprintf("/usr/local/lib/python%s/dist-packages/nvidia/cuda_nvrtc/lib", v),
+			fmt.tprintf("/usr/lib/python%s/dist-packages/nvidia/cuda_nvrtc/lib", v),
+		}
+		for d in cands {
+			if os.exists(d) {
+				append_linux_names(dst, d, prefer12)
+			}
+		}
+	}
+}
+
+@(private)
+try_nvrtc_candidates :: proc(candidates: []string, prefer12: bool) -> Error {
 	want := nvrtc_symbol_count()
 	for path in candidates {
+		dir := path
+		if is_soname_path(path) {
+			dir = parent_dir(path)
+		}
+		preload_builtins(dir)
 		count, ok := dynlib.initialize_symbols(&nv, path, "nvrtc")
 		if nv.__handle == nil {
 			nv = {}
@@ -231,10 +273,110 @@ load_nvrtc :: proc(dir := "") -> Error {
 			nv = {}
 			continue
 		}
+		if prefer12 && nvrtc_major() >= 13 {
+			fmt.eprintfln("cuda: skipping NVRTC %d at %s (cannot target compute_70)", nvrtc_major(), path)
+			dynlib.unload_library(nv.__handle)
+			nv = {}
+			continue
+		}
+		if nv_loaded_from != "" {
+			delete(nv_loaded_from)
+		}
 		nv_loaded_from = strings.clone(path)
+		maj, min: c.int
+		if nv.Version != nil && nv.Version(&maj, &min) == OK {
+			fmt.eprintfln("cuda: NVRTC %d.%d from %s", int(maj), int(min), path)
+		}
 		return OK
 	}
 	return ERR_LIBRARY
+}
+
+// load_nvrtc opens NVRTC. `dir` overrides the env paths when non-empty (tests).
+// prefer12 limits the search to NVRTC 12.x, which is required for compute_70.
+load_nvrtc :: proc(dir := "", prefer12 := false) -> Error {
+	if nv.__handle != nil {
+		if !prefer12 || nvrtc_major() < 13 {
+			return OK
+		}
+		fmt.eprintfln("cuda: loaded NVRTC %d from %s cannot target compute_70; looking for NVRTC 12.x", nvrtc_major(), nv_loaded_from)
+		unload_nv()
+	}
+
+	// ODINFER_NVRTC_PATH and the dir argument are exclusive. NVRTC_DIR is
+	// only the first place to look: on sm_70 a directory that holds NVRTC
+	// 13 must not hide a pip-installed libnvrtc.so.12.
+	from := dir
+	exclusive := dir != ""
+	if from == "" {
+		from = os.get_env("ODINFER_NVRTC_PATH", context.temp_allocator)
+		if from != "" {
+			exclusive = true
+		}
+	}
+	if from == "" {
+		from = os.get_env("NVRTC_DIR", context.temp_allocator)
+	}
+
+	candidates := make([dynamic]string, context.temp_allocator)
+	defer delete(candidates)
+
+	when ODIN_OS == .Windows {
+		if from != "" {
+			append(&candidates, from)
+			append(&candidates, join_path(from, "nvrtc64_120_0.dll"))
+			if !prefer12 {
+				append(&candidates, join_path(from, "nvrtc64_130_0.dll"))
+			}
+		}
+		if !exclusive {
+			append(&candidates, "nvrtc64_120_0.dll")
+			if !prefer12 {
+				append(&candidates, "nvrtc64_130_0.dll")
+			}
+		}
+	} else when ODIN_OS == .Linux {
+		if from != "" {
+			if is_soname_path(from) {
+				append(&candidates, from)
+			} else {
+				append_linux_names(&candidates, from, prefer12)
+			}
+		}
+		if !exclusive {
+			if prefer12 {
+				// pip's 12.x wheel before the loader, which on a CUDA 13 box
+				// resolves libnvrtc.so to NVRTC 13 (no compute_70).
+				append_pip_nvrtc(&candidates, true)
+				append(&candidates, "libnvrtc.so.12")
+				append(&candidates, "libnvrtc.so")
+			} else {
+				append(&candidates, "libnvrtc.so.13")
+				append(&candidates, "libnvrtc.so.12")
+				append(&candidates, "libnvrtc.so")
+				append_pip_nvrtc(&candidates, false)
+			}
+		}
+	}
+
+	err := try_nvrtc_candidates(candidates[:], prefer12)
+	if err != OK && prefer12 {
+		if from != "" {
+			fmt.eprintfln("cuda: ODINFER_NVRTC_PATH/NVRTC_DIR %s has no usable NVRTC 12.x", from)
+		}
+		nvrtc12_hint()
+	}
+	return err
+}
+
+@(private)
+options_need_nvrtc12 :: proc(options: []string) -> bool {
+	for o in options {
+		if strings.contains(o, "compute_70") || strings.contains(o, "compute_72") || strings.contains(o, "sm_70") || strings.contains(o, "sm_72") {
+			return true
+		}
+	}
+	return false
 }
 
 parent_dir :: proc(path: string) -> string {
@@ -284,9 +426,27 @@ error_string :: proc(err: Error) -> string {
 // --gpu-architecture=compute_XX derived from the device. `log` is always
 // populated when NVRTC produced a diagnostic (success or failure).
 compile_ptx :: proc(source, name: string, options: []string, allocator := context.allocator) -> (ptx: string, log: string, err: Error) {
-	if e := load_nvrtc(); e != OK {
+	want12 := options_need_nvrtc12(options)
+	if e := load_nvrtc("", want12); e != OK {
 		return "", "", e
 	}
+	ptx, log, err = compile_loaded(source, name, options, allocator)
+	// compute_70 asked for 12.x already. A compile that still failed on
+	// NVRTC 13 (arch was not in the option string, or 13 was already loaded)
+	// gets one retry against 12.x.
+	if err == OK || nvrtc_major() < 13 {
+		return
+	}
+	fmt.eprintln("cuda: NVRTC compile failed on a 13.x library. CUDA 13 NVRTC cannot target compute_70. Retrying with NVRTC 12.x.")
+	unload_nv()
+	if e := load_nvrtc("", true); e != OK {
+		return "", log, err
+	}
+	return compile_loaded(source, name, options, allocator)
+}
+
+@(private)
+compile_loaded :: proc(source, name: string, options: []string, allocator := context.allocator) -> (ptx: string, log: string, err: Error) {
 	csrc := strings.clone_to_cstring(source, context.temp_allocator)
 	cname := strings.clone_to_cstring(name, context.temp_allocator)
 	copts := make([]cstring, len(options), context.temp_allocator)

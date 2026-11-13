@@ -38,20 +38,29 @@ KV 存取、复位都是 `when`，编译出来的热路径没有 Metal/CUDA 分�
 
 ## NVRTC
 
-`NVRTC_DIR` 指到库所在目录，或直接给 soname 的完整路径。加载顺序：
+`ODINFER_NVRTC_PATH` 是独占覆盖：指向 `libnvrtc.so.12`（或 `.13`）的完整路径，
+或包含它的目录。设了它就不再搜索其它位置。没设覆盖时先找 `NVRTC_DIR`，然后
+继续往下找。
 
-1. `$NVRTC_DIR/libnvrtc.so.13`，然后 `.12`，然后 `libnvrtc.so`（路径本身以
-   `.so` 结尾时先加载它）。同目录的 `libnvrtc-builtins.so.13` / `.12`，以及
-   wheel 实际带的完整版本名（`libnvrtc-builtins.so.12.9`、
-   `libnvrtc-builtins.so.13.0`，以及该目录里其它以 `libnvrtc-builtins`
-   开头、且不是 `.alt.` 的文件）会用 `RTLD_GLOBAL` 预加载。
-2. 系统上的 `libnvrtc.so.13`、`libnvrtc.so.12`，最后才是不带版本的
-   `libnvrtc.so`。
+否则加载器先试带版本的 soname，再试不带版本的名字（`libnvrtc.so.13`、`.12`、
+`libnvrtc.so`），然后找 pip 的 `nvidia-cuda-nvrtc-cu12`
+（`~/.local/lib/python3.*/site-packages/nvidia/cuda_nvrtc/lib`）。对应的
+`libnvrtc-builtins.so.<主版本>.<次版本>`（wheel 里是
+`libnvrtc-builtins.so.12.9`，没有 `.so.12`）用 `RTLD_GLOBAL` 预加载。
+`.alt.` 那份会跳过。
 
-不带版本的名字放在最后：CUDA 13 的机器上它经常是错误的主版本。每次编译都带
-上从设备算力得到的 `--gpu-architecture=compute_XX`。CUDA 13 的 NVRTC 默认
-sm_75，在 V100（sm_70）上 JIT 不过。7.0 设备对应 `compute_70`。
+CUDA 13 的 NVRTC 不能编译 `compute_70`。低于 sm_75 的架构被删了，CUDA 13
+机器上不带版本的 `libnvrtc.so` 就是这个 13.x 库。13.x 的驱动仍然可以 JIT
+NVRTC 12.9 产出的 PTX。设备是 sm_70 / sm_72，或者 `compute_70` 在 13.x 库上
+编译失败时，运行时只加载 NVRTC 12.x，找不到就打印 pip 路径。NVRTC 12.9 会
+警告 sm_75 之前的架构已弃用，在 V100 上这是预期的。
 
+```sh
+python3 -m pip install --user nvidia-cuda-nvrtc-cu12
+export ODINFER_NVRTC_PATH="$HOME/.local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12"
+```
+
+每次编译都带上从设备算力得到的 `--gpu-architecture=compute_XX`。
 `CUDA_DEVICE` 选设备序号，默认 0。
 
 ## 检查脚本
@@ -71,10 +80,19 @@ sm_75，在 V100（sm_70）上 JIT 不过。7.0 设备对应 `compute_70`。
 | `$MODEL` | 加载器能读的任意 Qwen3.5 GGUF | 你指定的文件 |
 | `models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf` | 524 MB | MoE，混合 Q4_K / Q8_0 / Q5_0 |
 | `$HOME/.odinfer/models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf` | 524 MB | 同上，安装器目录 |
-| `models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf` | 5.6 GB | 稠密 Q4_K_M（Q4_K + Q6_K + F32 norm） |
+| `models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf` | Mac 基准，sha256 前缀 `a692de95` | 稠密 Q4_K_M（Q4_K + Q6_K + F32 norm） |
 
 冒烟参数：`SMOKE_TOKENS` 默认 16，`SMOKE_CTX` 默认 2048。没有模型文件时内核
 测试照跑，冒烟跳过，除非 `CUDA_CHECK_REQUIRE_SMOKE=1`。
+
+脚本会打印 `sha256 <十六进制> <路径>`。Mac 上的 9B 基准文件以前缀
+`a692de95` 开头。`mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF`
+当前的 Hugging Face `main`（提交 `29319295d35e` 到 `a713868aa6cd`）是另一份
+量化：sha256 前缀 `b4363b57`，5780092768 字节。不能把这个提交钉成基准，
+因为 `a692de95` 已经不在该仓库现存历史里。heretic 9B 的哈希不是
+`a692de95` 时，`cuda_check.sh` 拒绝冒烟，除非 `CUDA_CHECK_ALLOW_REQUANT=1`。
+`scripts/install.sh --model qwen9b` 仍会拉 HF `main`，打印 sha256，并在
+不是 `a692de95` 时给出警告。
 
 脚本包住的命令：
 

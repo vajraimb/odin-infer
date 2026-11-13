@@ -42,7 +42,8 @@ you isolate per-stage GPU time. Never enable in production.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `NVRTC_DIR` | unset | Directory (or a full `libnvrtc.so.13` path) searched before the system sonames. Versioned `libnvrtc.so.13` / `.12` are tried before bare `libnvrtc.so`. |
+| `ODINFER_NVRTC_PATH` | unset | Exclusive path to `libnvrtc.so.12` (sm_70) or `.13`, or the directory that contains it. CUDA 13 NVRTC cannot target compute_70; a V100 needs NVRTC 12.x (`pip install nvidia-cuda-nvrtc-cu12`). |
+| `NVRTC_DIR` | unset | Directory or soname path searched first when `ODINFER_NVRTC_PATH` is unset. For sm_70 a 13.x library there is skipped and the search continues to pip `libnvrtc.so.12` and the loader. |
 | `CUDA_DEVICE` | `0` | Device ordinal. |
 | `QTIMING` | off | `=1` prints per-chunk CUDA wall time on stderr. |
 | `KV_Q8` / `KV_V` | Q8 K + mixed V | Same switches as Metal. The on-disk KV snapshot format is shared. |

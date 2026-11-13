@@ -42,23 +42,33 @@ compiled hot path has no Metal-vs-CUDA test.
 
 ## NVRTC
 
-Set `NVRTC_DIR` to the directory that contains the real library, or to the
-full soname path. Load order:
+`ODINFER_NVRTC_PATH` is an exclusive override: a full path to
+`libnvrtc.so.12` (or `.13`), or a directory that contains it. When it is
+set, nothing else is searched. `NVRTC_DIR` is searched first when the
+override is unset, and the search then continues.
 
-1. `$NVRTC_DIR/libnvrtc.so.13`, then `.12`, then `libnvrtc.so` (and the path
-   itself if it already ends in `.so`). `libnvrtc-builtins.so.13` / `.12`,
-   and the fully versioned name the wheel actually ships
-   (`libnvrtc-builtins.so.12.9`, `libnvrtc-builtins.so.13.0`, anything else
-   in that directory starting with `libnvrtc-builtins` except the `.alt.`
-   copy) is preloaded with `RTLD_GLOBAL`.
-2. System `libnvrtc.so.13`, then `libnvrtc.so.12`, then bare `libnvrtc.so`.
+Otherwise the loader tries versioned sonames before the bare name
+(`libnvrtc.so.13`, then `.12`, then `libnvrtc.so`), then a pip
+`nvidia-cuda-nvrtc-cu12` tree
+(`~/.local/lib/python3.*/site-packages/nvidia/cuda_nvrtc/lib`). The matching
+`libnvrtc-builtins.so.<major>.<minor>` (the wheel ships
+`libnvrtc-builtins.so.12.9`, not `.so.12`) is preloaded with `RTLD_GLOBAL`.
+The `.alt.` copy is skipped.
 
-The bare soname is last on purpose. On a CUDA 13 machine it is often the
-wrong major. Every compile passes
-`--gpu-architecture=compute_XX` from the device's compute capability.
-CUDA 13 NVRTC defaults to sm_75, which will not JIT on a V100 (sm_70).
-For a 7.0 device the flag is `compute_70`.
+CUDA 13 NVRTC cannot target `compute_70`. Archs below sm_75 were removed,
+and the bare `libnvrtc.so` on a CUDA 13 machine is that 13.x library. A
+13.x driver can still JIT PTX produced by NVRTC 12.9. When the device is
+sm_70 / sm_72, or a `compute_70` compile fails on a 13.x library, the
+runtime loads NVRTC 12.x only and prints the pip path if none is found.
+NVRTC 12.9 warns that archs before sm_75 are deprecated. That warning is
+expected on a V100.
 
+```sh
+python3 -m pip install --user nvidia-cuda-nvrtc-cu12
+export ODINFER_NVRTC_PATH="$HOME/.local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12"
+```
+
+Every compile passes `--gpu-architecture=compute_XX` from the device.
 `CUDA_DEVICE` selects the ordinal (default 0).
 
 ## Check script
@@ -78,11 +88,23 @@ Model search, first hit wins (`MODEL` overrides):
 | `$MODEL` | any Qwen3.5 GGUF the loader accepts | whatever you point at |
 | `models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf` | 524 MB | MoE, mixed Q4_K / Q8_0 / Q5_0 |
 | `$HOME/.odinfer/models/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf` | 524 MB | same, installer layout |
-| `models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf` | 5.6 GB | dense Q4_K_M (Q4_K + Q6_K + F32 norms) |
+| `models/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf` | Mac benchmark, sha256 prefix `a692de95` | dense Q4_K_M (Q4_K + Q6_K + F32 norms) |
 
 Smoke arguments (overridable): `SMOKE_TOKENS` default 16, `SMOKE_CTX` default
 2048. If no model file is present the kernel test still runs and smoke is
 skipped, unless `CUDA_CHECK_REQUIRE_SMOKE=1`.
+
+The script prints `sha256 <hex> <path>` for the file it found. The Mac
+benchmark 9B starts with `a692de95`. Current Hugging Face `main` of
+`mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF`
+(commits `29319295d35e` through `a713868aa6cd`) is a different quant:
+sha256 prefix `b4363b57`, 5780092768 bytes. That revision is not pinned,
+because pinning it would not match the Mac file, and the `a692de95` blob
+is not in the surviving history of that repo. `cuda_check.sh` refuses to
+smoke a heretic 9B whose hash does not start with `a692de95` unless
+`CUDA_CHECK_ALLOW_REQUANT=1`. `scripts/install.sh --model qwen9b` still
+fetches HF `main`, prints the sha256, and warns when it is not
+`a692de95`.
 
 Direct commands the script wraps:
 

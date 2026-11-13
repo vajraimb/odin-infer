@@ -722,7 +722,12 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	if err != cu.OK {
 		fmt.eprintf("cuda: NVRTC compile for %s failed: %s\n", arch, cu.error_string(err))
-		fmt.eprintln("cuda: set NVRTC_DIR to the directory of libnvrtc.so.13 (versioned soname, not the bare .so)")
+		pre75 := int(major) < 7 || (int(major) == 7 && int(minor) < 5)
+		if pre75 {
+			fmt.eprintln("cuda: sm_70 needs NVRTC 12.x. Set ODINFER_NVRTC_PATH to libnvrtc.so.12 from pip nvidia-cuda-nvrtc-cu12. CUDA 13 NVRTC cannot target compute_70.")
+		} else {
+			fmt.eprintln("cuda: set NVRTC_DIR or ODINFER_NVRTC_PATH to the directory of libnvrtc.so.13 (versioned soname, not the bare .so)")
+		}
 		cuda_destroy()
 		return false
 	}
