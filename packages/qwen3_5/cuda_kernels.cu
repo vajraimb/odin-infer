@@ -1386,12 +1386,11 @@ DEF_TC(q8_k, 12)
 
 #undef DEF_TC
 
-/* Q4_K / Q6_K prefill. A block owns 32 output rows and 128 tokens, in two
-   64-token WMMA chunks that share one fp16 weight tile. K steps by 128
-   (half a quant block). Prefill chunks are 128 tokens, so each weight
-   block is expanded once per chunk instead of once per 32 tokens. The
-   scalar tc_* kernel stays for other kinds and for K that is not a
-   multiple of 256. ODINFER_CUDA_TC2=0 selects that kernel. */
+/* Q4_K / Q6_K prefill, wide tile. A block owns 32 output rows and 128
+   tokens, in two 64-token WMMA chunks that share one fp16 weight tile.
+   The host uses this for T>64. T<=64 uses tc2s (32 tokens, BK=256): at
+   T=19 this tile still MMAs 64 tokens per K-step and measured 323 ms
+   against tc2s at 176 ms. ODINFER_CUDA_TC2=0 selects the scalar tile. */
 template<int Q6>
 __device__ void tc2_dequant_row(const unsigned char* blk, int part, unsigned short* dst) {
     if (Q6 == 0) {
@@ -1563,6 +1562,92 @@ extern "C" __global__ void tc2_q6_k(const unsigned char* wb, const float* x, flo
     tc2_run<1>(wb, x, out, n, d, T);
 }
 
+/* 32-token tile from 18202b0. One 256-K quant block is expanded once and
+   reused for 32 tokens. At T=19 the 128-token tile above did twice the MMA
+   and twice the X loads (a 64-token chunk, BK=128) and measured 323 ms vs
+   176 ms on the 9B. The host uses this kernel for T<=64. */
+template<int Q6>
+__device__ void tc2s_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    const int BM = 32;
+    const int BN = 32;
+    const int BK = 256;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int t0 = (int)blockIdx.y * BM;
+    const int n0 = (int)blockIdx.x * BN;
+    if (t0 >= T || n0 >= d) return;
+    int sub = lane >> 3;
+    int part = lane & 7;
+    int row = warp * 4 + sub;
+    int bbytes = Q6 ? 210 : 144;
+    int nb = n >> 8;
+
+    __shared__ __align__(16) unsigned char raw[32 * 256 * 4];
+    unsigned short* Xs = (unsigned short*)raw;
+    unsigned short* Ws = Xs + BM * BK;
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        if (row < BN) {
+            unsigned short* dst = Ws + row * BK + part * 32;
+            if (n0 + row < d) {
+                const unsigned char* blk = wb + ((size_t)(n0 + row) * (size_t)nb + (size_t)(k0 >> 8)) * (size_t)bbytes;
+                tc2_dequant_row<Q6>(blk, part, dst);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 32; ++j) dst[j] = 0;
+            }
+        }
+        for (int i = tid; i < BM * BK; i += 256) {
+            int tr = i >> 8;
+            int kk = i & 255;
+            float v = 0.f;
+            int tt = t0 + tr;
+            int kkabs = k0 + kk;
+            if (tt < T && kkabs < n) v = x[(size_t)tt * (size_t)n + (size_t)kkabs];
+            Xs[i] = f32_to_f16(v);
+        }
+        __syncthreads();
+        if (warp < 4) {
+            int wm = warp >> 1;
+            int wn = warp & 1;
+            for (int kk = 0; kk < BK; kk += 16) {
+                unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+                unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+                wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
+                wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
+                wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+            }
+        }
+        __syncthreads();
+    }
+    if (warp < 4) {
+        float* tile = (float*)raw;
+        wmma_store(tile + warp * 256, 16, c0, c1, c2, c3, c4, c5, c6, c7);
+    }
+    __syncthreads();
+    float* tile = (float*)raw;
+    for (int idx = tid; idx < 4 * 256; idx += 256) {
+        int w = idx >> 8;
+        int e = idx & 255;
+        int i = e >> 4;
+        int j = e & 15;
+        int wm = w >> 1;
+        int wn = w & 1;
+        int t = t0 + wm * 16 + i;
+        int orow = n0 + wn * 16 + j;
+        if (t < T && orow < d) out[(size_t)t * (size_t)d + orow] = tile[idx];
+    }
+}
+
+extern "C" __global__ void tc2s_q4_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2s_run<0>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void tc2s_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2s_run<1>(wb, x, out, n, d, T);
+}
+
 /* ---- bandwidth GEMV (T == 1) ------------------------------------------------
    Four rows per warp, eight threads per row. Each of those eight threads
    issues one ld.global.v4 (16 bytes) so a row's quant payload is one
@@ -1606,16 +1691,9 @@ __device__ __forceinline__ uint4 ld_u4_any(const unsigned char* p) {
     return v;
 }
 
-/* 16 bytes at p, using only aligned ld.global.v4. Misaligned p (Q6 blocks are
-   210 bytes) is a 2-byte shift of two aligned windows. The caller must pad the
-   allocation by 32 bytes so the second window stays in range. */
-__device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p) {
-    unsigned long long a = (unsigned long long)p;
-    unsigned mis = (unsigned)(a & 15ull);
-    if (mis == 0u) return *(const uint4*)p;
-    const uint4* base = (const uint4*)(a & ~15ull);
-    uint4 lo = base[0];
-    uint4 hi = base[1];
+/* Shift two aligned uint4 windows by `mis` bytes (0..15). mis==0 returns lo. */
+__device__ __forceinline__ uint4 u4_from_mis(uint4 lo, uint4 hi, unsigned mis) {
+    if (mis == 0u) return lo;
     unsigned long long L0 = (unsigned long long)lo.x | ((unsigned long long)lo.y << 32);
     unsigned long long L1 = (unsigned long long)lo.z | ((unsigned long long)lo.w << 32);
     unsigned long long H0 = (unsigned long long)hi.x | ((unsigned long long)hi.y << 32);
@@ -1639,6 +1717,24 @@ __device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p) {
     o.z = (unsigned)B;
     o.w = (unsigned)(B >> 32);
     return o;
+}
+
+/* 16 bytes at p, using only aligned ld.global.v4. Misaligned p (Q6 blocks are
+   210 bytes) is a shift of two aligned windows. The caller must pad the
+   allocation by 32 bytes so the second window stays in range. */
+__device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p) {
+    unsigned long long a = (unsigned long long)p;
+    unsigned mis = (unsigned)(a & 15ull);
+    if (mis == 0u) return *(const uint4*)p;
+    const uint4* base = (const uint4*)(a & ~15ull);
+    return u4_from_mis(base[0], base[1], mis);
+}
+
+/* Same shift, from a 16-aligned shared tile. `at` is the byte offset. */
+__device__ __forceinline__ uint4 ld_u4_staged(const unsigned char* staged, unsigned at) {
+    unsigned base = at & ~15u;
+    const uint4* p = (const uint4*)(staged + base);
+    return u4_from_mis(p[0], p[1], at & 15u);
 }
 
 /* Subtract 32 from each byte. No vsub4: NVRTC 12.9 emits
@@ -1856,17 +1952,13 @@ extern "C" __global__ void gemv2_q4_k(const unsigned char* wb, const signed char
     store_row(out, row, d, t == 0, acc, accumulate);
 }
 
-/* 16 smem bytes. Q6 rows are 2-byte aligned, so a uint4 at `mis` is not. */
-__device__ __forceinline__ uint4 ld_u4_bytes(const unsigned char* p) {
-    uint4 o;
-    unsigned char* d = (unsigned char*)&o;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) d[i] = p[i];
-    return o;
-}
-
-extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char* xq, const float* xd,
-                                      float* out, int n, int d, int accumulate) {
+/* STAGE=1 copies each 210-byte block through aligned global loads into
+   shared memory, then shifts aligned smem uint4s. A byte-wise smem reload
+   made the 9B w2 slower (K=12288). The host uses STAGE=1 only for long K
+   (n>=16384, the 27B w2) and for tall rows (d>8192, the logits). */
+template<int STAGE>
+__device__ void gemv2_q6_run(const unsigned char* wb, const signed char* xq, const float* xd,
+                             float* out, int n, int d, int accumulate) {
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
     int sub = lane >> 3;
@@ -1879,34 +1971,40 @@ extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char
     int nb = n >> 8;
     int b0s, b1s;
     k_range(nb, &b0s, &b1s);
-    /* Stage each 210-byte block through aligned global loads. A 210-byte
-       stride is misaligned for 7 of 8 rows, and ld.global.v4 then splits. */
-    __shared__ __align__(16) unsigned char q6sm[16 * 4 * 224];
+    __shared__ __align__(16) unsigned char q6sm[STAGE ? 16 * 4 * 240 : 4];
     float acc = 0.f;
     for (int b = b0s; b < b1s; ++b) {
         uint4 ql = make_uint4(0, 0, 0, 0);
         uint4 qh = make_uint4(0, 0, 0, 0);
         uint4 scv = make_uint4(0, 0, 0, 0);
         float dW = 0.f;
-        unsigned char* staged = q6sm + (warp * 4 + sub) * 224;
-        if (row < d) {
-            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 210;
-            unsigned long long addr = (unsigned long long)blk;
-            unsigned mis = (unsigned)(addr & 15ull);
-            const unsigned char* base = (const unsigned char*)(addr & ~15ull);
-            for (int v = t; v < 14; v += 8) {
-                uint4 u = *(const uint4*)(base + (size_t)v * 16);
-                *(uint4*)(staged + v * 16) = u;
+        if (STAGE) {
+            unsigned char* staged = q6sm + (warp * 4 + sub) * 240;
+            if (row < d) {
+                const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 210;
+                unsigned long long addr = (unsigned long long)blk;
+                const unsigned char* base = (const unsigned char*)(addr & ~15ull);
+                for (int v = t; v < 15; v += 8) {
+                    *(uint4*)(staged + (size_t)v * 16) = *(const uint4*)(base + (size_t)v * 16);
+                }
             }
-        }
-        __syncwarp();
-        if (row < d) {
-            unsigned mis = (unsigned)(((unsigned long long)(wb + ((size_t)row * (size_t)nb + (size_t)b) * 210)) & 15ull);
-            ql = ld_u4_bytes(staged + mis + t * 16);
-            qh = ld_u4_bytes(staged + mis + 128 + half * 32 + l0);
+            __syncwarp();
+            if (row < d) {
+                unsigned mis = (unsigned)(((unsigned long long)(wb + ((size_t)row * (size_t)nb + (size_t)b) * 210)) & 15ull);
+                ql = ld_u4_staged(staged, mis + (unsigned)t * 16u);
+                qh = ld_u4_staged(staged, mis + 128u + (unsigned)(half * 32 + l0));
+                if (t == 0) {
+                    scv = ld_u4_staged(staged, mis + 192u);
+                    dW = ld_f16(staged + mis + 208);
+                }
+            }
+        } else if (row < d) {
+            const unsigned char* blk = wb + ((size_t)row * (size_t)nb + (size_t)b) * 210;
+            ql = ld_u4_aligned(blk + t * 16);
+            qh = ld_u4_aligned(blk + 128 + half * 32 + l0);
             if (t == 0) {
-                scv = ld_u4_bytes(staged + mis + 192);
-                dW = ld_f16(staged + mis + 208);
+                scv = ld_u4_aligned(blk + 192);
+                dW = ld_f16(blk + 208);
             }
         }
         int src = lane & ~7;
@@ -1941,6 +2039,15 @@ extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char
     }
     acc = warp8_sum(acc);
     store_row(out, row, d, t == 0, acc, accumulate);
+}
+
+extern "C" __global__ void gemv2_q6_k(const unsigned char* wb, const signed char* xq, const float* xd,
+                                      float* out, int n, int d, int accumulate) {
+    gemv2_q6_run<0>(wb, xq, xd, out, n, d, accumulate);
+}
+extern "C" __global__ void gemv2_q6s_k(const unsigned char* wb, const signed char* xq, const float* xd,
+                                       float* out, int n, int d, int accumulate) {
+    gemv2_q6_run<1>(wb, xq, xd, out, n, d, accumulate);
 }
 
 extern "C" __global__ void gemv2_q5_k(const unsigned char* wb, const signed char* xq, const float* xd, const float2* sum16,

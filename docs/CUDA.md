@@ -9,7 +9,7 @@ tensor cores (WMMA 16×16×16, fp16 operands, fp32 accumulate). Decode (`T==1`)
 uses a bandwidth GEMV: 128-bit loads, `dp4a`, and the activation quantized to
 q8 once per vector. Short Q4_K / Q6_K matrices use one row per warp; taller
 ones keep four. `ODINFER_CUDA_GEMV=old` restores the scalar kernel. Dense
-decode is one CUDA graph unless `ODINFER_CUDA_GRAPH=0`.
+decode stays eager unless `ODINFER_CUDA_GRAPH=1`.
 
 macOS builds are unchanged: the default backend is still Metal. A single
 binary never contains both hot paths.
@@ -163,7 +163,9 @@ launching a second kernel.
 
 Q4_K and Q6_K rows of 8192 or fewer split K across four blocks (`ODINFER_CUDA_GEMV_SPLIT=0` leaves them in one block). The partials are `atomicAdd`s, so the output is zeroed first unless the GEMV is accumulating into the residual.
 
-Q4_K and Q6_K prefill with K a multiple of 256 uses `tc2`: a block owns 32 rows and 128 tokens. Each 128-wide K slice is expanded to fp16 once and both 64-token WMMA chunks reuse it, so a 128-token prefill chunk does not dequantize the same weights again. `ODINFER_CUDA_TC2=0` is the older scalar-dequant tile. A prefill linear-attention chunk is one `delta_recurrent_chunk` launch per layer. Decode (`T==1`) still launches `delta_recurrent` once. Decode also folds the q8 cache into the attention gate, SwiGLU, and gated RMSNorm, so those GEMVs skip `quant_q8`.
+Q4_K and Q6_K prefill with K a multiple of 256 uses `tc2`. For `T<=64` that is the 32-token tile (one 256-wide quant block expanded to fp16, profile name `tc2`). For `T>64` a block owns 32 rows and 128 tokens and reuses one fp16 K-slice across two 64-token WMMA chunks (profile name `tc2w`), so a 128-token prefill chunk dequantizes once. On the V100S the 128-token tile at T=19 did twice the MMA of the 32-token tile and measured 323 ms against 176 ms. `ODINFER_CUDA_TC2_WIDE=0` keeps the 32-token tile at every T. `ODINFER_CUDA_TC2=0` is the scalar-dequant tile. A prefill linear-attention chunk is one `delta_recurrent_chunk` launch per layer. Decode (`T==1`) still launches `delta_recurrent` once. Decode also folds the q8 cache into the attention gate, SwiGLU, and gated RMSNorm, so those GEMVs skip `quant_q8`.
+
+Q6 GEMV stages a block through aligned loads only when K is at least 16384 or the matrix is taller than 8192 rows (the 27B down projection and the logits). The 9B down projection (4096×12288) stays on the direct load. `ODINFER_CUDA_Q6_STAGE=1` stages every Q6 GEMV; `=0` stages none. The staged profile name is `gemv2_q6s`.
 
 Q8_0 and Q5_0 matrices under 16 MiB stay on the scalar kernel. At
 2048×2048 the new kernel was slower (Q8_0 118.5 vs 121.8 GB/s, Q5_0 49.2
@@ -196,17 +198,19 @@ add with their own kernel. The logits GEMV does not accumulate.
 | `ODINFER_CUDA_GEMV_ROWS` | `4` | Rows per warp for Q4_K and Q6_K. Unset is four. `1` selects the slower one-row kernel |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16) |
 | `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K with `rows≤8192` split K four ways. `=0` is one K range |
-| `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill expands each 128-K slice to fp16 once and reuses it for 128 tokens. `=0` is the scalar-dequant tile |
+| `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill. `T<=64` uses the 32-token fp16 tile. `T>64` uses the 128-token tile. `=0` is the scalar-dequant tile |
+| `ODINFER_CUDA_TC2_WIDE` | on | `=0` keeps the 32-token tile at every T |
+| `ODINFER_CUDA_Q6_STAGE` | auto | `=1` stages every Q6 GEMV through aligned loads. `=0` never stages. Unset stages only when K≥16384 or rows>8192 |
 | `ODINFER_CUDA_SMOKE_PREFILL` | unset | `cuda_smoke` only. `=N` prefills N tokens |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count for each forward |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | Peak used by `--bench-gemv` to print % of HBM |
-| `ODINFER_CUDA_GRAPH` | on | Dense `T==1` is one CUDA graph. `=0` runs every kernel eager. MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
+| `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` as one CUDA graph. The position is an async copy on the graph stream. MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for that forward, slowest first |
 
 `cuda_selftest` runs the four-row kernel against the CPU fp32 dot for Q4_K,
 Q6_K, Q8_0, Q5_0, and Q5_K at 64×512 and at 6×256 (the tail that is not a
 multiple of four rows). Q4_K and Q6_K also run the one-row kernel, including
-`accumulate=1` (output starts at 0.25, expect `ref+0.25`). The 64×512 cases also launch split-K with `gridDim.y=2`. `tc2_q4_k` and `tc2_q6_k` run at 64×256×32 and at a partial tile. `delta_recurrent_chunk` runs two tokens and two value heads against `delta_recurrent_step`. Allowance is
+`accumulate=1` (output starts at 0.25, expect `ref+0.25`). Q6 also runs the staged kernel. The 64×512 cases also launch split-K with `gridDim.y=2`. `tc2s_*` (32-token tile) and `tc2_*` (128-token tile) run at 64×256×32 and at a partial tile; the wide tile also runs at T=80 and T=160. `delta_recurrent_chunk` runs two tokens and two value heads against `delta_recurrent_step`. Allowance is
 `1 + 0.05*|ref|`. The gap against the CPU is the q8 of `x`; a swapped
 nibble or scale is on the order of `|ref|`.
 
@@ -255,17 +259,18 @@ bin/cuda_smoke "$MODEL27B" 16 2048
 ODINFER_CUDA_LAUNCHES=1 bin/cuda_smoke "$MODEL9B" 8 2048
 ```
 
-Init prints the GEMV row policy and either `graph on for dense T=1` or
-`gemv old`.
+Init prints the GEMV row policy and `graph off` unless `ODINFER_CUDA_GRAPH=1`.
 
-Dense decode (`T==1`, not MoE) is captured once into a CUDA graph and
-replayed. Capture does not run the kernels; the first token pays for
-capture and then launches the graph. The token position is a device
-symbol (`g_decode_pos`), written before each replay, because a kernel
-argument would be baked in at capture. Prefill passes the real position
-and stays eager, so a graph cannot change a `T>1` result. If capture or
-instantiate fails, that token runs eager and graphs stay off.
-`ODINFER_CUDA_GRAPH=0` is the eager path. `ODINFER_CUDA_PROFILE=1`
+Dense decode (`T==1`, not MoE) stays eager. On the V100S a captured graph
+was slower than eager (9B 57.6 tok/s versus 63.0): the position update was
+`cuMemcpyHtoD` on the legacy stream, which syncs the device every token,
+and capture left split-K out because the zeroing memset was not on the
+capture stream. `ODINFER_CUDA_GRAPH=1` opts in. The position is then an
+async copy on the graph stream, and split-K is recorded with
+`cuMemsetD8Async` when the driver has that symbol. A missing
+`g_decode_pos` symbol uses a device int instead of turning the graph off.
+Prefill passes the real position and stays eager. If capture or instantiate
+fails, that token runs eager and graphs stay off. `ODINFER_CUDA_PROFILE=1`
 disables the graph and prints each kernel's GPU time (name, count,
 milliseconds), slowest first, plus wall time against the sum. Sampling
 stays on the CPU, after the logits copy. The graph and event symbols are

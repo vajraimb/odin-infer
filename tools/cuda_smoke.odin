@@ -84,10 +84,14 @@ main :: proc() {
 			tail := "\nWhat is 2+2? Answer with one number.<|im_end|>\n<|im_start|>assistant\n"
 			body := "The quick brown fox jumps over the lazy dog. "
 			filled := head
+			filled_owned := false
+			extra := body
+			extra_owned := false
 			built := false
-			for _ in 0 ..< 12 {
+			for len(filled) <= need * 32 {
 				prompt = strings.concatenate({filled, tail})
 				enc, eerr := tok35.encode(&tok, prompt)
+				delete(prompt)
 				if eerr != nil {
 					fmt.eprintln("cuda_smoke: encode failed")
 					os.exit(1)
@@ -98,7 +102,24 @@ main :: proc() {
 					break
 				}
 				delete(enc)
-				filled = strings.concatenate({filled, body, body, body, body})
+				next := strings.concatenate({filled, extra})
+				if filled_owned {
+					delete(filled)
+				}
+				filled = next
+				filled_owned = true
+				grown := strings.concatenate({extra, extra})
+				if extra_owned {
+					delete(extra)
+				}
+				extra = grown
+				extra_owned = true
+			}
+			if filled_owned {
+				delete(filled)
+			}
+			if extra_owned {
+				delete(extra)
 			}
 			if !built {
 				fmt.eprintfln("cuda_smoke: could not build a %d-token prompt", want_prefill)

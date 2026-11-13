@@ -3,7 +3,7 @@
    Decode (T==1) uses a bandwidth GEMV, four rows per warp.
    ODINFER_CUDA_GEMV_ROWS=1 selects one row per warp. ODINFER_CUDA_GEMV=old
    restores the scalar kernel.
-   Dense decode can be one CUDA graph (ODINFER_CUDA_GRAPH=0 disables it).
+   Dense decode can be one CUDA graph (ODINFER_CUDA_GRAPH=1 enables it).
    Prefill stays eager and uses WMMA when it pays. KV layout matches the
    Metal/CPU snapshot bytes (Q8_0 K, mixed or Q8 V, or legacy f16). */
 
@@ -131,6 +131,12 @@ g_gemv_rows: int // 0 or 4: four rows/warp. 1: one row/warp.
 @(private)
 g_gemv_split: bool // short Q4_K / Q6_K GEMV splits K across grid.y
 @(private)
+g_q6_stage: int // -1 auto, 0 direct loads, 1 staged loads
+@(private)
+g_tc2_wide: bool // T>64 uses the 128-token tile
+@(private)
+g_pos_host: i32 // stable source for the async decode-pos copy
+@(private)
 g_tc2: bool // Q4_K / Q6_K prefill uses the block-dequant WMMA kernel
 @(private)
 g_gemv_warps: int
@@ -171,7 +177,7 @@ g_q8_valid: bool
 @(private)
 k_quant, k_rmsnorm_q8: cu.Function
 @(private)
-k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
+k_gemv2_q4, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50: cu.Function
 @(private)
 k_gemv2r1_q4, k_gemv2r1_q6: cu.Function
 @(private)
@@ -181,7 +187,7 @@ k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v: cu.Func
 @(private)
 k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
-k_tc2_q4, k_tc2_q6: cu.Function
+k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6: cu.Function
 
 Prof_Bin :: struct {
 	name:  string,
@@ -510,9 +516,9 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	}
 	splits := 1
 	// Short Q4/Q6 rows (wq, wo, w2) do not fill the SMs. Split K so more
-	// blocks are in flight. Tall rows stay one split. Capture keeps one
-	// split: the zeroing memset is not on the capture stream.
-	if g_gemv_split && !g_capturing && !r1 && (kind == .Q4_K || kind == .Q6_K) && d > 0 && d <= 8192 {
+	// blocks are in flight. Tall rows stay one split. Capture includes the
+	// split only when the zeroing memset can be recorded on g_stream.
+	if g_gemv_split && !r1 && (kind == .Q4_K || kind == .Q6_K) && d > 0 && d <= 8192 {
 		nb := n / 256
 		if nb >= 4 {
 			splits = 4
@@ -520,8 +526,16 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 			splits = 2
 		}
 	}
+	if splits > 1 && g_capturing && (g_stream == nil || cu.gapi.memset_async == nil) {
+		splits = 1
+	}
 	if splits > 1 && accumulate == 0 {
-		if cu.memset(y, 0, d * 4) != cu.OK {
+		if g_capturing {
+			if cu.gapi.memset_async(y, 0, c.size_t(d * 4), g_stream) != cu.OK {
+				fmt.eprintln("cuda: gemv split memset failed")
+				return false
+			}
+		} else if cu.memset(y, 0, d * 4) != cu.OK {
 			fmt.eprintln("cuda: gemv split memset failed")
 			return false
 		}
@@ -529,13 +543,33 @@ launch_gemv2 :: proc(fn: cu.Function, kind: ggml.GGML_Type, w, y: cu.Device_Ptr,
 	gx := u32((d + rows_per - 1) / rows_per)
 	bx := u32(warps * 32)
 	what := gemv_what(kind, r1)
+	fn_use := fn
+	// 9B q6 is 33 launches: 32 of them are w2 (4096 x 12288). Staging those
+	// was slower (3.95 -> 4.19 ms). 27B w2 is 5120 x 17408 and the logits
+	// are 248320 rows; staging those was faster (7.99 -> 7.04 ms).
+	if kind == .Q6_K && !r1 && k_gemv2_q6s != nil && q6_stage_on(n, d) {
+		fn_use = k_gemv2_q6s
+		what = "gemv2_q6s"
+	}
 	gy := u32(splits)
 	if kind == .Q4_K || kind == .Q5_K {
 		args := [?]rawptr{&wb, &qs, &sc, &sm, &yy, &nn, &dd, &acc}
-		return klaunch(fn, gx, gy, 1, bx, 1, 1, args[:], what)
+		return klaunch(fn_use, gx, gy, 1, bx, 1, 1, args[:], what)
 	}
 	args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
-	return klaunch(fn, gx, gy, 1, bx, 1, 1, args[:], what)
+	return klaunch(fn_use, gx, gy, 1, bx, 1, 1, args[:], what)
+}
+
+// Long K or a tall output matrix. The 9B down projection is neither.
+@(private)
+q6_stage_on :: proc(n, d: int) -> bool {
+	if g_q6_stage == 0 {
+		return false
+	}
+	if g_q6_stage == 1 {
+		return true
+	}
+	return n >= 16384 || d > 8192
 }
 
 launch_gemv :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d: int) -> bool {
@@ -594,15 +628,32 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 	nn, dd, tt := i32(n), i32(d), i32(tcount)
 	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
 	if g_tc2 && n > 0 && n % 256 == 0 && (kind == .Q4_K || kind == .Q6_K) {
-		fn := k_tc2_q4
+		// T=19 on the 128-token tile was 323 ms vs 176 ms for the 32-token
+		// tile: a skipped second chunk still MMAs 64 tokens at BK=128, so
+		// each K is loaded twice. T<=64 stays on that 32-token tile. A
+		// prefill chunk is 128 tokens, so T>64 uses the wide tile and
+		// dequantizes once per chunk. ODINFER_CUDA_TC2_WIDE=0 keeps the
+		// 32-token tile at every T.
+		wide := g_tc2_wide && tcount > 64
+		fn := k_tc2s_q4
+		if wide {
+			fn = k_tc2_q4
+		}
 		if kind == .Q6_K {
-			fn = k_tc2_q6
+			fn = k_tc2s_q6
+			if wide {
+				fn = k_tc2_q6
+			}
 		}
 		if fn != nil {
-			// 32 rows by 128 tokens (two 64-token WMMA chunks share the fp16 tile).
 			gx := u32((d + 31) / 32)
-			gy := u32((tcount + 127) / 128)
-			return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], "tc2")
+			gy := u32((tcount + 31) / 32)
+			name := "tc2"
+			if wide {
+				gy = u32((tcount + 127) / 128)
+				name = "tc2w"
+			}
+			return klaunch(fn, gx, gy, 1, 256, 1, 1, args[:], name)
 		}
 	}
 	fn := tc_fn[int(kind)]
@@ -910,6 +961,8 @@ bind_kernels :: proc() -> bool {
 	k_delta_chunk = get_fn("delta_recurrent_chunk")
 	k_tc2_q4 = get_fn("tc2_q4_k")
 	k_tc2_q6 = get_fn("tc2_q6_k")
+	k_tc2s_q4 = get_fn("tc2s_q4_k")
+	k_tc2s_q6 = get_fn("tc2s_q6_k")
 	k_rmsgate = get_fn("rmsnorm_gated")
 	k_rmsgate_q = get_fn("rmsnorm_gated_quant")
 	k_moe_topk = get_fn("moe_softmax_topk")
@@ -917,6 +970,7 @@ bind_kernels :: proc() -> bool {
 	k_rmsnorm_q8 = get_fn("rmsnorm_quant_q8")
 	k_gemv2_q4 = get_fn("gemv2_q4_k")
 	k_gemv2_q6 = get_fn("gemv2_q6_k")
+	k_gemv2_q6s = get_fn("gemv2_q6s_k")
 	k_gemv2_q5k = get_fn("gemv2_q5_k")
 	k_gemv2_q8 = get_fn("gemv2_q8_0")
 	k_gemv2_q50 = get_fn("gemv2_q5_0")
@@ -927,8 +981,8 @@ bind_kernels :: proc() -> bool {
 		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v,
 		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
-		k_tc2_q4, k_tc2_q6,
-		k_quant, k_rmsnorm_q8, k_gemv2_q4, k_gemv2_q6, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
+		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6,
+		k_quant, k_rmsnorm_q8, k_gemv2_q4, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
 	}
 	for h in handles {
@@ -1222,10 +1276,19 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		}
 	}
 	g_gemv_split = os.get_env("ODINFER_CUDA_GEMV_SPLIT", context.temp_allocator) != "0"
+	g_q6_stage = -1
+	if s := os.get_env("ODINFER_CUDA_Q6_STAGE", context.temp_allocator); s == "0" {
+		g_q6_stage = 0
+	} else if s == "1" {
+		g_q6_stage = 1
+	}
 	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
+	g_tc2_wide = os.get_env("ODINFER_CUDA_TC2_WIDE", context.temp_allocator) != "0"
 	g_count_launches = os.get_env("ODINFER_CUDA_LAUNCHES", context.temp_allocator) == "1"
 	g_profile = os.get_env("ODINFER_CUDA_PROFILE", context.temp_allocator) == "1"
-	g_use_graph = os.get_env("ODINFER_CUDA_GRAPH", context.temp_allocator) != "0"
+	// Replay was slower than eager (9B 57.6 vs 63.0 tok/s): MemcpyHtoD_v2
+	// synced the device every token, and capture dropped split-K. =1 opts in.
+	g_use_graph = os.get_env("ODINFER_CUDA_GRAPH", context.temp_allocator) == "1"
 	if g_profile {
 		g_use_graph = false
 	}
@@ -1269,17 +1332,21 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	} else {
 		ptx_load, _ = strings.replace(ptx, needle, ".visible .global .align 4 .u32 g_decode_pos;", 1)
 	}
-	// Link first so `.visible .global g_decode_pos` survives into the cubin.
-	// Direct PTX load JITs without exporting that name (CUresult 500).
-	linked, lerr := cu.module_load_linked(ptx_load)
+	// Direct cuModuleLoadData is the default. cuLink did not export
+	// g_decode_pos on driver 580 (still CUresult 500) and the linked cubin
+	// is a different JIT of gemv2_q4, whose source did not change while its
+	// time went from 6.0 ms to 6.94 ms. ODINFER_CUDA_LINK=1 opts into cuLink.
 	mod: cu.Module
-	if lerr == cu.OK && linked != nil {
-		mod = linked
-		fmt.eprintln("cuda: module linked (g_decode_pos stays exported)")
-	} else {
-		if lerr != cu.OK && lerr != cu.ERR_SYMBOL {
+	if os.get_env("ODINFER_CUDA_LINK", context.temp_allocator) == "1" {
+		linked, lerr := cu.module_load_linked(ptx_load)
+		if lerr == cu.OK && linked != nil {
+			mod = linked
+			fmt.eprintln("cuda: module linked (g_decode_pos stays exported)")
+		} else if lerr != cu.OK && lerr != cu.ERR_SYMBOL {
 			fmt.eprintf("cuda: cuLink failed: %s (%d); loading PTX directly\n", cu.error_string(lerr), int(lerr))
 		}
+	}
+	if mod == nil {
 		loaded, jit, merr := cu.module_load_ptx(ptx_load)
 		if len(jit) > 0 {
 			fmt.eprintfln("cuda: jit: %s", jit)
@@ -1421,7 +1488,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_tc2 {
-		fmt.eprintln("cuda: tc2 on for Q4_K/Q6_K (128-token fp16 tile, ODINFER_CUDA_TC2=0 uses the scalar dequant tile)")
+		wide_note := "T<=64 is the 32-token tile, T>64 is the 128-token tile"
+		if !g_tc2_wide {
+			wide_note = "32-token tile at every T (ODINFER_CUDA_TC2_WIDE=0)"
+		}
+		fmt.eprintfln("cuda: tc2 on for Q4_K/Q6_K (%s; ODINFER_CUDA_TC2=0 uses the scalar dequant tile)", wide_note)
 	}
 	if g_gemv_split {
 		fmt.eprintln("cuda: gemv split-K on for Q4_K/Q6_K with rows<=8192 (ODINFER_CUDA_GEMV_SPLIT=0 disables it)")
@@ -1481,9 +1552,11 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		}
 	}
 	if g_use_graph {
-		fmt.eprintln("cuda: graph on for dense T=1 (ODINFER_CUDA_GRAPH=0 disables it; MoE stays eager)")
+		fmt.eprintln("cuda: graph on for dense T=1 (ODINFER_CUDA_GRAPH=1; MoE stays eager)")
 	} else if g_profile {
 		fmt.eprintln("cuda: profile on (graph off while profiling)")
+	} else {
+		fmt.eprintln("cuda: graph off (ODINFER_CUDA_GRAPH=1 enables it; replay was slower than eager)")
 	}
 	return true
 }
@@ -1774,8 +1847,16 @@ profile_end :: proc(T, pos0: int, t0: time.Tick) {
 
 @(private)
 write_decode_pos :: proc(pos: int) -> bool {
-	v := i32(pos)
-	return ck(cu.drv.MemcpyHtoD_v2(g_pos_sym, &v, 4), "decode pos")
+	// MemcpyHtoD_v2 runs on the legacy null stream and syncs the device.
+	// That sync, once per token, is why graph replay was slower than eager.
+	// After the graph exists, the copy is ordered on g_stream ahead of the
+	// replay. The first token still uses the sync copy so capture starts on
+	// an idle stream. g_pos_host stays live until the logits download.
+	g_pos_host = i32(pos)
+	if g_graph_ready && g_stream != nil && cu.gapi.htod_async != nil {
+		return ck(cu.gapi.htod_async(g_pos_sym, &g_pos_host, 4, g_stream), "decode pos")
+	}
+	return ck(cu.drv.MemcpyHtoD_v2(g_pos_sym, &g_pos_host, 4), "decode pos")
 }
 
 // Capture does not run the kernels. On success the caller replays the graph.

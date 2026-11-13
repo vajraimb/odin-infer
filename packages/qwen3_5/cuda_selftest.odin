@@ -348,6 +348,26 @@ run_gemv2 :: proc(kind: ggml.GGML_Type, rows, cols: int, atol, rtol: f32) -> boo
 	if !ok {
 		return false
 	}
+	if kind == .Q6_K {
+		sfn := s_fn("gemv2_q6s_k")
+		if sfn == nil {
+			fmt.eprintln("cuda_selftest: gemv2_q6s_k missing")
+			return false
+		}
+		args := [?]rawptr{&wb, &qs, &sc, &yy, &nn, &dd, &acc}
+		if cu.launch(sfn, gx, 1, 1, bx, 1, 1, 0, args[:]) != cu.OK || cu.sync() != cu.OK {
+			fmt.eprintln("cuda_selftest: gemv2_q6s_k launch failed")
+			return false
+		}
+		cu.download(raw_data(got), dy, rows * 4)
+		st = {}
+		for r in 0 ..< rows {
+			s_note(&st, fmt.tprintf("gemv2_q6s row %d", r), got[r], ref[r], atol, rtol)
+		}
+		if !s_report(fmt.tprintf("gemv2_q6s %dx%d", rows, cols), st, atol, rtol) {
+			return false
+		}
+	}
 	if kind == .Q4_K || kind == .Q6_K {
 		rname := "gemv2r1_q4_k"
 		if kind == .Q6_K {
@@ -539,10 +559,16 @@ run_tc :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> boo
 }
 
 @(private)
-run_tc2 :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bool {
-	name := "tc2_q4_k"
+run_tc2 :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32, wide: bool) -> bool {
+	name := "tc2s_q4_k"
+	if wide {
+		name = "tc2_q4_k"
+	}
 	if kind == .Q6_K {
-		name = "tc2_q6_k"
+		name = "tc2s_q6_k"
+		if wide {
+			name = "tc2_q6_k"
+		}
 	}
 	fn := s_fn(name)
 	if fn == nil {
@@ -577,7 +603,10 @@ run_tc2 :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bo
 	nn, dd, tt := i32(cols), i32(rows), i32(T)
 	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
 	gx := u32((rows + 31) / 32)
-	gy := u32((T + 127) / 128)
+	gy := u32((T + 31) / 32)
+	if wide {
+		gy = u32((T + 127) / 128)
+	}
 	if cu.launch(fn, gx, gy, 1, 256, 1, 1, 0, args[:]) != cu.OK {
 		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
 		return false
@@ -1158,14 +1187,17 @@ cuda_selftest :: proc() -> bool {
 	if !run_tc(.Q5_0, 40, 64, 20, 5e-2, 5e-2) {
 		ok = false
 	}
-	if !run_tc2(.Q4_K, 64, 256, 32, 5e-2, 5e-2) || !run_tc2(.Q6_K, 64, 256, 32, 5e-2, 5e-2) {
+	if !run_tc2(.Q4_K, 64, 256, 32, 5e-2, 5e-2, false) || !run_tc2(.Q6_K, 64, 256, 32, 5e-2, 5e-2, false) {
 		ok = false
 	}
-	if !run_tc2(.Q4_K, 40, 256, 20, 5e-2, 5e-2) || !run_tc2(.Q6_K, 40, 512, 20, 5e-2, 5e-2) {
+	if !run_tc2(.Q4_K, 40, 256, 20, 5e-2, 5e-2, false) || !run_tc2(.Q6_K, 40, 512, 20, 5e-2, 5e-2, false) {
 		ok = false
 	}
 	// 80 tokens forces the second 64-token chunk that reuses the fp16 weight tile.
-	if !run_tc2(.Q4_K, 64, 256, 80, 5e-2, 5e-2) || !run_tc2(.Q6_K, 48, 512, 160, 5e-2, 5e-2) {
+	if !run_tc2(.Q4_K, 64, 256, 80, 5e-2, 5e-2, true) || !run_tc2(.Q6_K, 48, 512, 160, 5e-2, 5e-2, true) {
+		ok = false
+	}
+	if !run_tc2(.Q4_K, 64, 256, 32, 5e-2, 5e-2, true) || !run_tc2(.Q6_K, 40, 256, 20, 5e-2, 5e-2, true) {
 		ok = false
 	}
 	if !run_delta_chunk() {

@@ -7,8 +7,8 @@ Qwen3.5 引擎的 Linux x86_64 后端。目标是 **sm_70 及以上**（按 Tesl
 （`T>1`）可以用 Volta tensor core（WMMA 16×16×16，fp16 乘、fp32 累加）。
 解码（`T==1`）走带宽 GEMV：128 位加载、`dp4a`，激活每条向量只量化成 q8
 一次。短的 Q4_K / Q6_K 每个 warp 一行，更高的矩阵仍是四行。
-`ODINFER_CUDA_GEMV=old` 回到标量内核。稠密解码默认是一张 CUDA graph，
-`ODINFER_CUDA_GRAPH=0` 关掉。
+`ODINFER_CUDA_GEMV=old` 回到标量内核。稠密解码默认即时启动，
+`ODINFER_CUDA_GRAPH=1` 才捕获 CUDA graph。
 
 macOS 构建不变，默认仍是 Metal。同一个二进制不会同时带上两条热路径。
 
@@ -128,8 +128,7 @@ Q4_K 和 Q6_K 默认都是四行一个 warp。一行一个 warp 在 V100S 上每
 39%）。`ODINFER_CUDA_GEMV_ROWS=1` 仍可选它。一段 K 上的总 warp 数是 `rows / 4`。
 行数不超过 8192 的 Q4_K / Q6_K 把这段 K 拆到 `gridDim.y`（默认 4 路，
 `atomicAdd` 汇总）。`ODINFER_CUDA_GEMV_SPLIT=0` 关掉。K 是 256 倍数的
-Q4_K / Q6_K 预填充走 `tc2`：每个量化块展开成 fp16 一次再做 WMMA。
-`ODINFER_CUDA_TC2=0` 回到逐元素反量化。`tc2` 的一块覆盖 32 行和 128 个 token，同一份 fp16 权重给两个 64-token 的 WMMA 用。预填充的线性注意力一层一次
+Q4_K / Q6_K 预填充走 `tc2`。`T<=64` 用 32-token 的块（一次展开 256 宽的量化块）。`T>64` 一块覆盖 32 行和 128 个 token，同一份 fp16 权重给两个 64-token 的 WMMA 用。V100S 上 T=19 的 128-token 块是 323 ms，32-token 块是 176 ms。`ODINFER_CUDA_TC2_WIDE=0` 让任何 T 都用 32-token 块。`ODINFER_CUDA_TC2=0` 回到逐元素反量化。Q6 只在 K≥16384 或行数>8192 时把量化块经对齐加载放进共享内存（27B 的 down 和 logits）；9B 的 down（4096×12288）仍直接加载。`ODINFER_CUDA_Q6_STAGE=0` 关掉，`=1` 全开。预填充的线性注意力一层一次
 `delta_recurrent_chunk`；解码 `T==1` 仍是原来的单 token 内核。
 
 16 MiB 以下的 Q8_0 和 Q5_0 留在标量内核。2048×2048 上新内核更慢（Q8_0
@@ -157,7 +156,7 @@ warp 槽。
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | 带宽 GEMV 每块的 warp 数（1..16） |
 | `ODINFER_CUDA_LAUNCHES` | 关 | `=1` 时每次 forward 打印内核启动次数 |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | `--bench-gemv` 用来算峰值百分比 |
-| `ODINFER_CUDA_GRAPH` | 开 | 稠密 `T==1` 是一张 CUDA graph。`=0` 每次都即时启动。MoE 和预填充仍即时。`ODINFER_CUDA_PROFILE=1` 会关掉 graph |
+| `ODINFER_CUDA_GRAPH` | 关 | `=1` 把稠密 `T==1` 收成一张 CUDA graph。位置用图所在 stream 上的异步拷贝。MoE 和预填充仍即时。`ODINFER_CUDA_PROFILE=1` 会关掉 graph |
 | `ODINFER_CUDA_PROFILE` | 关 | `=1` 打印这次 forward 每个内核的 GPU 时间，最慢的在前 |
 
 `cuda_selftest` 用 CPU fp32 点积对四行内核做 Q4_K、Q6_K、Q8_0、Q5_0、Q5_K
@@ -191,14 +190,16 @@ bin/cuda_smoke "$MODEL27B" 16 2048
 ODINFER_CUDA_LAUNCHES=1 bin/cuda_smoke "$MODEL9B" 8 2048
 ```
 
-初始化日志会写 GEMV 的行策略，以及 `graph on for dense T=1` 或 `gemv old`。
+初始化日志会写 GEMV 的行策略，以及 `graph off`，除非设了 `ODINFER_CUDA_GRAPH=1`。
 
-稠密解码（`T==1`，不是 MoE）捕获一次 CUDA graph，之后重放。捕获本身不跑
-内核；第一个 token 付出捕获的代价，然后启动这张图。token 位置是设备符号
-`g_decode_pos`，每次重放前写入，因为内核参数会在捕获时被写死。预填充传入
-真实位置，并且保持即时启动，所以 graph 改不了 `T>1` 的结果。捕获或实例化
-失败时，这个 token 改走即时路径，之后也不再捕获。`ODINFER_CUDA_GRAPH=0`
-就是即时路径。`ODINFER_CUDA_PROFILE=1` 关掉 graph，并按从慢到快打印每个
+稠密解码（`T==1`，不是 MoE）默认即时启动。V100S 上捕获的 graph 比即时慢
+（9B 57.6 对 63.0 tok/s）：位置更新走的是 legacy stream 上的
+`cuMemcpyHtoD`，每个 token 都同步整卡，而且捕获时清零不在捕获 stream 上，
+split-K 被丢掉了。`ODINFER_CUDA_GRAPH=1` 才打开。打开之后位置是 graph
+所在 stream 上的异步拷贝，驱动有 `cuMemsetD8Async` 时 split-K 会进图。
+`g_decode_pos` 找不到时改用一个设备 int，不再因此关掉 graph。预填充传入
+真实位置，并且保持即时启动。捕获或实例化失败时，这个 token 改走即时路径，
+之后也不再捕获。`ODINFER_CUDA_PROFILE=1` 关掉 graph，并按从慢到快打印每个
 内核的 GPU 时间（名字、次数、毫秒），以及墙钟和内核时间之和。采样仍在
 CPU 上，在 logits 拷回之后。graph 和 event 符号是单独查找的；驱动里没有
 它们时，graph 和 profiler 关掉，GEMV 照常加载。

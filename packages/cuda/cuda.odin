@@ -75,6 +75,7 @@ Graph_API :: struct {
 	graph_exec_destroy: proc "c" (exec: rawptr) -> Error,
 	module_global:     proc "c" (dptr: ^Device_Ptr, bytes: ^c.size_t, mod: Module, name: cstring) -> Error,
 	htod_async:        proc "c" (dst: Device_Ptr, src: rawptr, bytes: c.size_t, stream: rawptr) -> Error,
+	memset_async:      proc "c" (ptr: Device_Ptr, value: c.uchar, n: c.size_t, stream: rawptr) -> Error,
 	event_create:      proc "c" (event: ^rawptr, flags: c.uint) -> Error,
 	event_destroy:     proc "c" (event: rawptr) -> Error,
 	event_record:      proc "c" (event: rawptr, stream: rawptr) -> Error,
@@ -744,6 +745,10 @@ load_graph_api :: proc() -> bool {
 		gapi.htod_async = p
 	} else {
 		ok = false
+	}
+	// Optional. Missing it keeps split-K out of a captured graph.
+	if p, got := bind_sym("cuMemsetD8Async", type_of(gapi.memset_async)); got {
+		gapi.memset_async = p
 	}
 	if p, got := bind_sym("cuEventCreate", type_of(gapi.event_create)); got {
 		gapi.event_create = p
