@@ -19,8 +19,14 @@
    nearest-even matches CUDA __float2half and Odin's f16 cast. */
 
 /* Engine decode stores the token position here and passes pos=-1 so a CUDA
-   graph can replay every token. A non-negative argument is the position. */
-__device__ int g_decode_pos;
+   graph can replay every token. A non-negative argument is the position.
+   volatile: the host writes this with cuMemcpyHtoD between replays, and
+   ptxas must not fold the load to 0. extern "C" keeps the PTX name. The
+   host also rewrites the declaration to `.visible .global`, because NVRTC
+   emits a plain `.global` and cuModuleGetGlobal does not see that. */
+extern "C" {
+__device__ volatile int g_decode_pos;
+}
 
 __device__ __forceinline__ int live_pos(int pos) {
     return pos >= 0 ? pos : g_decode_pos;

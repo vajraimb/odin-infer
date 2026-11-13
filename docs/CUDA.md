@@ -154,14 +154,13 @@ Q6 codes are unpacked per byte. There is no `vsub4` in the PTX: NVRTC emits
 `vsub4.s32.s32.s32`, and the sm_70 JIT rejects that opcode, which rejects
 the whole module. Scales stay in registers.
 
-One row per warp is used when the matrix has 8192 rows or fewer (attention
-out, FFN down, the 9B Q projection). Four rows per warp on a 4096-row
-matrix is only 1024 warps, about 13 per SM on a V100S, which is why those
-shapes sat near 20% of 1134 GB/s. One row per warp is 4096 warps. Total
-warps are `rows / rows_per_warp`; changing warps per block does not change
-that, so split-K was not added. A second sequential launch would not fill
-more SMs, and a fused split would need atomics. `ODINFER_CUDA_GEMV_ROWS=1`
-or `=4` forces one shape for Q4_K and Q6_K.
+Four rows per warp is the default for every Q4_K and Q6_K shape. One row
+per warp was slower on the V100S at every size that was timed (9B decode
+33 tok/s versus 62 for four rows; bench r1 was 8% of peak where r4 was
+39%). `ODINFER_CUDA_GEMV_ROWS=1` still selects it. Total warps are
+`rows / 4`. Changing warps per block does not change that, so split-K was
+not added. A second sequential launch would not fill more SMs, and a fused
+split would need atomics.
 
 Q8_0 and Q5_0 matrices under 16 MiB stay on the scalar kernel. At
 2048×2048 the new kernel was slower (Q8_0 118.5 vs 121.8 GB/s, Q5_0 49.2
@@ -191,7 +190,7 @@ add with their own kernel. The logits GEMV does not accumulate.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `ODINFER_CUDA_GEMV` | auto | `old` or `0`: scalar GEMV. `new`: bandwidth kernel even for small Q5_0 / Q8_0. Unset: bandwidth, except Q5_0 / Q8_0 under 16 MiB |
-| `ODINFER_CUDA_GEMV_ROWS` | auto | `1` or `4` forces rows per warp for Q4_K and Q6_K. Unset: one row when `rows≤8192`, else four |
+| `ODINFER_CUDA_GEMV_ROWS` | `4` | Rows per warp for Q4_K and Q6_K. Unset is four. `1` selects the slower one-row kernel |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block (1..16) |
 | `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count for each forward |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | Peak used by `--bench-gemv` to print % of HBM |

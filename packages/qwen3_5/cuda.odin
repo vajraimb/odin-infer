@@ -1,7 +1,8 @@
 /* CUDA forward for Qwen3.5. Compiled only with -define:ODINFER_BACKEND="cuda".
    The driver and NVRTC are dlopen'd; nothing here links against libcuda.
-   Decode (T==1) uses a bandwidth GEMV. Short Q4/Q6 matrices use one row per
-   warp; tall ones keep four. ODINFER_CUDA_GEMV=old restores the scalar kernel.
+   Decode (T==1) uses a bandwidth GEMV, four rows per warp.
+   ODINFER_CUDA_GEMV_ROWS=1 selects one row per warp. ODINFER_CUDA_GEMV=old
+   restores the scalar kernel.
    Dense decode can be one CUDA graph (ODINFER_CUDA_GRAPH=0 disables it).
    Prefill stays eager and uses WMMA when it pays. KV layout matches the
    Metal/CPU snapshot bytes (Q8_0 K, mixed or Q8 V, or legacy f16). */
@@ -16,6 +17,7 @@ import "core:fmt"
 import "core:math"
 import "core:os"
 import "core:strconv"
+import "core:strings"
 import "core:time"
 
 @(private)
@@ -31,6 +33,7 @@ _cuda_import_keep :: proc() {
 	_ = math.abs(f32(0))
 	_ = os.O_RDONLY
 	_, _ = strconv.parse_int("0")
+	_, _ = strings.replace("", "", "", 1)
 	_ = time.now()
 	_ = c.int(0)
 	_ = len(CUDA_KERNEL_SRC)
@@ -41,8 +44,6 @@ when GPU_CUDA {
 CUDA_MAX_BATCH :: 128
 // Q5_0 / Q8_0 below this stay on the old GEMV. The new kernel lost at 2048x2048.
 GEMV_SMALL_BYTES :: 16 * 1024 * 1024
-// Four rows per warp under-fills the V100 below this row count (wo, w2, 9B wq).
-GEMV_R1_ROWS :: 8192
 PROF_MAX :: 8192
 // WMMA tile is 16. Below this, the fp16 quant round-trip does not pay for
 // itself against the 8-token MMQ. ODINFER_CUDA_TC=1 uses tensor cores for
@@ -126,7 +127,7 @@ g_gemv_new: bool
 @(private)
 g_gemv_force: int // 0 old, 1 auto, 2 always the new kernel
 @(private)
-g_gemv_rows: int // 0 auto, 1 one row/warp, 4 four rows/warp
+g_gemv_rows: int // 0 or 4: four rows/warp. 1: one row/warp.
 @(private)
 g_gemv_warps: int
 @(private)
@@ -466,16 +467,9 @@ gemv2_pick :: proc(kind: ggml.GGML_Type, n, d: int) -> (fn: cu.Function, r1: boo
 	if base == nil {
 		return nil, false
 	}
-	want_r1 := false
-	if kind == .Q4_K || kind == .Q6_K {
-		if g_gemv_rows == 1 {
-			want_r1 = true
-		} else if g_gemv_rows == 4 {
-			want_r1 = false
-		} else {
-			want_r1 = d <= GEMV_R1_ROWS
-		}
-	}
+	// One row per warp lost on every V100 shape (9B default 44 tok/s, ROWS=1
+	// 33, ROWS=4 62). Four rows is the default. ROWS=1 still selects it.
+	want_r1 := g_gemv_rows == 1 && (kind == .Q4_K || kind == .Q6_K)
 	if want_r1 {
 		if kind == .Q4_K && k_gemv2r1_q4 != nil {
 			return k_gemv2r1_q4, true
@@ -1000,6 +994,35 @@ upload_moe :: proc(t: ^Transformer) -> bool {
 
 cuda_destroy :: proc() {
 	g_ready = false
+	// Stream, graph exec, and events belong to the primary context. Releasing
+	// the context first and destroying them after is the exit 139: the driver
+	// faults in stream teardown even when the graph was never captured.
+	if g_ctx_held {
+		cu.drv.CtxSynchronize()
+	}
+	if cu.gapi.ready && g_exec != nil {
+		cu.gapi.graph_exec_destroy(g_exec)
+	}
+	g_exec = nil
+	g_graph_launches = 0
+	g_graph_ready = false
+	g_capturing = false
+	g_launch_stream = nil
+	g_pos_sym = 0
+	if cu.gapi.ready && g_stream != nil {
+		cu.gapi.stream_destroy(g_stream)
+	}
+	g_stream = nil
+	if cu.gapi.ready {
+		for i in 0 ..< PROF_MAX {
+			if g_prof_ev[i] != nil {
+				cu.gapi.event_destroy(g_prof_ev[i])
+				g_prof_ev[i] = nil
+			}
+		}
+	}
+	g_prof_ready = false
+	g_prof_n = 0
 	free_live()
 	if d_mmap != 0 {
 		cu.free(d_mmap)
@@ -1016,29 +1039,6 @@ cuda_destroy :: proc() {
 	d_xq, d_xd, d_xs = 0, 0, 0
 	g_q8_valid = false
 	g_q8_cap = 0
-	g_graph_ready = false
-	g_capturing = false
-	g_launch_stream = nil
-	g_pos_sym = 0
-	if cu.gapi.ready && g_exec != nil {
-		cu.gapi.graph_exec_destroy(g_exec)
-	}
-	g_exec = nil
-	g_graph_launches = 0
-	if cu.gapi.ready && g_stream != nil {
-		cu.gapi.stream_destroy(g_stream)
-	}
-	g_stream = nil
-	if cu.gapi.ready {
-		for i in 0 ..< PROF_MAX {
-			if g_prof_ev[i] != nil {
-				cu.gapi.event_destroy(g_prof_ev[i])
-				g_prof_ev[i] = nil
-			}
-		}
-	}
-	g_prof_ready = false
-	g_prof_n = 0
 	delete(h_logits); h_logits = nil
 	delete(h_embed); h_embed = nil
 	delete(h_wt); h_wt = nil
@@ -1142,7 +1142,17 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		cuda_destroy()
 		return false
 	}
-	mod, jit, merr := cu.module_load_ptx(ptx)
+	// NVRTC emits `.global` without `.visible`. The kernels can still load it,
+	// but cuModuleGetGlobal only finds an exported symbol, so the graph never
+	// attached ("g_decode_pos missing").
+	needle := ".global .align 4 .u32 g_decode_pos;"
+	ptx_load := ptx
+	if !strings.contains(ptx, needle) {
+		fmt.eprintln("cuda: PTX has no g_decode_pos declaration; graph will be off")
+	} else {
+		ptx_load, _ = strings.replace(ptx, needle, ".visible .global .align 4 .u32 g_decode_pos;", 1)
+	}
+	mod, jit, merr := cu.module_load_ptx(ptx_load)
 	if len(jit) > 0 {
 		fmt.eprintfln("cuda: jit: %s", jit)
 	}
@@ -1281,11 +1291,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_gemv_new {
-		rows_note := "auto (1 row/warp when rows<=8192)"
+		rows_note := "4 rows/warp"
 		if g_gemv_rows == 1 {
 			rows_note = "1 row/warp"
-		} else if g_gemv_rows == 4 {
-			rows_note = "4 rows/warp"
 		}
 		force_note := ""
 		if g_gemv_force == 2 {
@@ -1312,11 +1320,15 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 			nbytes: c.size_t
 			dptr: cu.Device_Ptr
 			sym := [?]u8{'g', 'd', 'e', 'c', 'o', 'd', 'e', '_', 'p', 'o', 's', 0}
-			if cu.gapi.module_global(&dptr, &nbytes, g_mod, cstring(&sym[0])) != cu.OK || dptr == 0 {
-				fmt.eprintln("cuda: g_decode_pos missing; graph off")
+			gerr := cu.gapi.module_global(&dptr, &nbytes, g_mod, cstring(&sym[0]))
+			if gerr != cu.OK || dptr == 0 {
+				fmt.eprintf("cuda: g_decode_pos missing: %s (%d); graph off\n", cu.error_string(gerr), int(gerr))
+				cu.gapi.stream_destroy(st)
+				g_stream = nil
 				g_use_graph = false
 			} else {
 				g_pos_sym = dptr
+				fmt.eprintfln("cuda: g_decode_pos %d bytes", int(nbytes))
 			}
 		}
 	}

@@ -123,12 +123,11 @@ ODINFER_CUDA_TC=1 bin/cuda_smoke "$MODEL" 8 2048
 `vsub4.s32.s32.s32`，sm_70 的 JIT 拒绝这条指令，整模块都加载失败。scale
 留在寄存器里。
 
-8192 行及以下用一行一个 warp（注意力输出、FFN down、9B 的 Q）。4096 行配
-四行一个 warp 只有 1024 个 warp，V100S 上大约每个 SM 13 个，所以这些形状
-只有 1134 GB/s 的大约 20%。一行一个 warp 是 4096 个 warp。总 warp 数是
-`rows / rows_per_warp`，改每块的 warp 数并不改变它，所以没有加 split-K。
-再发一次 kernel 填不满更多 SM，融合的 split 还要原子加。
-`ODINFER_CUDA_GEMV_ROWS=1` 或 `=4` 强制 Q4_K / Q6_K 的形状。
+Q4_K 和 Q6_K 默认都是四行一个 warp。一行一个 warp 在 V100S 上每个测过的
+形状都更慢（9B 解码 33 tok/s，四行是 62；bench 上 r1 只有峰值的 8%，r4 是
+39%）。`ODINFER_CUDA_GEMV_ROWS=1` 仍可选它。总 warp 数是 `rows / 4`，改每块
+的 warp 数并不改变它，所以没有加 split-K。再发一次 kernel 填不满更多 SM，
+融合的 split 还要原子加。
 
 16 MiB 以下的 Q8_0 和 Q5_0 留在标量内核。2048×2048 上新内核更慢（Q8_0
 118.5 对 121.8 GB/s，Q5_0 49.2 对 69.7）。9B 和 27B 的热权重是 Q4_K 和
@@ -151,7 +150,7 @@ warp 槽。
 | 变量 | 默认 | 作用 |
 |------|------|------|
 | `ODINFER_CUDA_GEMV` | auto | `old` 或 `0`：标量 GEMV。`new`：小 Q5_0 / Q8_0 也用带宽内核。不设：带宽内核，但 16 MiB 以下的 Q5_0 / Q8_0 用标量 |
-| `ODINFER_CUDA_GEMV_ROWS` | auto | Q4_K / Q6_K 每个 warp 的行数。不设：`rows≤8192` 用 1，否则 4。`1` 或 `4` 强制 |
+| `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K 每个 warp 的行数。不设是四行。`1` 选更慢的一行内核 |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | 带宽 GEMV 每块的 warp 数（1..16） |
 | `ODINFER_CUDA_LAUNCHES` | 关 | `=1` 时每次 forward 打印内核启动次数 |
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | `--bench-gemv` 用来算峰值百分比 |

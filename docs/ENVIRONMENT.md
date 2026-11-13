@@ -47,7 +47,7 @@ you isolate per-stage GPU time. Never enable in production.
 | `CUDA_DEVICE` | `0` | Device ordinal. |
 | `ODINFER_CUDA_TC` | auto | Prefill GEMM. Unset: Volta WMMA when `T≥16`. `1`: WMMA for every `T>1`. `0`: MMQ. Decode (`T==1`) stays GEMV. |
 | `ODINFER_CUDA_GEMV` | auto | Decode GEMV. Unset: dp4a bandwidth kernel; Q5_0 and Q8_0 under 16 MiB stay on the scalar kernel. `new`: bandwidth kernel for those small shapes too. `old` or `0`: scalar GEMV for everything. |
-| `ODINFER_CUDA_GEMV_ROWS` | auto | Q4_K / Q6_K rows per warp. Unset: 1 when `rows≤8192`, else 4. `1` or `4` forces it. |
+| `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K rows per warp. Unset is four. `1` selects the one-row kernel, which was slower on the V100S. |
 | `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
 | `ODINFER_CUDA_GRAPH` | on | Dense `T==1` decode is one CUDA graph. `=0` runs eager. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). |
