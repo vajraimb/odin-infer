@@ -119,7 +119,9 @@ ODINFER_CUDA_TC=1 bin/cuda_smoke "$MODEL" 8 2048
 用于高矩阵（FFN up、27B 的 Q、logits）。这 8 个线程各发一次 `ld.global.v4`，
 一行的量化数据是一次 128 字节的合并读，点积是 `dp4a.s32.s32`。Q6_K 的块是
 210 字节，16 字节加载是两个对齐窗口的移位；权重分配多留 64 字节，sm_70 上
-不会发出未对齐的 `v4`。Q6 用 `vsub4` 拆码，scale 不再进 local memory。
+不会发出未对齐的 `v4`。Q6 按字节拆码，PTX 里没有 `vsub4`：NVRTC 会发出
+`vsub4.s32.s32.s32`，sm_70 的 JIT 拒绝这条指令，整模块都加载失败。scale
+留在寄存器里。
 
 8192 行及以下用一行一个 warp（注意力输出、FFN down、9B 的 Q）。4096 行配
 四行一个 warp 只有 1024 个 warp，V100S 上大约每个 SM 13 个，所以这些形状

@@ -150,8 +150,9 @@ one `ld.global.v4` each, so a row's quant payload is a single coalesced
 128-byte read, and the dot is `dp4a.s32.s32`. Q6_K blocks are 210 bytes, so
 the 16-byte load is a shift of two aligned windows; the weight allocation
 is padded by 64 bytes and the load never emits a misaligned `v4` on sm_70.
-Q6 codes are unpacked with `vsub4` and there is no scale array in local
-memory.
+Q6 codes are unpacked per byte. There is no `vsub4` in the PTX: NVRTC emits
+`vsub4.s32.s32.s32`, and the sm_70 JIT rejects that opcode, which rejects
+the whole module. Scales stay in registers.
 
 One row per warp is used when the matrix has 8192 rows or fewer (attention
 out, FFN down, the 9B Q projection). Four rows per warp on a 4096-row

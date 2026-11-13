@@ -117,7 +117,7 @@ s_open :: proc() -> bool {
 		fmt.eprintfln("jit: %s", jit)
 	}
 	if merr != cu.OK {
-		fmt.eprintf("cuda_selftest: module load failed: %s\n", cu.error_string(merr))
+		fmt.eprintf("cuda_selftest: module load failed: %s (%d)\n", cu.error_string(merr), int(merr))
 		s_close()
 		return false
 	}

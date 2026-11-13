@@ -1341,10 +1341,15 @@ __device__ __forceinline__ uint4 ld_u4_aligned(const unsigned char* p) {
     return o;
 }
 
-__device__ __forceinline__ int vsub4_bias32(int a) {
-    int d;
-    asm("vsub4.s32.s32.s32 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(0x20202020));
-    return d;
+/* Subtract 32 from each byte. No vsub4: NVRTC 12.9 emits
+   vsub4.s32.s32.s32, and the sm_70 PTX JIT rejects that opcode
+   (CUDA_ERROR_INVALID_PTX), which rejects the whole module. */
+__device__ __forceinline__ int sub_bias32_bytes(unsigned x) {
+    unsigned b0 = (x & 0xffu) - 32u;
+    unsigned b1 = ((x >> 8) & 0xffu) - 32u;
+    unsigned b2 = ((x >> 16) & 0xffu) - 32u;
+    unsigned b3 = ((x >> 24) & 0xffu) - 32u;
+    return (int)((b0 & 0xffu) | ((b1 & 0xffu) << 8) | ((b2 & 0xffu) << 16) | ((b3 & 0xffu) << 24));
 }
 
 /* Four Q6 codes from one ql word and the matching qh word. hi_pair 0 is
@@ -1354,8 +1359,8 @@ __device__ __forceinline__ void q6_pack(unsigned ql, unsigned qh, int hi_pair, i
     unsigned hi = (ql >> 4) & 0x0f0f0f0fu;
     unsigned hs = hi_pair ? 2u : 0u;
     unsigned hb = hi_pair ? 6u : 4u;
-    *qa = vsub4_bias32((int)(lo | (((qh >> hs) & 0x03030303u) << 4)));
-    *qb = vsub4_bias32((int)(hi | (((qh >> hb) & 0x03030303u) << 4)));
+    *qa = sub_bias32_bytes(lo | (((qh >> hs) & 0x03030303u) << 4));
+    *qb = sub_bias32_bytes(hi | (((qh >> hb) & 0x03030303u) << 4));
 }
 
 __device__ __forceinline__ unsigned hdr_scale_byte(uint4 hdr, int i) {

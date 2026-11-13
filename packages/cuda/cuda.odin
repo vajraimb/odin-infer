@@ -52,6 +52,7 @@ Driver :: struct {
 	MemcpyDtoH_v2:              proc "c" (dst: rawptr, src: Device_Ptr, bytes: c.size_t) -> Error,
 	MemcpyDtoD_v2:              proc "c" (dst: Device_Ptr, src: Device_Ptr, bytes: c.size_t) -> Error,
 	MemsetD8_v2:                proc "c" (ptr: Device_Ptr, value: c.uchar, n: c.size_t) -> Error,
+	ModuleLoadData:             proc "c" (mod: ^Module, image: rawptr) -> Error,
 	ModuleLoadDataEx:           proc "c" (mod: ^Module, image: rawptr, nopts: c.uint, opts: [^]c.int, vals: [^]rawptr) -> Error,
 	ModuleGetFunction:          proc "c" (fn: ^Function, mod: Module, name: cstring) -> Error,
 	ModuleUnload:               proc "c" (mod: Module) -> Error,
@@ -105,9 +106,15 @@ ATTR_MULTIPROCESSOR_COUNT :: c.int(16)
 ATTR_COMPUTE_CAPABILITY_MAJOR :: c.int(75)
 ATTR_COMPUTE_CAPABILITY_MINOR :: c.int(76)
 
-// CU_JIT_ERROR_LOG_BUFFER / SIZE
+// CU_JIT_INFO_LOG_BUFFER / SIZE, CU_JIT_ERROR_LOG_BUFFER / SIZE.
+// Size options take a pointer to the byte count. 1024, not 64 KiB: driver
+// 580's ptxjitcompiler segfaults in strncpy when LoadDataEx is given a
+// 64 KiB error log and the PTX is rejected.
+JIT_INFO_LOG_BUFFER :: c.int(3)
+JIT_INFO_LOG_BUFFER_SIZE_BYTES :: c.int(4)
 JIT_ERROR_LOG_BUFFER :: c.int(5)
 JIT_ERROR_LOG_BUFFER_SIZE_BYTES :: c.int(6)
+JIT_LOG_CAP :: 1024
 
 BACKEND_TAG :: "cuda"
 
@@ -508,22 +515,65 @@ compile_loaded :: proc(source, name: string, options: []string, allocator := con
 	return
 }
 
-module_load_ptx :: proc(ptx: string) -> (mod: Module, jit_log: string, err: Error) {
-	// cuModuleLoadDataEx wants a NUL-terminated image.
-	img := make([]u8, len(ptx) + 1, context.temp_allocator)
-	copy(img, transmute([]u8)(ptx))
-	logbuf := make([]u8, 1 << 16, context.temp_allocator)
-	logsize := c.size_t(len(logbuf))
-	opts := [2]c.int{JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES}
-	vals := [2]rawptr{raw_data(logbuf), &logsize}
-	err = drv.ModuleLoadDataEx(&mod, raw_data(img), 2, raw_data(opts[:]), raw_data(vals[:]))
+@(private)
+jit_cstr :: proc(b: []u8) -> string {
 	n := 0
-	for n < len(logbuf) && logbuf[n] != 0 {
+	for n < len(b) && b[n] != 0 {
 		n += 1
 	}
-	if n > 0 {
-		jit_log = strings.clone(string(logbuf[:n]))
+	if n == 0 {
+		return ""
 	}
+	return string(b[:n])
+}
+
+// Best-effort JIT text after a failed plain load. Buffers are 1024 bytes and
+// zeroed. The size lives in a size_t so a 4-byte or 8-byte read both see
+// 1024. A 64 KiB buffer is what faults driver 580.
+@(private)
+jit_log_after_failure :: proc(image: rawptr) -> string {
+	info := make([]u8, JIT_LOG_CAP, context.temp_allocator)
+	errb := make([]u8, JIT_LOG_CAP, context.temp_allocator)
+	info_n := c.size_t(JIT_LOG_CAP)
+	err_n := c.size_t(JIT_LOG_CAP)
+	opts := [4]c.int{
+		JIT_INFO_LOG_BUFFER,
+		JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+		JIT_ERROR_LOG_BUFFER,
+		JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+	}
+	vals := [4]rawptr{raw_data(info), &info_n, raw_data(errb), &err_n}
+	extra: Module
+	_ = drv.ModuleLoadDataEx(&extra, image, 4, raw_data(opts[:]), raw_data(vals[:]))
+	if extra != nil {
+		drv.ModuleUnload(extra)
+	}
+	a := jit_cstr(info)
+	b := jit_cstr(errb)
+	if len(a) == 0 {
+		return strings.clone(b)
+	}
+	if len(b) == 0 {
+		return strings.clone(a)
+	}
+	return strings.concatenate({a, "\n", b})
+}
+
+module_load_ptx :: proc(ptx: string) -> (mod: Module, jit_log: string, err: Error) {
+	// NUL-terminated image. cuModuleLoadData is the load that returns
+	// CUDA_ERROR_INVALID_PTX (218) without entering the JIT log copier.
+	img := make([]u8, len(ptx) + 1, context.temp_allocator)
+	copy(img, transmute([]u8)(ptx))
+	image := raw_data(img)
+	err = drv.ModuleLoadData(&mod, image)
+	if err == OK {
+		return
+	}
+	// Printed before the log attempt. A bad LoadDataEx still faults driver
+	// 580 inside strncpy; this line is already on stderr if that happens.
+	fmt.eprintf("cuda: cuModuleLoadData failed: %s (%d)\n", error_string(err), int(err))
+	os.flush(os.stderr)
+	jit_log = jit_log_after_failure(image)
 	return
 }
 

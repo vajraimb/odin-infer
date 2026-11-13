@@ -1147,7 +1147,7 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 		fmt.eprintfln("cuda: jit: %s", jit)
 	}
 	if merr != cu.OK {
-		fmt.eprintf("cuda: cuModuleLoadDataEx failed: %s\n", cu.error_string(merr))
+		fmt.eprintf("cuda: cuModuleLoadData failed: %s (%d)\n", cu.error_string(merr), int(merr))
 		cuda_destroy()
 		return false
 	}
