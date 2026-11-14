@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// l2norm_into then multiply by f0 (1 for k, 1/sqrt(head_k) for q).
+// u0=in u1=out u2=rows u3=size u4=in_stride u5=out_stride  f0=scale f1=eps
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint row = gl_GlobalInvocationID.x;
+	if (row >= pc.u[2]) return;
+	uint size = pc.u[3];
+	uint inb = pc.u[0] + row * pc.u[4];
+	precise float ss = 0.0;
+	for (uint j = 0u; j < size; j++) {
+		float v = X(inb + j);
+		ss += v * v;
+	}
+	float inv = 1.0 / max(sqrt(ss), pc.f[1]);
+	float scale = pc.f[0];
+	uint outb = pc.u[1] + row * pc.u[5];
+	for (uint j = 0u; j < size; j++) {
+		Y(outb + j, (X(inb + j) * inv) * scale);
+	}
+}

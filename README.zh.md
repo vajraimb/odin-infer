@@ -99,12 +99,15 @@ M3 / 16GB，DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic（Q4_K_M），单引�
   [docs/MEMORY.zh.md](docs/MEMORY.zh.md)
 - **Linux CUDA**（sm_70+，含 Tesla V100）：`-define:ODINFER_BACKEND="cuda"`
   编译。驱动和 NVRTC 运行时加载。见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。
+- **Windows Vulkan**（共享显存 Radeon）：`-define:ODINFER_BACKEND=vulkan`
+  编译。Odin dev-2026-07 和驱动的 `vulkan-1.dll` 就够；SPIR-V 已嵌进二进制。
+  见 [docs/VULKAN.zh.md](docs/VULKAN.zh.md)。
   macOS 构建仍走 Metal。
 
 ## 仓库结构
 
 ```
-packages/   ggml · infer(Qwen3 历史兼容) · qwen3_5 · qwen3_5_tokenizer · sampler · tokenizer · cuda
+packages/   ggml · infer(Qwen3 历史兼容) · qwen3_5 · qwen3_5_tokenizer · sampler · tokenizer · cuda · vulkan
 server/     odin-serve（HTTP + MCP + dashboard + 集成测试）
 cli/        odin-cli
 tools/      gemm/delta/doctor/oracle harness + thermal_test.py + MoE 测试
@@ -118,6 +121,7 @@ docs/       MCP · THERMAL · MEMORY · 排障记录
 - [docs/MEMORY.zh.md](docs/MEMORY.zh.md) —— 内存预算配置
 - [docs/THERMAL.zh.md](docs/THERMAL.zh.md) —— 持续负载对照协议
 - [docs/CUDA.zh.md](docs/CUDA.zh.md) —— Linux CUDA 后端（sm_70+，V100）
+- [docs/VULKAN.zh.md](docs/VULKAN.zh.md) —— Windows Vulkan 后端（SPIR-V 已嵌入）
 - [AGENTS.zh.md](AGENTS.zh.md) —— 给 AI agent 的构建/测试/使用速查
 
 ## 社区

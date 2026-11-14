@@ -2483,8 +2483,9 @@ handle_openai_chat :: proc(body: string) -> string {
 
 	// Optional: parse max_tokens (default 256), temperature (default 0.6)
 	max_tokens := parse_int_field(body, "max_tokens", 256)
-	temperature := parse_f32_field(body, "temperature", 0.6)
-	_ = temperature  // currently unused; could set on sampler
+	// Honor per-request temperature like the Ollama path below; 0 selects
+	// greedy argmax in the sampler.
+	g_state.samp.temperature = parse_f32_field(body, "temperature", 0.6)
 
 	// Render conversation as Qwen chat template (stateless per request)
 	prompt_buf: strings.Builder
@@ -2860,7 +2861,7 @@ main :: proc() {
 		}
 	}
 	if len(args) < 2 {
-		fmt.eprintln("usage: serve <model.gguf> [--port N] [--metal|--cuda] [--max-ctx N]")
+		fmt.eprintln("usage: serve <model.gguf> [--port N] [--metal|--cuda|--vulkan] [--max-ctx N]")
 		fmt.eprintln("       serve --self-test  (parse regression, no model needed)")
 		os.exit(1)
 	}
@@ -2877,7 +2878,7 @@ main :: proc() {
 			v, _ := strconv_parse_int(args[i+1])
 			port = u16(v)
 			i += 2
-		} else if a == "--metal" || a == "--cuda" {
+		} else if a == "--metal" || a == "--cuda" || a == "--vulkan" {
 			use_metal = true
 			i += 1
 		} else if a == "--max-ctx" && i + 1 < len(args) {

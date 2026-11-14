@@ -1,0 +1,28 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// RMSNormGated: rmsnorm then multiply by silu(z), per value head.
+// u0=x u1=z u2=weight u3=rows u4=head_v  f0=eps
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint row = gl_GlobalInvocationID.x;
+	if (row >= pc.u[3]) return;
+	uint n = pc.u[4];
+	uint xb = pc.u[0] + row * n;
+	uint zb = pc.u[1] + row * n;
+	precise float ss = 0.0;
+	for (uint j = 0u; j < n; j++) {
+		float v = X(xb + j);
+		ss += v * v;
+	}
+	ss = ss / float(n) + pc.f[0];
+	float inv = 1.0 / sqrt(ss);
+	uint w = pc.u[2];
+	for (uint j = 0u; j < n; j++) {
+		float v = X(xb + j);
+		Y(xb + j, (X(w + j) * (inv * v)) * silu(X(zb + j)));
+	}
+}

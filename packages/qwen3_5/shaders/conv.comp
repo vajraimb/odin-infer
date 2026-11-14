@@ -1,0 +1,23 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Depthwise causal conv1d, one channel per thread. Matches conv1d_step.
+// Weights are F32 in the weight buffer, layout [conv_dim, kernel].
+// u0=w_byte u1=in u2=out u3=state u4=conv_dim u5=kernel
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint c = gl_GlobalInvocationID.x;
+	if (c >= pc.u[4]) return;
+	uint kernel = pc.u[5];
+	uint km1 = kernel - 1u;
+	uint wbase = pc.u[0] + c * kernel * 4u;
+	precise float acc = load_f32(wbase + km1 * 4u) * X(pc.u[1] + c);
+	uint sb = pc.u[3] + c * km1;
+	for (uint k = 0u; k < km1; k++) acc += load_f32(wbase + k * 4u) * X(sb + k);
+	Y(pc.u[2] + c, silu(acc));
+	for (uint k = 0u; k + 1u < km1; k++) Y(sb + k, X(sb + k + 1u));
+	if (km1 > 0u) Y(sb + km1 - 1u, X(pc.u[1] + c));
+}

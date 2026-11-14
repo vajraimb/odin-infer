@@ -1,0 +1,84 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Optional integer-dot GEMV for Q8_0 (kind 8) and Q4_0 (kind 2).
+// The activation group of 32 is quantized to int8 (scale amax/127) and
+// dotted with dotPacked4x8AccSatEXT. This is the fast approximation, not
+// the fp32 forward path. One thread per row so the integer sum is ordered.
+// u0=w_off u1=x_off u2=y_off u3=rows u4=cols u5=T u6=kind u7=row0
+// u8=x_stride u9=y_stride u11=row_bytes
+
+layout(local_size_x = 1) in;
+
+int quant_i8(float v) {
+	float x = clamp(v, -127.0, 127.0);
+	if (x >= 0.0) return int(floor(x + 0.5));
+	return -int(floor(-x + 0.5));
+}
+
+uint pack4(int a, int b, int c, int d) {
+	return (uint(a) & 255u) | ((uint(b) & 255u) << 8u) | ((uint(c) & 255u) << 16u) | ((uint(d) & 255u) << 24u);
+}
+
+int as_i32(uint u) {
+	return floatBitsToInt(uintBitsToFloat(u));
+}
+
+int dot32(int qv[32], int xv[32]) {
+	int acc = 0;
+	for (uint g = 0u; g < 8u; g++) {
+		uint o = g * 4u;
+		acc = dotPacked4x8AccSatEXT(
+			as_i32(pack4(qv[o], qv[o + 1u], qv[o + 2u], qv[o + 3u])),
+			as_i32(pack4(xv[o], xv[o + 1u], xv[o + 2u], xv[o + 3u])), acc);
+	}
+	return acc;
+}
+
+void main() {
+	uint row = pc.u[7] + gl_WorkGroupID.x;
+	if (row >= pc.u[3]) return;
+	uint cols = pc.u[4];
+	uint kind = pc.u[6];
+	uint T = pc.u[5];
+	uint base = pc.u[0] + row * pc.u[11];
+	uint nb = cols / 32u;
+	for (uint t = 0u; t < T; t++) {
+		precise float acc = 0.0;
+		uint xb = pc.u[1] + t * pc.u[8];
+		for (uint b = 0u; b < nb; b++) {
+			float xs[32];
+			float amax = 0.0;
+			for (uint j = 0u; j < 32u; j++) {
+				xs[j] = X(xb + b * 32u + j);
+				amax = max(amax, abs(xs[j]));
+			}
+			float sx = amax > 0.0 ? amax / 127.0 : 1.0;
+			int xv[32];
+			for (uint j = 0u; j < 32u; j++) xv[j] = quant_i8(xs[j] / sx);
+			int qv[32];
+			float d;
+			if (kind == 8u) {
+				uint blk = base + b * 34u;
+				d = load_f16(blk);
+				for (uint j = 0u; j < 32u; j++) {
+					uint bits = load_u8(blk + 2u + j);
+					int s = int(bits);
+					qv[j] = s >= 128 ? s - 256 : s;
+				}
+			} else {
+				uint blk = base + b * 18u;
+				d = load_f16(blk);
+				for (uint j = 0u; j < 16u; j++) {
+					uint qs = load_u8(blk + 2u + j);
+					qv[j] = int(qs & 0xFu) - 8;
+					qv[j + 16u] = int(qs >> 4u) - 8;
+				}
+			}
+			acc += d * sx * float(dot32(qv, xv));
+		}
+		Y(pc.u[2] + t * pc.u[9] + row, acc);
+	}
+}

@@ -14,22 +14,34 @@ when ODIN_OS == .Darwin {
 	when ODINFER_BACKEND == "cuda" {
 		GPU_METAL :: false
 		GPU_CUDA :: true
+		GPU_VULKAN :: false
+	} else when ODINFER_BACKEND == "vulkan" {
+		GPU_METAL :: false
+		GPU_CUDA :: false
+		GPU_VULKAN :: true
 	} else {
 		GPU_METAL :: true
 		GPU_CUDA :: false
+		GPU_VULKAN :: false
 	}
 } else {
 	when ODINFER_BACKEND == "cuda" {
 		GPU_METAL :: false
 		GPU_CUDA :: true
+		GPU_VULKAN :: false
+	} else when ODINFER_BACKEND == "vulkan" {
+		GPU_METAL :: false
+		GPU_CUDA :: false
+		GPU_VULKAN :: true
 	} else {
 		GPU_METAL :: false
 		GPU_CUDA :: false
+		GPU_VULKAN :: false
 	}
 }
 
-when GPU_METAL && GPU_CUDA {
-	#panic("ODINFER_BACKEND: Metal and CUDA are mutually exclusive")
+when (GPU_METAL && GPU_CUDA) || (GPU_METAL && GPU_VULKAN) || (GPU_CUDA && GPU_VULKAN) {
+	#panic("ODINFER_BACKEND: Metal, CUDA, and Vulkan are mutually exclusive")
 }
 
 // Name of the accelerator that will actually run when `ready` is set.
@@ -38,7 +50,9 @@ gpu_backend_name :: proc(ready: bool) -> string {
 	if !ready {
 		return "cpu"
 	}
-	when GPU_CUDA {
+	when GPU_VULKAN {
+		return "vulkan"
+	} else when GPU_CUDA {
 		return "cuda"
 	} else when GPU_METAL {
 		return "metal"
@@ -49,7 +63,9 @@ gpu_backend_name :: proc(ready: bool) -> string {
 @(test)
 test_gpu_backend_name :: proc(t: ^testing.T) {
 	testing.expect_value(t, gpu_backend_name(false), "cpu")
-	when GPU_CUDA {
+	when GPU_VULKAN {
+		testing.expect_value(t, gpu_backend_name(true), "vulkan")
+	} else when GPU_CUDA {
 		testing.expect_value(t, gpu_backend_name(true), "cuda")
 	} else when GPU_METAL {
 		testing.expect_value(t, gpu_backend_name(true), "metal")

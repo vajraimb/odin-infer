@@ -78,8 +78,14 @@ The CUDA backend is a separate define, not the default:
 # or: -define:ODINFER_BACKEND="cuda"  -collection:cuda=packages
 ```
 
-See [docs/CUDA.md](docs/CUDA.md). Hot path is `when GPU_METAL` / `when GPU_CUDA`;
-a binary never branches between the two.
+See [docs/CUDA.md](docs/CUDA.md).
+
+Windows Vulkan is the same kind of switch (`-define:ODINFER_BACKEND=vulkan`,
+`-collection:vulkan=packages`). Odin dev-2026-07 is enough to build: SPIR-V is
+committed and embedded, and `vulkan-1.dll` is loaded at run time. The SDK is
+only for `./scripts/compile_spirv.sh`. Checks: `./scripts/vulkan_check.sh`.
+See [docs/VULKAN.md](docs/VULKAN.md). Hot path is `when GPU_METAL` /
+`when GPU_CUDA` / `when GPU_VULKAN`; a binary never contains more than one.
 
 ## Run
 
@@ -115,8 +121,9 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
 3. **json_escape emits its own outer quotes** (outputs `"escaped"`); callers
    must not add quotes around it.
 4. **Collection imports**: `import q35 "qwen3_5:qwen3_5"`; builds must pass
-   `-collection:<name>=packages` for all 6 collections (ggml/infer/qwen3_5/
-   qwen3_5_tokenizer/sampler/tokenizer), see COLLECTIONS in build.sh.
+   `-collection:<name>=packages` for ggml, infer, qwen3_5, qwen3_5_tokenizer,
+   sampler, tokenizer, cuda, and vulkan. The CUDA and Vulkan packages are
+   imported even when that backend is not selected. See COLLECTIONS in build.sh.
 5. **Kernel A/B switches** (env, all off by default, all measured regressions):
    `QGEMV3=1` (llama.cpp row-split port), `QGEMV2R=1` (2 rows/lane),
    `QGEMVNORM=1` (norm fusion). Ablation switches: write `/tmp/qprof_flags`

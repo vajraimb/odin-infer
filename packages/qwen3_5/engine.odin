@@ -43,6 +43,8 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 			e.metal_ready = metal_init(&e.transformer, path)
 		} else when GPU_CUDA {
 			e.metal_ready = cuda_init(&e.transformer, path)
+		} else when GPU_VULKAN {
+			e.metal_ready = vulkan_init(&e.transformer, path)
 		} else {
 			fmt.eprintln("metal: only supported on macOS")
 			e.metal_ready = false
@@ -54,6 +56,12 @@ engine_load :: proc(path: string, opts: Engine_Opts) -> (Engine, bool) {
 					return e, false
 				}
 				fmt.eprintln("cuda: init failed, METAL_FALLBACK=1 -> using CPU")
+			} else when GPU_VULKAN {
+				if !allow_fallback {
+					fmt.eprintln("vulkan: init failed and GPU was requested; refusing to fall back to CPU (set METAL_FALLBACK=1 to allow)")
+					return e, false
+				}
+				fmt.eprintln("vulkan: init failed, METAL_FALLBACK=1 -> using CPU")
 			} else {
 				if !allow_fallback {
 					fmt.eprintln("metal: init failed and --metal was requested; refusing to fall back to CPU (set METAL_FALLBACK=1 to allow)")
@@ -77,6 +85,10 @@ engine_destroy :: proc(e: ^Engine) {
 		if e.metal_ready {
 			cuda_destroy()
 		}
+	} else when GPU_VULKAN {
+		if e.metal_ready {
+			vulkan_destroy()
+		}
 	}
 	free_transformer(&e.transformer)
 	destroy_matmul_pool()
@@ -90,6 +102,10 @@ engine_forward :: proc(e: ^Engine, token, pos: int) -> []f32 {
 	} else when GPU_CUDA {
 		if e.metal_ready {
 			return cuda_forward(&e.transformer, token, pos)
+		}
+	} else when GPU_VULKAN {
+		if e.metal_ready {
+			return vulkan_forward(&e.transformer, token, pos)
 		}
 	}
 	return forward(&e.transformer, token, pos)
@@ -136,6 +152,10 @@ engine_forward_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32
 	when GPU_CUDA {
 		if e.metal_ready {
 			return cuda_forward_tokens(&e.transformer, tokens, pos_start)
+		}
+	} else when GPU_VULKAN {
+		if e.metal_ready {
+			return vulkan_forward_tokens(&e.transformer, tokens, pos_start)
 		}
 	}
 	if e.transformer.config.is_moe {
@@ -239,6 +259,8 @@ engine_batch_max :: proc() -> int {
 		return MAX_BATCH_T
 	} else when GPU_CUDA {
 		return cuda_batch_max()
+	} else when GPU_VULKAN {
+		return vulkan_batch_max()
 	} else {
 		return 0
 	}
@@ -261,6 +283,11 @@ engine_reset_state :: proc(e: ^Engine) {
 	} else when GPU_CUDA {
 		if e.metal_ready {
 			cuda_reset_state()
+			return
+		}
+	} else when GPU_VULKAN {
+		if e.metal_ready {
+			vulkan_reset_state()
 			return
 		}
 	}
@@ -293,6 +320,8 @@ engine_save_full_state :: proc(e: ^Engine) -> (kv_k: []u8, kv_v: []u8, conv: []u
 		if e.metal_ready { return metal_save_full_state() }
 	} else when GPU_CUDA {
 		if e.metal_ready { return cuda_save_full_state() }
+	} else when GPU_VULKAN {
+		if e.metal_ready { return vulkan_save_full_state(&e.transformer) }
 	}
 	return cpu_save_full_state(&e.transformer)
 }
@@ -302,6 +331,8 @@ engine_restore_full_state :: proc(e: ^Engine, kv_k, kv_v, conv, rec: []u8) {
 		if e.metal_ready { metal_restore_full_state(kv_k, kv_v, conv, rec); return }
 	} else when GPU_CUDA {
 		if e.metal_ready { cuda_restore_full_state(kv_k, kv_v, conv, rec); return }
+	} else when GPU_VULKAN {
+		if e.metal_ready { vulkan_restore_full_state(&e.transformer, kv_k, kv_v, conv, rec); return }
 	}
 	cpu_restore_full_state(&e.transformer, kv_k, kv_v, conv, rec)
 }
@@ -438,6 +469,8 @@ engine_save_spec_state :: proc(e: ^Engine) -> (conv: []u8, rec: []u8) {
 		if e.metal_ready { return metal_save_spec_state() }
 	} else when GPU_CUDA {
 		if e.metal_ready { return cuda_save_spec_state() }
+	} else when GPU_VULKAN {
+		if e.metal_ready { return vulkan_save_spec_state() }
 	}
 	return
 }
@@ -447,6 +480,8 @@ engine_restore_spec_state :: proc(e: ^Engine, conv: []u8, rec: []u8) {
 		if e.metal_ready { metal_restore_spec_state(conv, rec); return }
 	} else when GPU_CUDA {
 		if e.metal_ready { cuda_restore_spec_state(conv, rec); return }
+	} else when GPU_VULKAN {
+		if e.metal_ready { vulkan_restore_spec_state(conv, rec); return }
 	}
 }
 
@@ -454,6 +489,12 @@ engine_verify_batch :: proc(e: ^Engine, tokens: []int, pos_start: int) -> []f32 
 	when GPU_CUDA {
 		if e.metal_ready {
 			fmt.eprintln("cuda: engine_verify_batch is not implemented")
+			return {}
+		}
+	}
+	when GPU_VULKAN {
+		if e.metal_ready {
+			fmt.eprintln("vulkan: engine_verify_batch is not implemented")
 			return {}
 		}
 	}

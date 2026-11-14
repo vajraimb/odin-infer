@@ -1,0 +1,28 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One thread per row, sequential sum, matching rmsnorm in ops.odin.
+// u0=in u1=out u2=weight u3=rows u4=size u5=in_stride u6=out_stride  f0=eps
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint row = gl_GlobalInvocationID.x;
+	if (row >= pc.u[3]) return;
+	uint size = pc.u[4];
+	uint inb = pc.u[0] + row * pc.u[5];
+	precise float ss = 0.0;
+	for (uint j = 0u; j < size; j++) {
+		float v = X(inb + j);
+		ss += v * v;
+	}
+	ss = ss / float(size) + pc.f[0];
+	float inv = 1.0 / sqrt(ss);
+	uint outb = pc.u[1] + row * pc.u[6];
+	uint w = pc.u[2];
+	for (uint j = 0u; j < size; j++) {
+		float v = X(inb + j);
+		Y(outb + j, X(w + j) * (inv * v));
+	}
+}

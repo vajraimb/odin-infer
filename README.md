@@ -105,11 +105,14 @@ residency, cooled machine:
 - **Linux CUDA** (sm_70+, including Tesla V100): build with
   `-define:ODINFER_BACKEND="cuda"`. The driver and NVRTC are loaded at
   runtime. See [docs/CUDA.md](docs/CUDA.md). macOS builds stay on Metal.
+- **Windows Vulkan** (shared-memory Radeon): build with
+  `-define:ODINFER_BACKEND=vulkan`. Odin dev-2026-07 and the driver's
+  `vulkan-1.dll` are enough; SPIR-V is embedded. See [docs/VULKAN.md](docs/VULKAN.md).
 
 ## Repo layout
 
 ```
-packages/   ggml · infer(Qwen3, legacy) · qwen3_5 · qwen3_5_tokenizer · sampler · tokenizer · cuda
+packages/   ggml · infer(Qwen3, legacy) · qwen3_5 · qwen3_5_tokenizer · sampler · tokenizer · cuda · vulkan
 server/     odin-serve (HTTP + MCP + dashboard + integration tests)
 cli/        odin-cli
 tools/      gemm/delta/doctor/oracle harness + thermal_test.py + MoE tests
@@ -123,6 +126,7 @@ docs/       MCP · THERMAL · MEMORY · troubleshooting notes
 - [docs/MEMORY.md](docs/MEMORY.md) — memory budget guidance
 - [docs/THERMAL.md](docs/THERMAL.md) — sustained-load comparison protocol
 - [docs/CUDA.md](docs/CUDA.md) — Linux CUDA backend (sm_70+, V100)
+- [docs/VULKAN.md](docs/VULKAN.md) — Windows Vulkan backend (embedded SPIR-V)
 - [AGENTS.md](AGENTS.md) — quickstart for AI coding agents
 
 ## Community / 社区

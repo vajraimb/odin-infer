@@ -1,0 +1,43 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Gated delta step for every value head. Dots along K are sequential.
+// u0=q u1=k u2=v u3=state u4=out u5=b u6=a u7=a_decay u8=dt
+// u9=head_k u10=head_v u11=n_kh
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint vh = gl_WorkGroupID.x;
+	uint tid = gl_LocalInvocationID.x;
+	uint hk = pc.u[9];
+	uint hv = pc.u[10];
+	uint kh = vh % pc.u[11];
+	float beta = sigmoid(X(pc.u[5] + vh));
+	float g = exp(X(pc.u[7] + vh) * softplus(X(pc.u[6] + vh) + X(pc.u[8] + vh)));
+	uint st = pc.u[3] + vh * hk * hv;
+	uint q = pc.u[0] + kh * hk;
+	uint k = pc.u[1] + kh * hk;
+	uint v = pc.u[2] + vh * hv;
+	uint o = pc.u[4] + vh * hv;
+
+	uint n = hk * hv;
+	for (uint idx = tid; idx < n; idx += 64u) Y(st + idx, X(st + idx) * g);
+	// State is an SSBO, so the workgroup needs a buffer memory barrier.
+	memoryBarrierBuffer();
+	barrier();
+
+	for (uint j = tid; j < hv; j += 64u) {
+		precise float s = 0.0;
+		for (uint i = 0u; i < hk; i++) s += X(st + i * hv + j) * X(k + i);
+		float delta = (X(v + j) - s) * beta;
+		for (uint i = 0u; i < hk; i++) {
+			uint at = st + i * hv + j;
+			Y(at, X(at) + X(k + i) * delta);
+		}
+		precise float acc = 0.0;
+		for (uint i = 0u; i < hk; i++) acc += X(st + i * hv + j) * X(q + i);
+		Y(o + j, acc);
+	}
+}
