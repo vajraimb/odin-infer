@@ -679,6 +679,60 @@ run_tc2 :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32, wide:
 }
 
 @(private)
+run_tc2m :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> bool {
+	name := "tc2m_q4_k"
+	if kind == .Q6_K {
+		name = "tc2m_q6_k"
+	}
+	fn := s_fn(name)
+	if fn == nil {
+		fmt.eprintf("cuda_selftest: missing %s\n", name)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			x[t * cols + j] = (f32((t + 1) * (j + 3) % 9) - 4) * 0.03
+		}
+	}
+	ref := make([]f32, T * rows)
+	defer delete(ref)
+	for t in 0 ..< T {
+		row := cpu_gemv(kind, raw, x[t * cols:][:cols], rows, cols)
+		copy(ref[t * rows:][:rows], row)
+		delete(row)
+	}
+	dw, _ := cu.alloc(len(raw))
+	dx, _ := cu.alloc(T * cols * 4)
+	dy, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	wb, xx, yy := dw, dx, dy
+	nn, dd, tt := i32(cols), i32(rows), i32(T)
+	args := [?]rawptr{&wb, &xx, &yy, &nn, &dd, &tt}
+	gx := u32((rows + 63) / 64)
+	gy := u32((T + 63) / 64)
+	if cu.launch(fn, gx, gy, 1, 512, 1, 1, 0, args[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
+		return false
+	}
+	got := make([]f32, T * rows)
+	defer delete(got)
+	cu.download(raw_data(got), dy, T * rows * 4)
+	st: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st, fmt.tprintf("%s [%d]", name, i), got[i], ref[i], atol, rtol)
+	}
+	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
+}
+
+@(private)
 run_elem :: proc() -> bool {
 	// RMSNorm
 	n := 64
@@ -1305,6 +1359,17 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_tc2(.Q4_K, 64, 256, 32, 5e-2, 5e-2, true) || !run_tc2(.Q6_K, 40, 256, 20, 5e-2, 5e-2, true) {
+		ok = false
+	}
+	// tc2m is the opt-in 64x64 block-scale tile. T=80 is a partial second
+	// token tile; 40 rows is a partial row tile; K=512 crosses two superblocks.
+	if !run_tc2m(.Q4_K, 64, 256, 64, 5e-2, 5e-2) || !run_tc2m(.Q4_K, 40, 256, 80, 5e-2, 5e-2) {
+		ok = false
+	}
+	if !run_tc2m(.Q6_K, 64, 512, 64, 5e-2, 5e-2) || !run_tc2m(.Q6_K, 48, 256, 96, 5e-2, 5e-2) {
+		ok = false
+	}
+	if !run_tc2m(.Q6_K, 40, 512, 128, 5e-2, 5e-2) {
 		ok = false
 	}
 	if !run_delta_chunk() {

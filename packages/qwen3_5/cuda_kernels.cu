@@ -1672,6 +1672,134 @@ extern "C" __global__ void tc2s_q6_k(const unsigned char* wb, const float* x, fl
     tc2s_run<1>(wb, x, out, n, d, T);
 }
 
+/* One 32-wide slice of a Q4_K or Q6_K superblock. Lane `lane` writes element
+   `lane`. The scale is read on lane 0 and broadcast. The scalar tc kernel
+   repeats that scale decode on every element; a warp on one row was doing
+   it 32 times. */
+template<int Q6>
+__device__ __forceinline__ unsigned short tc2m_elem(const unsigned char* blk, int part, int lane) {
+    if (Q6 == 0) {
+        int sc = 0, m = 0;
+        float ds = 0.f, dm = 0.f;
+        if (lane == 0) {
+            scale_min_k4(part, blk + 4, &sc, &m);
+            ds = ld_f16(blk) * (float)sc;
+            dm = ld_f16(blk + 2) * (float)m;
+        }
+        ds = __shfl_sync(0xffffffff, ds, 0);
+        dm = __shfl_sync(0xffffffff, dm, 0);
+        int p = part >> 1;
+        int hi = part & 1;
+        unsigned char q = blk[16 + p * 32 + lane];
+        int qv = hi ? (int)(q >> 4) : (int)(q & 0xF);
+        return f32_to_f16((float)qv * ds - dm);
+    }
+    float d = 0.f;
+    if (lane == 0) d = ld_f16(blk + 208);
+    d = __shfl_sync(0xffffffff, d, 0);
+    int half = part >> 2;
+    int group = part & 3;
+    const unsigned char* ql = blk + half * 64;
+    const unsigned char* qh = blk + 128 + half * 32;
+    const unsigned char* scb = blk + 192 + half * 8;
+    unsigned char qh1 = qh[lane];
+    int is = lane >> 4;
+    int qv, sc_i;
+    if (group == 0) {
+        qv = (int)((ql[lane] & 0xF) | (((qh1 >> 0) & 3) << 4)) - 32;
+        sc_i = is;
+    } else if (group == 1) {
+        qv = (int)((ql[lane + 32] & 0xF) | (((qh1 >> 2) & 3) << 4)) - 32;
+        sc_i = is + 2;
+    } else if (group == 2) {
+        qv = (int)((ql[lane] >> 4) | (((qh1 >> 4) & 3) << 4)) - 32;
+        sc_i = is + 4;
+    } else {
+        qv = (int)((ql[lane + 32] >> 4) | (((qh1 >> 6) & 3) << 4)) - 32;
+        sc_i = is + 6;
+    }
+    return f32_to_f16(d * (float)(signed char)scb[sc_i] * (float)qv);
+}
+
+/* Large-T Q4_K / Q6_K tile. Same 64 tokens x 64 rows and 16 warps as the
+   scalar tc kernel (the one that beat tc2w at 581 and 2000). BK is 64: one
+   step expands both nibble planes of a shared 32-byte qs group, and the
+   fp16 tile is 16 KB, which is the same buffer the scalar kernel uses to
+   store the WMMA result, so the SM warp cap does not drop. T<=64 stays on
+   tc2s. This kernel is ODINFER_CUDA_TC2_BLOCK=1 only. */
+template<int Q6>
+__device__ void tc2m_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    const int BM = 64;
+    const int BN = 64;
+    const int BK = 64;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm = warp >> 2;
+    const int wn = warp & 3;
+    const int t0 = (int)blockIdx.y * BM;
+    const int n0 = (int)blockIdx.x * BN;
+    if (t0 >= T || n0 >= d) return;
+    int bbytes = Q6 ? 210 : 144;
+    int nb = n >> 8;
+
+    __shared__ __align__(16) unsigned char sm[16 * 256 * 4];
+    unsigned short* Xs = (unsigned short*)sm;
+    unsigned short* Ws = Xs + BM * BK;
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        for (int i = tid; i < BM * BK; i += 512) {
+            int t = i / BK;
+            int kk = i - t * BK;
+            float v = 0.f;
+            if (t0 + t < T && k0 + kk < n) v = x[((size_t)t0 + t) * (size_t)n + (size_t)k0 + kk];
+            Xs[i] = f32_to_f16(v);
+        }
+        int part = (k0 >> 5) & 7;
+        for (int r = warp; r < BN; r += 16) {
+            if (n0 + r < d && k0 + 63 < n) {
+                const unsigned char* blk = wb + ((size_t)(n0 + r) * (size_t)nb + (size_t)(k0 >> 8)) * (size_t)bbytes;
+                Ws[r * BK + lane] = tc2m_elem<Q6>(blk, part, lane);
+                Ws[r * BK + 32 + lane] = tc2m_elem<Q6>(blk, part + 1, lane);
+            } else {
+                Ws[r * BK + lane] = 0;
+                Ws[r * BK + 32 + lane] = 0;
+            }
+        }
+        __syncthreads();
+        for (int kk = 0; kk < BK; kk += 16) {
+            unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+            unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+            wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
+            wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
+            wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+        }
+        __syncthreads();
+    }
+    float* tile = ((float*)sm) + warp * 256;
+    wmma_store(tile, 16, c0, c1, c2, c3, c4, c5, c6, c7);
+    __syncthreads();
+    for (int idx = tid; idx < 16 * 256; idx += 512) {
+        int w = idx >> 8;
+        int e = idx & 255;
+        int i = e >> 4;
+        int j = e & 15;
+        int tw = w >> 2;
+        int nw = w & 3;
+        int t = t0 + tw * 16 + i;
+        int row = n0 + nw * 16 + j;
+        if (t < T && row < d) out[(size_t)t * (size_t)d + row] = ((float*)sm)[idx];
+    }
+}
+
+extern "C" __global__ void tc2m_q4_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2m_run<0>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void tc2m_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2m_run<1>(wb, x, out, n, d, T);
+}
+
 /* ---- bandwidth GEMV (T == 1) ------------------------------------------------
    Four rows per warp, eight threads per row. Each of those eight threads
    issues one ld.global.v4 (16 bytes) so a row's quant payload is one
