@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Partial-rotary MRoPE, text form. Pairs (v[i], v[i+half]).
+// u0=v u1=inv_freq u2=rows u3=stride u4=rotary_dim u5=pos0 u6=heads_per_token
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint row = gl_GlobalInvocationID.x;
+	if (row >= pc.u[2]) return;
+	uint pos = pc.u[5] + row / pc.u[6];
+	uint nrot = pc.u[4] >> 1u;
+	uint base = pc.u[0] + row * pc.u[3];
+	uint inv = pc.u[1];
+	for (uint i = 0u; i < nrot; i++) {
+		float ang = float(pos) * X(inv + i);
+		float c = cos(ang);
+		float s = sin(ang);
+		float x = X(base + i);
+		float y = X(base + i + nrot);
+		Y(base + i, x * c - y * s);
+		Y(base + i + nrot, x * s + y * c);
+	}
+}

@@ -23,6 +23,9 @@ GPU=(--metal)
 if [[ "${ODINFER_BACKEND:-}" == "cuda" ]]; then
   EXTRA=(-define:ODINFER_BACKEND="cuda")
   GPU=(--cuda)
+elif [[ "${ODINFER_BACKEND:-}" == "vulkan" ]]; then
+  EXTRA=(-define:ODINFER_BACKEND="vulkan")
+  GPU=(--vulkan)
 elif [[ "$(uname -s)" != "Darwin" ]]; then
   GPU=()
 fi
@@ -32,7 +35,7 @@ exec odin run server/serve_harness/serve.odin -file -o:speed \
   -collection:ggml=packages -collection:infer=packages \
   -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
   -collection:sampler=packages -collection:tokenizer=packages \
-  -collection:cuda=packages \
+  -collection:cuda=packages -collection:vulkan=packages \
   -- \
   "$MODEL" \
   "${GPU[@]}" --max-ctx "$MAX_CTX" --port "$PORT"

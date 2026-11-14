@@ -1,0 +1,52 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One workgroup per head. Score dots are sequential per position.
+// Softmax and the V mix run on thread 0 in index order (ops.odin softmax).
+// u0=q u1=k_base u2=v_base u3=out u4=att u5=head_dim u6=n_heads
+// u7=n_kv u8=kv_dim u9=pos u10=seq   f0=scale
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint head = gl_WorkGroupID.x;
+	uint tid = gl_LocalInvocationID.x;
+	uint hd = pc.u[5];
+	uint nh = pc.u[6];
+	uint nkv = pc.u[7];
+	uint kv_dim = pc.u[8];
+	uint pos = pc.u[9];
+	uint seq = pc.u[10];
+	uint kv_mul = nh / nkv;
+	uint kh = head / kv_mul;
+	uint qbase = pc.u[0] + head * hd;
+	uint att = pc.u[4] + head * seq;
+
+	for (uint t = tid; t <= pos; t += 64u) {
+		uint kbase = pc.u[1] + t * kv_dim + kh * hd;
+		precise float s = 0.0;
+		for (uint i = 0u; i < hd; i++) s += X(qbase + i) * X(kbase + i);
+		Y(att + t, s * pc.f[0]);
+	}
+	// barrier() orders shared memory only. Scores live in the storage buffer.
+	memoryBarrierBuffer();
+	barrier();
+	if (tid != 0u) return;
+
+	float m = X(att);
+	for (uint t = 1u; t <= pos; t++) m = max(m, X(att + t));
+	precise float sum = 0.0;
+	for (uint t = 0u; t <= pos; t++) {
+		float e = exp(X(att + t) - m);
+		Y(att + t, e);
+		sum += e;
+	}
+	uint ob = pc.u[3] + head * hd;
+	for (uint i = 0u; i < hd; i++) Y(ob + i, 0.0);
+	for (uint t = 0u; t <= pos; t++) {
+		float a = X(att + t) / sum;
+		uint vbase = pc.u[2] + t * kv_dim + kh * hd;
+		for (uint i = 0u; i < hd; i++) Y(ob + i, X(ob + i) + a * X(vbase + i));
+	}
+}

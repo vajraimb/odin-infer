@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Vulkan backend for Windows x64 (`-define:ODINFER_BACKEND=vulkan`). SPIR-V is
+  embedded; run time loads the driver's `vulkan-1.dll` and does not link
+  `vulkan-1.lib`. Default CPU/Metal/CUDA binaries are unchanged. Lavapipe:
+  exact GEMV max_abs 0 on the native quant kinds, greedy tokens match the CPU
+  reference on a synthetic hybrid model and a synthetic MoE model. See
+  docs/VULKAN.md.
 - Load-time Metal shader specialization: per-model constants baked into the
   MSL prelude (QCONST=0 for legacy A/B). 27B decode −0.8% (best −2.5%);
   9B flat (MLP-bound). QPROF ablation switches now compile-time only

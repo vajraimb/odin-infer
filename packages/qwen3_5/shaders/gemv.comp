@@ -1,0 +1,305 @@
+#version 450
+#ifdef SUBGROUP
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#endif
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Y[t, row] = dot(dequant(W[row]), X[t]).
+// LOCAL_X=1 accumulates in element order (the CPU dot). LOCAL_X=64 splits
+// the row into contiguous block ranges and sums those partials.
+// u0=w_off u1=x_off u2=y_off u3=rows u4=cols u5=T u6=kind u7=row0
+// u8=x_stride u9=y_stride u11=row_bytes
+
+#ifndef LOCAL_X
+#define LOCAL_X 64
+#endif
+
+layout(local_size_x = LOCAL_X) in;
+
+shared float red[8 * LOCAL_X];
+
+uint block_elems(uint k) {
+	if (k <= 1u) return 1u;
+	if (k == 2u || k == 3u || k == 6u || k == 7u || k == 8u) return 32u;
+	return 256u;
+}
+
+uint block_bytes(uint k) {
+	if (k == 0u) return 4u;
+	if (k == 1u) return 2u;
+	if (k == 2u) return 18u;
+	if (k == 3u) return 20u;
+	if (k == 6u) return 22u;
+	if (k == 7u) return 24u;
+	if (k == 8u) return 34u;
+	if (k == 10u) return 84u;
+	if (k == 11u) return 110u;
+	if (k == 12u) return 144u;
+	if (k == 13u) return 176u;
+	if (k == 14u) return 210u;
+	if (k == 15u) return 292u;
+	return 4u;
+}
+
+int i8of(uint bits) {
+	int s = int(bits);
+	return s >= 128 ? s - 256 : s;
+}
+
+void dequant_block(uint kind, uint base, inout float dst[256]) {
+	if (kind == 2u) {
+		float d = load_f16(base);
+		for (uint j = 0u; j < 16u; j++) {
+			uint qs = load_u8(base + 2u + j);
+			dst[j] = float(int(qs & 0xFu) - 8) * d;
+			dst[j + 16u] = float(int(qs >> 4u) - 8) * d;
+		}
+	} else if (kind == 3u) {
+		float d = load_f16(base);
+		float m = load_f16(base + 2u);
+		for (uint j = 0u; j < 16u; j++) {
+			uint qs = load_u8(base + 4u + j);
+			dst[j] = float(qs & 0xFu) * d + m;
+			dst[j + 16u] = float(qs >> 4u) * d + m;
+		}
+	} else if (kind == 6u) {
+		float d = load_f16(base);
+		uint qh = load_u32(base + 2u);
+		for (uint j = 0u; j < 16u; j++) {
+			uint qs = load_u8(base + 6u + j);
+			uint xh0 = ((qh >> j) << 4u) & 0x10u;
+			uint xh1 = (qh >> (j + 12u)) & 0x10u;
+			dst[j] = float(int((qs & 0xFu) | xh0) - 16) * d;
+			dst[j + 16u] = float(int((qs >> 4u) | xh1) - 16) * d;
+		}
+	} else if (kind == 7u) {
+		float d = load_f16(base);
+		float m = load_f16(base + 2u);
+		uint qh = load_u32(base + 4u);
+		for (uint j = 0u; j < 16u; j++) {
+			uint qs = load_u8(base + 8u + j);
+			uint xh0 = ((qh >> j) << 4u) & 0x10u;
+			uint xh1 = (qh >> (j + 12u)) & 0x10u;
+			dst[j] = float((qs & 0xFu) | xh0) * d + m;
+			dst[j + 16u] = float((qs >> 4u) | xh1) * d + m;
+		}
+	} else if (kind == 8u) {
+		float d = load_f16(base);
+		for (uint j = 0u; j < 32u; j++) dst[j] = d * float(i8of(load_u8(base + 2u + j)));
+	} else if (kind == 10u) {
+		float d = load_f16(base + 80u);
+		float dmin = load_f16(base + 82u);
+		uint yoff = 0u;
+		uint is = 0u;
+		uint qoff = 0u;
+		for (uint part = 0u; part < 2u; part++) {
+			uint shift = 0u;
+			for (uint s = 0u; s < 4u; s++) {
+				uint sc = load_u8(base + is);
+				is += 1u;
+				float dl = d * float(sc & 0xFu);
+				float ml = dmin * float(sc >> 4u);
+				for (uint l = 0u; l < 16u; l++) dst[yoff + l] = dl * float((load_u8(base + 16u + qoff + l) >> shift) & 3u) - ml;
+				sc = load_u8(base + is);
+				is += 1u;
+				dl = d * float(sc & 0xFu);
+				ml = dmin * float(sc >> 4u);
+				for (uint l = 0u; l < 16u; l++) dst[yoff + 16u + l] = dl * float((load_u8(base + 16u + qoff + 16u + l) >> shift) & 3u) - ml;
+				shift += 2u;
+				yoff += 32u;
+			}
+			qoff += 32u;
+		}
+	} else if (kind == 11u) {
+		float d = load_f16(base + 108u);
+		uint aux0 = load_u32(base + 96u);
+		uint aux1 = load_u32(base + 100u);
+		uint tmp = load_u32(base + 104u);
+		uint K1 = 0x03030303u;
+		uint K2 = 0x0f0f0f0fu;
+		uint aux2 = ((aux0 >> 4u) & K2) | (((tmp >> 4u) & K1) << 4u);
+		uint aux3 = ((aux1 >> 4u) & K2) | (((tmp >> 6u) & K1) << 4u);
+		aux0 = (aux0 & K2) | (((tmp >> 0u) & K1) << 4u);
+		aux1 = (aux1 & K2) | (((tmp >> 2u) & K1) << 4u);
+		uint auxs[4] = uint[4](aux0, aux1, aux2, aux3);
+		uint yoff = 0u;
+		uint qoff = 0u;
+		uint m = 1u;
+		uint is = 0u;
+		for (uint part = 0u; part < 2u; part++) {
+			uint shift = 0u;
+			for (uint s = 0u; s < 4u; s++) {
+				int sc = i8of((auxs[is / 4u] >> (8u * (is % 4u))) & 0xFFu);
+				is += 1u;
+				float dl = d * float(sc - 32);
+				for (uint l = 0u; l < 16u; l++) {
+					int q = int((load_u8(base + 32u + qoff + l) >> shift) & 3u);
+					if ((load_u8(base + l) & m) == 0u) q -= 4;
+					dst[yoff + l] = dl * float(q);
+				}
+				sc = i8of((auxs[is / 4u] >> (8u * (is % 4u))) & 0xFFu);
+				is += 1u;
+				dl = d * float(sc - 32);
+				for (uint l = 0u; l < 16u; l++) {
+					int q = int((load_u8(base + 32u + qoff + 16u + l) >> shift) & 3u);
+					if ((load_u8(base + 16u + l) & m) == 0u) q -= 4;
+					dst[yoff + 16u + l] = dl * float(q);
+				}
+				shift += 2u;
+				m <<= 1u;
+				yoff += 32u;
+			}
+			qoff += 32u;
+		}
+	} else if (kind == 12u) {
+		float d = load_f16(base);
+		float dmin = load_f16(base + 2u);
+		uint yoff = 0u;
+		uint is = 0u;
+		uint qoff = 0u;
+		for (uint s = 0u; s < 4u; s++) {
+			uvec2 sm0 = scale_min_k4(is, base + 4u);
+			uvec2 sm1 = scale_min_k4(is + 1u, base + 4u);
+			float d1 = d * float(sm0.x);
+			float mm1 = dmin * float(sm0.y);
+			float d2 = d * float(sm1.x);
+			float mm2 = dmin * float(sm1.y);
+			for (uint l = 0u; l < 32u; l++) dst[yoff + l] = d1 * float(load_u8(base + 16u + qoff + l) & 0xFu) - mm1;
+			for (uint l = 0u; l < 32u; l++) dst[yoff + 32u + l] = d2 * float(load_u8(base + 16u + qoff + l) >> 4u) - mm2;
+			qoff += 32u;
+			is += 2u;
+			yoff += 64u;
+		}
+	} else if (kind == 13u) {
+		float d = load_f16(base);
+		float dmin = load_f16(base + 2u);
+		uint yoff = 0u;
+		uint is = 0u;
+		uint qloff = 0u;
+		uint u1 = 1u;
+		uint u2 = 2u;
+		for (uint s = 0u; s < 4u; s++) {
+			uvec2 sm0 = scale_min_k4(is, base + 4u);
+			uvec2 sm1 = scale_min_k4(is + 1u, base + 4u);
+			float d1 = d * float(sm0.x);
+			float mm1 = dmin * float(sm0.y);
+			float d2 = d * float(sm1.x);
+			float mm2 = dmin * float(sm1.y);
+			for (uint l = 0u; l < 32u; l++) {
+				uint ql = load_u8(base + 48u + qloff + l);
+				uint qh = load_u8(base + 16u + l);
+				uint v = (ql & 0xFu) + (((qh & u1) == 0u) ? 0u : 16u);
+				dst[yoff + l] = d1 * float(v) - mm1;
+			}
+			for (uint l = 0u; l < 32u; l++) {
+				uint ql = load_u8(base + 48u + qloff + l);
+				uint qh = load_u8(base + 16u + l);
+				uint v = (ql >> 4u) + (((qh & u2) == 0u) ? 0u : 16u);
+				dst[yoff + 32u + l] = d2 * float(v) - mm2;
+			}
+			qloff += 32u;
+			is += 2u;
+			u1 <<= 2u;
+			u2 <<= 2u;
+			yoff += 64u;
+		}
+	} else if (kind == 14u) {
+		float d = load_f16(base + 208u);
+		uint yoff = 0u;
+		uint qloff = 0u;
+		uint qhoff = 0u;
+		uint scoff = 0u;
+		for (uint part = 0u; part < 2u; part++) {
+			for (uint l = 0u; l < 32u; l++) {
+				uint isc = l / 16u;
+				uint ql0 = load_u8(base + qloff + l);
+				uint ql1 = load_u8(base + qloff + l + 32u);
+				uint qh = load_u8(base + 128u + qhoff + l);
+				int q1 = int((ql0 & 0xFu) | (((qh >> 0u) & 3u) << 4u)) - 32;
+				int q2 = int((ql1 & 0xFu) | (((qh >> 2u) & 3u) << 4u)) - 32;
+				int q3 = int((ql0 >> 4u) | (((qh >> 4u) & 3u) << 4u)) - 32;
+				int q4 = int((ql1 >> 4u) | (((qh >> 6u) & 3u) << 4u)) - 32;
+				dst[yoff + l] = d * float(i8of(load_u8(base + 192u + scoff + isc))) * float(q1);
+				dst[yoff + l + 32u] = d * float(i8of(load_u8(base + 192u + scoff + isc + 2u))) * float(q2);
+				dst[yoff + l + 64u] = d * float(i8of(load_u8(base + 192u + scoff + isc + 4u))) * float(q3);
+				dst[yoff + l + 96u] = d * float(i8of(load_u8(base + 192u + scoff + isc + 6u))) * float(q4);
+			}
+			qloff += 64u;
+			qhoff += 32u;
+			scoff += 8u;
+			yoff += 128u;
+		}
+	} else if (kind == 15u) {
+		float d = load_f32(base);
+		for (uint j = 0u; j < 256u; j++) dst[j] = d * float(i8of(load_u8(base + 4u + j)));
+	} else {
+		for (uint j = 0u; j < 256u; j++) dst[j] = 0.0;
+	}
+}
+
+void main() {
+	uint row = pc.u[7] + gl_WorkGroupID.x;
+	uint cols = pc.u[4];
+	uint kind = pc.u[6];
+	uint T = pc.u[5];
+	if (T > 8u) T = 8u;
+	uint tid = gl_LocalInvocationID.x;
+	float acc[8];
+	for (uint t = 0u; t < 8u; t++) acc[t] = 0.0;
+
+	if (row < pc.u[3]) {
+		uint base = pc.u[0] + row * pc.u[11];
+		if (kind <= 1u) {
+			uint chunk = (cols + uint(LOCAL_X) - 1u) / uint(LOCAL_X);
+			uint begin = tid * chunk;
+			uint end = min(cols, begin + chunk);
+			for (uint i = begin; i < end; i++) {
+				float v = kind == 0u ? load_f32(base + i * 4u) : load_f16(base + i * 2u);
+				for (uint t = 0u; t < T; t++) acc[t] += v * X(pc.u[1] + t * pc.u[8] + i);
+			}
+		} else {
+			uint be = block_elems(kind);
+			uint bb = block_bytes(kind);
+			uint nb = cols / be;
+			uint chunk = (nb + uint(LOCAL_X) - 1u) / uint(LOCAL_X);
+			uint b0 = tid * chunk;
+			uint b1 = min(nb, b0 + chunk);
+			float dst[256];
+			for (uint b = b0; b < b1; b++) {
+				dequant_block(kind, base + b * bb, dst);
+				for (uint i = 0u; i < be; i++) {
+					float v = dst[i];
+					uint col = b * be + i;
+					for (uint t = 0u; t < T; t++) acc[t] += v * X(pc.u[1] + t * pc.u[8] + col);
+				}
+			}
+		}
+	}
+
+#ifdef SUBGROUP
+	for (uint t = 0u; t < T; t++) {
+		float v = subgroupAdd(acc[t]);
+		if (gl_SubgroupInvocationID == 0u) red[t * uint(LOCAL_X) + gl_SubgroupID] = v;
+	}
+	barrier();
+	if (tid == 0u && row < pc.u[3]) {
+		for (uint t = 0u; t < T; t++) {
+			precise float s = 0.0;
+			for (uint i = 0u; i < gl_NumSubgroups; i++) s += red[t * uint(LOCAL_X) + i];
+			Y(pc.u[2] + t * pc.u[9] + row, s);
+		}
+	}
+#else
+	for (uint t = 0u; t < T; t++) red[t * uint(LOCAL_X) + tid] = acc[t];
+	barrier();
+	if (tid == 0u && row < pc.u[3]) {
+		for (uint t = 0u; t < T; t++) {
+			precise float s = 0.0;
+			for (uint i = 0u; i < uint(LOCAL_X); i++) s += red[t * uint(LOCAL_X) + i];
+			Y(pc.u[2] + t * pc.u[9] + row, s);
+		}
+	}
+#endif
+}

@@ -2860,7 +2860,7 @@ main :: proc() {
 		}
 	}
 	if len(args) < 2 {
-		fmt.eprintln("usage: serve <model.gguf> [--port N] [--metal|--cuda] [--max-ctx N]")
+		fmt.eprintln("usage: serve <model.gguf> [--port N] [--metal|--cuda|--vulkan] [--max-ctx N]")
 		fmt.eprintln("       serve --self-test  (parse regression, no model needed)")
 		os.exit(1)
 	}
@@ -2877,7 +2877,7 @@ main :: proc() {
 			v, _ := strconv_parse_int(args[i+1])
 			port = u16(v)
 			i += 2
-		} else if a == "--metal" || a == "--cuda" {
+		} else if a == "--metal" || a == "--cuda" || a == "--vulkan" {
 			use_metal = true
 			i += 1
 		} else if a == "--max-ctx" && i + 1 < len(args) {

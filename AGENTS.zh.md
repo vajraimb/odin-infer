@@ -71,7 +71,13 @@ Linux 上 `./build.sh` 走 CPU（`metal.odin` 带 `#+build darwin`）。CUDA 是
 # 或 -define:ODINFER_BACKEND="cuda"  -collection:cuda=packages
 ```
 
-见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。热路径是 `when GPU_METAL` / `when GPU_CUDA`，同一个二进制不会在两者之间分支。
+见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。
+
+Windows Vulkan 是同一类开关（`-define:ODINFER_BACKEND=vulkan`，
+`-collection:vulkan=packages`）。Odin dev-2026-07 即可编译：SPIR-V 已提交并嵌入，
+运行时加载 `vulkan-1.dll`。SDK 只用于 `./scripts/compile_spirv.sh`。检查脚本：
+`./scripts/vulkan_check.sh`。见 [docs/VULKAN.zh.md](docs/VULKAN.zh.md)。热路径是
+`when GPU_METAL` / `when GPU_CUDA` / `when GPU_VULKAN`，一个二进制只含一条。
 
 ## 运行
 
@@ -103,9 +109,10 @@ bin/odin-cli <model.gguf> -g 1 -c 2048
    库层启动打印已迁到 stderr，不要回退。
 2. **fmt.tprintf 的 `{`/`}` 是动词**：JSON 模板必须写 `{{`/`}}`。
 3. **json_escape 自带外层引号**（输出 `"escaped"`），调用方不要再加引号。
-4. **集合导入**：`import q35 "qwen3_5:qwen3_5"`，构建必须挂 6 个
-   `-collection:<name>=packages`（ggml/infer/qwen3_5/qwen3_5_tokenizer/
-   sampler/tokenizer），见 build.sh 的 COLLECTIONS。
+4. **集合导入**：`import q35 "qwen3_5:qwen3_5"`，构建必须挂
+   `-collection:<name>=packages`：ggml、infer、qwen3_5、qwen3_5_tokenizer、
+   sampler、tokenizer、cuda、vulkan。即使没选对应后端，CUDA 和 Vulkan 包也会被
+   import。见 build.sh 的 COLLECTIONS。
 5. **内核 A/B 开关**（env，默认全关，均为实测回归项）：`QGEMV3=1`
    （llama.cpp 行切块移植）、`QGEMV2R=1`（2 行/线程）、`QGEMVNORM=1`
    （norm 融合）。

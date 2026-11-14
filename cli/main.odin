@@ -361,7 +361,11 @@ error_usage :: proc() {
 	fmt.eprintln("  -f <int>    print TTFT (ms): 0 = off (default), 1 = on")
 	fmt.eprintln("  -j <int>    CPU matmul threads (default: core count)")
 	fmt.eprintln("  -c <int>    max context length (default 4096; caps KV/state memory)")
-	fmt.eprintln("  -g <int>    GPU: 0 = off (default), 1 = on (Metal on macOS, CUDA if built with ODINFER_BACKEND=cuda)")
+	when q35.GPU_VULKAN {
+		fmt.eprintln("  -g <int>    GPU: 0 = off (default), 1 = on (Vulkan; build with -define:ODINFER_BACKEND=vulkan)")
+	} else {
+		fmt.eprintln("  -g <int>    GPU: 0 = off (default), 1 = on (Metal on macOS, CUDA if built with ODINFER_BACKEND=cuda)")
+	}
 	fmt.eprintln("  -L <path>   load KV+SSM state from .oikv file (Qwen3.5 only, resumes chat)")
 	fmt.eprintln("  -S <path>   save KV+SSM state to .oikv on exit (Qwen3.5 only)")
 	fmt.eprintln("  -J <int>    force JSON output (Qwen3.5 only): 0 = off (default), 1 = on")

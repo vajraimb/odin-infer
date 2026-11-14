@@ -393,6 +393,10 @@ engine_save_kv :: proc(e: ^Engine, path: string, n_valid_pos: int) -> bool {
 		if e.metal_ready {
 			return cuda_save_kv(&e.transformer, path, n_valid_pos)
 		}
+	} else when GPU_VULKAN {
+		if e.metal_ready {
+			return vulkan_save_kv(&e.transformer, path, n_valid_pos)
+		}
 	}
 	return cpu_save_kv(&e.transformer, path, n_valid_pos)
 }
@@ -405,6 +409,10 @@ engine_load_kv :: proc(e: ^Engine, path: string) -> (int, bool) {
 	} else when GPU_CUDA {
 		if e.metal_ready {
 			return cuda_load_kv(&e.transformer, path)
+		}
+	} else when GPU_VULKAN {
+		if e.metal_ready {
+			return vulkan_load_kv(&e.transformer, path)
 		}
 	}
 	return cpu_load_kv(&e.transformer, path)

@@ -1,0 +1,60 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Elementwise ops. pc.u[0] is the opcode:
+//   0 fill     Y[off + i] = f0                         u1=off u2=n
+//   1 axpy     Y[y+i] += a * X[x+i]                    u1=y u2=x u3=n  f0=a
+//              if u4==1, a = sigmoid(X[u5])
+//   2 swiglu   X[up+i] = silu(X[gate+i]) * X[up+i]     u1=gate u2=up u3=n
+//   3 gate     xb3 *= sigmoid(qproj gate half)         u1=xb3 u2=qproj u3=T u4=n_heads u5=head_dim
+//   4 copy     dst[(row0+r)*dst_stride+c] = src[r*src_stride+c]
+//              u1=src u2=dst u3=rows u4=cols u5=src_stride u6=dst_stride u7=row0
+
+layout(local_size_x = 64) in;
+
+void main() {
+	uint op = pc.u[0];
+	uint i = gl_GlobalInvocationID.x;
+	if (op == 0u) {
+		if (i < pc.u[2]) Y(pc.u[1] + i, pc.f[0]);
+		return;
+	}
+	if (op == 1u) {
+		if (i >= pc.u[3]) return;
+		float a = pc.f[0];
+		if (pc.u[4] == 1u) a = sigmoid(X(pc.u[5]));
+		uint y = pc.u[1] + i;
+		Y(y, X(y) + a * X(pc.u[2] + i));
+		return;
+	}
+	if (op == 2u) {
+		if (i >= pc.u[3]) return;
+		float g = X(pc.u[1] + i);
+		uint up = pc.u[2] + i;
+		Y(up, silu(g) * X(up));
+		return;
+	}
+	if (op == 3u) {
+		uint hd = pc.u[5];
+		uint nh = pc.u[4];
+		uint span = nh * hd;
+		uint n = pc.u[3] * span;
+		if (i >= n) return;
+		uint tok = i / span;
+		uint rest = i - tok * span;
+		uint h = rest / hd;
+		uint e = rest - h * hd;
+		uint gate = pc.u[2] + tok * nh * hd * 2u + h * hd * 2u + hd + e;
+		uint o = pc.u[1] + i;
+		Y(o, X(o) * sigmoid(X(gate)));
+		return;
+	}
+	uint rows = pc.u[3];
+	uint cols = pc.u[4];
+	uint n = rows * cols;
+	if (i >= n) return;
+	uint r = i / cols;
+	uint c = i - r * cols;
+	Y(pc.u[2] + (pc.u[7] + r) * pc.u[6] + c, X(pc.u[1] + r * pc.u[5] + c));
+}

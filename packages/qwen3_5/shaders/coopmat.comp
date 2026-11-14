@@ -1,0 +1,29 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// Optional 16x16x16 f16 cooperative-matrix GEMM, f32 accumulate.
+// local_size_x is specialized to the device subgroup size so a single
+// subgroup owns the tile. Binding 0 is f16 A then B (256 + 256 values).
+// Binding 1 receives the f32 result, row-major 16x16.
+// Used only when VK_KHR_cooperative_matrix and 16-bit storage are present.
+// The fp32 GEMV path does not call this shader.
+
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer Src { float16_t h[]; };
+layout(set = 0, binding = 1) buffer Dst { float f[]; };
+
+void main() {
+	coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+	coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+	coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c =
+		coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+	coopMatLoad(a, h, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatLoad(b, h, 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	c = coopMatMulAdd(a, b, c);
+	coopMatStore(c, f, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+}

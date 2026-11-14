@@ -8,7 +8,7 @@ mkdir -p bin
 COLLECTIONS=(-collection:ggml=packages -collection:infer=packages \
   -collection:qwen3_5=packages -collection:qwen3_5_tokenizer=packages \
   -collection:sampler=packages -collection:tokenizer=packages \
-  -collection:cuda=packages)
+  -collection:cuda=packages -collection:vulkan=packages)
 
 echo "== gen MSL tables =="
 python3 tools/gen_msl_tables.py
