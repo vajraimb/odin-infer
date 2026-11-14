@@ -7,13 +7,12 @@ agent loop the model therefore never saw that it had already called a tool,
 and re-issued the same call forever (the "infinite tool-call loop" symptom:
 each round a full prefill, nothing ever answered).
 
-Fix: history renders the tool call as JSON inside <tool_call> and the tool
-result as a plain "工具执行结果: ..." user turn. Both choices are empirical
-(4+ template variants probed under greedy decode): this model treats the
-native <function=...> form in history as "about to call" (loops), and does
-not know the <tool_response> wrapper at all (loops in either role). JSON
-form + plain user result is the only combination that reliably produces a
-final answer.
+Fix: history renders exactly one native <tool_call><function=...> block —
+the bytes the server generated for that turn, looked up by tool-call id
+when the client stripped the markup out of content. Tool results stay a
+plain "工具执行结果: ..." user turn (this model does not consume a
+<tool_response> wrapper). Rendering the call a second time (raw content
+plus a JSON copy) makes the model emit the tool twice.
 
 What this test does
 -------------------
@@ -157,12 +156,15 @@ def main():
                              timeout=int(args.get("timeout", 10) or 10)).stdout.strip()
         print(f"turn 1: tool result -> {out!r}")
 
-        # Clients store prose content and tool calls separately (Ollama
-        # convention): strip the raw <tool_call> block from content.
+        # Clients often store prose and tool calls separately and strip the
+        # raw <tool_call> markup. Forward the server's id so history renders
+        # the exact generation (continuation cache) instead of a second copy.
         c1_clean = re.sub(r"<tool_call>.*?</tool_call>", "", c1, flags=re.S).strip()
+        tool_call = {"function": {"name": fn["name"], "arguments": args}}
+        if tc1[0].get("id"):
+            tool_call["id"] = tc1[0]["id"]
         msgs2 = msgs + [
-            {"role": "assistant", "content": c1_clean,
-             "tool_calls": [{"function": {"name": fn["name"], "arguments": args}}]},
+            {"role": "assistant", "content": c1_clean or " ", "tool_calls": [tool_call]},
             {"role": "tool", "content": out or "(no output)"},
         ]
         c2, tc2 = chat(msgs2)

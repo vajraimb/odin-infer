@@ -418,6 +418,31 @@ detok_window :: proc(ids: []int) -> string {
 g_heap:      runtime.Allocator
 g_req_arena: virtual.Arena
 
+// Tool-call ids are unique for the life of the process. Restarting at call_0
+// on every response collides in the client's id→name map.
+g_tool_call_seq: int
+// Exact assistant text that produced each id, allocated on g_heap. History
+// rendering uses it when the client stripped the raw <tool_call> markup, so
+// the next prompt stays a byte prefix of the continuation KV cache.
+g_tool_gen_text: map[string]string
+
+alloc_tool_call_id :: proc() -> string {
+	id := fmt.tprintf("call_%d", g_tool_call_seq)
+	g_tool_call_seq += 1
+	return id
+}
+
+remember_tool_generation :: proc(id, text: string) {
+	if len(id) == 0 do return
+	prev := context.allocator
+	context.allocator = g_heap
+	defer context.allocator = prev
+	if g_tool_gen_text == nil {
+		g_tool_gen_text = make(map[string]string)
+	}
+	g_tool_gen_text[id] = strings.clone(text)
+}
+
 // ====================== HTML (single-page dashboard) ======================
 
 INDEX_HTML := #load ("./index.html")
@@ -1333,8 +1358,227 @@ run_parse_self_test :: proc() -> bool {
 	ok = feed_bytes(&g, "<tool_call>\n<function=search>\n</function>\n</tool_call>\n\n<tool_call>\n<function=memory>\n<parameter=script>\nx\n</parameter>\n</function>\n</tool_call>")
 	total += 1; if expect_true("grammar: multiple calls in one generation", ok) do pass += 1
 
+	hp, ht := run_history_self_test()
+	pass += hp
+	total += ht
+
 	fmt.eprintfln("self-test: %d/%d cases passed", pass, total)
 	return pass == total
+}
+
+// History rendering, session-unique tool-call ids, and per-request tool-grammar
+// counts. No model and no GPU: the continuation cache matches iff these
+// prompts (and their token ids) share a prefix through the cached turn.
+run_history_self_test :: proc() -> (pass, total: int) {
+	check :: proc(label: string, cond: bool, pass, total: ^int) {
+		total^ += 1
+		if cond {
+			pass^ += 1
+			return
+		}
+		fmt.eprintfln("self-test FAIL: %s", label)
+	}
+	body_text :: proc(content, tc: string) -> string {
+		m := Message_Pair{role = "assistant", content = content, tool_calls_raw = tc}
+		b: strings.Builder
+		strings.builder_init(&b, context.allocator)
+		defer strings.builder_destroy(&b)
+		write_assistant_body(&b, m)
+		return strings.clone(strings.to_string(b))
+	}
+	count_sub :: proc(s, sub: string) -> int {
+		n := 0
+		from := 0
+		for {
+			j := index_from(s, sub, from)
+			if j < 0 { return n }
+			n += 1
+			from = j + len(sub)
+		}
+	}
+	ids_equal :: proc(a, b: []int) -> bool {
+		if len(a) != len(b) { return false }
+		for i in 0 ..< len(a) {
+			if a[i] != b[i] { return false }
+		}
+		return true
+	}
+
+	native :: "<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
+	// "EXACT\n" is only in the stored generation, so a prose-only rebuild
+	// cannot accidentally equal it.
+	generated :: "EXACT\nI'll list it.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
+	tc := `[{"id":"call_keep","function":{"name":"ls","arguments":{"path":"."}}}]`
+	remember_tool_generation("call_keep", generated)
+
+	sys := Message_Pair{role = "system", content = "You are pie."}
+	user := Message_Pair{role = "user", content = "list files"}
+	toolm := Message_Pair{role = "tool", content = "a.txt"}
+	shape_echo := [4]Message_Pair{
+		sys, user,
+		{role = "assistant", content = generated, tool_calls_raw = tc},
+		toolm,
+	}
+	shape_blank := [4]Message_Pair{
+		sys, user,
+		{role = "assistant", content = " ", tool_calls_raw = tc},
+		toolm,
+	}
+	shape_empty := [4]Message_Pair{
+		sys, user,
+		{role = "assistant", content = "", tool_calls_raw = tc},
+		toolm,
+	}
+	pa := render_ollama_prompt(shape_echo[:], false, "")
+	pb := render_ollama_prompt(shape_blank[:], false, "")
+	pc := render_ollama_prompt(shape_empty[:], false, "")
+
+	check("echoed markup == blank content", pa == pb, &pass, &total)
+	check("echoed markup == empty content", pa == pc, &pass, &total)
+	check("one tool_call in the prompt", count_sub(pa, "<tool_call>") == 1, &pass, &total)
+	check("tool role still renders", strings.contains(pa, "<|im_start|>user\n工具执行结果: a.txt<|im_end|>\n"), &pass, &total)
+
+	gend := strings.index(pa, generated)
+	prefix := ""
+	if gend >= 0 {
+		prefix = pa[:gend + len(generated)]
+	}
+	check("generation sits immediately before im_end", gend >= 0 && strings.has_prefix(pa[gend + len(generated):], "<|im_end|>\n"), &pass, &total)
+	check("blank shape shares cached-turn prefix", len(prefix) > 0 && strings.has_prefix(pb, prefix), &pass, &total)
+	check("empty shape shares cached-turn prefix", len(prefix) > 0 && strings.has_prefix(pc, prefix), &pass, &total)
+
+	// Clients that omit content, send null, or put tool_calls before content.
+	raw_missing := `{"messages":[{"role":"system","content":"You are pie."},{"role":"user","content":"list files"},{"role":"assistant","tool_calls":[{"id":"call_keep","function":{"name":"ls","arguments":{"path":"."}}}]},{"role":"tool","content":"a.txt","tool_call_id":"call_keep"}]}`
+	raw_null := `{"messages":[{"role":"system","content":"You are pie."},{"role":"user","content":"list files"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_keep","function":{"name":"ls","arguments":{"path":"."}}}]},{"role":"tool","tool_call_id":"call_keep","content":"a.txt"}]}`
+	raw_blank := `{"messages":[{"role":"system","content":"You are pie."},{"role":"user","content":"list files"},{"role":"assistant","content":" ","tool_calls":[{"id":"call_keep","function":{"name":"ls","arguments":{"path":"."}}}]},{"role":"tool","content":"a.txt"}]}`
+	raw_order := `{"messages":[{"role":"system","content":"You are pie."},{"role":"user","content":"list files"},{"role":"assistant","tool_calls":[{"id":"call_keep","function":{"name":"ls","arguments":{"path":"."}}}],"content":""},{"role":"tool","content":"a.txt"}]}`
+	msgs_missing := openai_extract_messages(raw_missing)
+	msgs_null := openai_extract_messages(raw_null)
+	msgs_blank := openai_extract_messages(raw_blank)
+	msgs_order := openai_extract_messages(raw_order)
+	check("missing content not skipped", len(msgs_missing) == 4 && msgs_missing[2].role == "assistant" && msgs_missing[2].content == "" && len(msgs_missing[2].tool_calls_raw) > 0 && msgs_missing[3].role == "tool" && msgs_missing[3].content == "a.txt", &pass, &total)
+	check("null content not skipped", len(msgs_null) == 4 && msgs_null[2].role == "assistant" && msgs_null[3].content == "a.txt", &pass, &total)
+	pm := render_ollama_prompt(msgs_missing, false, "")
+	pn := render_ollama_prompt(msgs_null, false, "")
+	pbl := render_ollama_prompt(msgs_blank, false, "")
+	po := render_ollama_prompt(msgs_order, false, "")
+	check("missing-content prompt matches echo", pm == pa, &pass, &total)
+	check("null-content prompt matches echo", pn == pa, &pass, &total)
+	check("blank-content JSON matches echo", pbl == pa, &pass, &total)
+	check("tool_calls-before-content matches echo", po == pa, &pass, &total)
+
+	// No stored id: echoed markup, " ", and "" still agree, and markup is not
+	// rendered a second time from tool_calls.
+	tc_new := `[{"id":"call_nostore","function":{"name":"ls","arguments":{"path":"."}}}]`
+	b_native := body_text("", tc_new)
+	b_space := body_text(" ", tc_new)
+	b_echo := body_text(native, tc_new)
+	check("reconstructed native form", b_native == native, &pass, &total)
+	check("blank reconstructs native", b_space == native, &pass, &total)
+	check("echoed markup is not doubled", b_echo == native && count_sub(b_echo, "<tool_call>") == 1, &pass, &total)
+
+	tc_other := `[{"id":"call_other","function":{"name":"pwd","arguments":{}}}]`
+	remember_tool_generation("call_other", "STORED<tool_call>\n<function=pwd>\n</function>\n</tool_call>")
+	echo_ls := "ECHOED<tool_call>\n<function=ls>\n</function>\n</tool_call>"
+	got_echo := body_text(echo_ls, tc_other)
+	check("markup content wins over a different store", got_echo == echo_ls && !strings.contains(got_echo, "pwd"), &pass, &total)
+	check("stored text wins when markup was stripped", body_text("I'll list it.", tc) == generated, &pass, &total)
+	prose_native := body_text("I'll list it.", tc_new)
+	prose_want := "I'll list it.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"
+	check("prose kept once when nothing was stored", prose_native == prose_want && count_sub(prose_native, "<tool_call>") == 1, &pass, &total)
+
+	bash_tc := `[{"function":{"name":"bash","arguments":{"command":"echo hi","timeout":10}}}]`
+	bash_want := "<tool_call>\n<function=bash>\n<parameter=command>\necho hi\n</parameter>\n<parameter=timeout>\n10\n</parameter>\n</function>\n</tool_call>"
+	check("param order and raw numbers", body_text("", bash_tc) == bash_want, &pass, &total)
+	nl_tc := `[{"function":{"name":"memory","arguments":{"script":"a\nb"}}}]`
+	nl_want := "<tool_call>\n<function=memory>\n<parameter=script>\na\nb\n</parameter>\n</function>\n</tool_call>"
+	check("escaped newline in argument", body_text("", nl_tc) == nl_want, &pass, &total)
+	parsed := parse_tool_calls(native)
+	check("native form parses back", len(parsed) == 1 && strings.contains(parsed[0], `"name":"ls"`) && strings.contains(parsed[0], `"path":"."`), &pass, &total)
+	esc_msgs := openai_extract_messages(`{"messages":[{"role":"user","content":"a\nb"}]}`)
+	check("content escapes still decode", len(esc_msgs) == 1 && esc_msgs[0].content == "a\nb", &pass, &total)
+
+	id1 := alloc_tool_call_id()
+	id2 := alloc_tool_call_id()
+	n1, n2 := 0, 0
+	ok1, ok2 := len(id1) > 5 && id1[:5] == "call_", len(id2) > 5 && id2[:5] == "call_"
+	if ok1 {
+		for i in 5 ..< len(id1) {
+			c := id1[i]
+			if c < '0' || c > '9' { ok1 = false; break }
+			n1 = n1 * 10 + int(c - '0')
+		}
+	}
+	if ok2 {
+		for i in 5 ..< len(id2) {
+			c := id2[i]
+			if c < '0' || c > '9' { ok2 = false; break }
+			n2 = n2 * 10 + int(c - '0')
+		}
+	}
+	check("tool-call ids unique across responses", id1 != id2 && ok1 && ok2 && n2 == n1 + 1 && id2 != "call_0", &pass, &total)
+
+	// 7 tools in the schema, 6 extra "function" objects in history. The old
+	// whole-body scan reported 13. A reused table also drops the stale name.
+	names := [?]string{"bash", "read", "write", "ls", "glob", "grep", "memory"}
+	tb: strings.Builder
+	strings.builder_init(&tb, context.allocator)
+	defer strings.builder_destroy(&tb)
+	strings.write_string(&tb, `{"messages":[{"role":"assistant","content":" ","tool_calls":[`)
+	for hi in 0 ..< 6 {
+		if hi > 0 { strings.write_string(&tb, ",") }
+		strings.write_string(&tb, `{"id":"call_h","function":{"name":"h`)
+		strings.write_string(&tb, fmt.tprintf("%d", hi))
+		strings.write_string(&tb, `","arguments":{"path":"."}}}`)
+	}
+	strings.write_string(&tb, `]}],"tools":[`)
+	for name, ni in names {
+		if ni > 0 { strings.write_string(&tb, ",") }
+		strings.write_string(&tb, `{"type":"function","function":{"name":"`)
+		strings.write_string(&tb, name)
+		strings.write_string(&tb, `","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}`)
+	}
+	strings.write_string(&tb, `]}`)
+	spec_body := strings.to_string(tb)
+	spec_table: sampler.TCG_Table
+	_ = sampler.tcg_table_add_tool(&spec_table, "stale_from_previous_request")
+	extract_tool_specs(spec_body, &spec_table)
+	names_ok := spec_table.n_tools == 7
+	if names_ok {
+		for name, ni in names {
+			if spec_table.tools[ni].name != name || spec_table.tools[ni].n_params != 1 || spec_table.tools[ni].params[0] != "command" {
+				names_ok = false
+				break
+			}
+		}
+	}
+	check("tool-grammar count stays 7 across history (not 13)", names_ok, &pass, &total)
+	extract_tool_specs(`{"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"not_a_tool","arguments":{"path":"x"}}},{"function":{"name":"h0","arguments":{}}}]}],"tools":[{"type":"function","function":{"name":"only_a","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}},{"type":"function","function":{"name":"only_b","parameters":{"type":"object","properties":{}}}}]}`, &spec_table)
+	check("tool-grammar resets on the next request", spec_table.n_tools == 2 && spec_table.tools[0].name == "only_a" && spec_table.tools[1].name == "only_b", &pass, &total)
+
+	tok: tok35.Tokenizer
+	tok35.build_tokenizer(&tok)
+	defer tok35.free_tokenizer(&tok)
+	ea, ea_err := tok35.encode(&tok, pa)
+	eb, eb_err := tok35.encode(&tok, pb)
+	em, em_err := tok35.encode(&tok, pm)
+	check("tokenize three history shapes", ea_err == nil && eb_err == nil && em_err == nil && len(ea) > 0, &pass, &total)
+	check("three shapes identical prompt tokens", ids_equal(ea, eb) && ids_equal(ea, em), &pass, &total)
+	ep, ep_err := tok35.encode(&tok, prefix)
+	pref_ok := ep_err == nil && len(ep) > 0 && len(ep) < len(ea)
+	if pref_ok {
+		for i in 0 ..< len(ep) {
+			if ea[i] != ep[i] || eb[i] != ep[i] || em[i] != ep[i] {
+				pref_ok = false
+				break
+			}
+		}
+	}
+	check("cached-turn token prefix shared", pref_ok, &pass, &total)
+	if pref_ok {
+		fmt.eprintfln("self-test: cached-turn prefix %d/%d tokens identical across echo, blank, and tool_calls-only", len(ep), len(ea))
+	}
+	return
 }
 
 // ====================== end tool calling helpers ======================
@@ -1385,17 +1629,35 @@ tcg_scan_json_string :: proc(text: string, start: int) -> (string, int, bool) {
 // grammar table. Heuristic depth-1 scan of parameters.properties; when no
 // properties are found the tool degrades to "any parameter key allowed".
 // Returned strings alias `body`, which outlives the request handler.
+//
+// The scan is only the top-level tools array (outside "messages"). Assistant
+// history carries its own "function" objects; counting those made
+// "tool-grammar ON (N tools)" grow on every turn (7 → 13) while the client
+// kept sending the same tools. n_tools is reset on every call.
 extract_tool_specs :: proc(body: string, table: ^sampler.TCG_Table) {
+	old_n := table.n_tools
+	for i in 0 ..< old_n {
+		table.tools[i].name = ""
+		table.tools[i].n_params = 0
+	}
 	table.n_tools = 0
+	mlo, mhi, _ := find_json_array(body, "messages", 0, 0)
+	skip_lo, skip_hi := 0, 0
+	if mhi > mlo {
+		skip_lo, skip_hi = mlo, mhi
+	}
+	tlo, thi, tok := find_json_array(body, "tools", skip_lo, skip_hi)
+	if !tok { return }
+	tools_json := body[tlo:thi]
 	search := 0
 	for table.n_tools < sampler.TCG_MAX_TOOLS {
-		rel := strings.index(body[search:], `"function"`)
+		rel := strings.index(tools_json[search:], `"function"`)
 		if rel < 0 { break }
 		fi := search + rel
 		// Find the { that opens the function object
 		obj_start := -1
-		for j := fi + len(`"function"`); j < len(body); j += 1 {
-			c := body[j]
+		for j := fi + len(`"function"`); j < len(tools_json); j += 1 {
+			c := tools_json[j]
 			if c == '{' { obj_start = j; break }
 			if c == '}' || c == ']' { break }
 		}
@@ -1404,8 +1666,8 @@ extract_tool_specs :: proc(body: string, table: ^sampler.TCG_Table) {
 		depth := 1
 		j := obj_start + 1
 		in_str := false
-		for j < len(body) && depth > 0 {
-			c := body[j]
+		for j < len(tools_json) && depth > 0 {
+			c := tools_json[j]
 			if in_str {
 				if c == '\\' { j += 1 }
 				else if c == '"' { in_str = false }
@@ -1416,7 +1678,7 @@ extract_tool_specs :: proc(body: string, table: ^sampler.TCG_Table) {
 			}
 			j += 1
 		}
-		region := body[obj_start:j]
+		region := tools_json[obj_start:j]
 		search = j
 		// name
 		name := ""
@@ -1660,60 +1922,13 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		}
 	}
 
-	// Render Qwen chat template
-	prompt_buf: strings.Builder
-	strings.builder_init(&prompt_buf, context.allocator)
-	defer strings.builder_destroy(&prompt_buf)
-	for m in msgs {
-		role := m.role
-		if role == "tool" {
-			// Tool result → plain user turn. Probe verdict: this model does NOT
-			// know the <tool_response> wrapper (loops with it, in either a tool
-			// or user role); a plain "工具执行结果: ..." user message is the
-			// only rendering that makes it consume the result and answer.
-			strings.write_string(&prompt_buf, "<|im_start|>user\n工具执行结果: ")
-			strings.write_string(&prompt_buf, m.content)
-			strings.write_string(&prompt_buf, "<|im_end|>\n")
-			continue
-		}
-		if role != "system" && role != "user" && role != "assistant" {
-			role = "user"
-		}
-		if role == "system" && has_tools {
-			// Tools section goes INSIDE the system block, matching the model's
-			// native chat template (and letting the prefix snapshot cache it).
-			strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>system\n%s%s<|im_end|>\n",
-				m.content, extract_tools_section(body)))
-			continue
-		}
-		if role == "assistant" {
-			// Render past assistant turns with the same empty think stub the
-			// generation prompt uses (line below: "<|im_start|>assistant\n
-			// <think>\n\n</think>\n"). Without it, last_tokens (prompt incl.
-			// stub + generated ids) and any follow-up request diverge right
-			// after "assistant\n", so the continuation path could NEVER hit
-			// in chat — every multi-turn request fell back to the system
-			// snapshot and re-prefilled the whole conversation. Keeping the
-			// stub in history makes the token stream structurally identical
-			// between full prefill and continuation, preserving the
-			// bit-identical invariant.
-			strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
-			strings.write_string(&prompt_buf, m.content)
-			// Re-render tool calls in JSON form inside <tool_call>. Dropping
-			// them (the old behavior) hid the model's own calls from history
-			// — it re-called the same tool forever; and the NATIVE form
-			// (byte-identical to generation) still loops, per template probe.
-			if len(m.tool_calls_raw) > 0 {
-				render_json_tool_calls(&prompt_buf, m.tool_calls_raw)
-			}
-			strings.write_string(&prompt_buf, "<|im_end|>\n")
-			continue
-		}
-		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
+	// Tools section goes INSIDE the system block, matching the model's native
+	// chat template (and letting the prefix snapshot cache it).
+	tools_section := ""
+	if has_tools {
+		tools_section = extract_tools_section(body)
 	}
-	strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
-
-	prompt := strings.clone(strings.to_string(prompt_buf))
+	prompt := render_ollama_prompt(msgs, has_tools, tools_section)
 	defer delete(prompt)
 
 	encoded, err := tok35.encode(&g_state.tok, prompt)
@@ -1942,19 +2157,25 @@ handle_ollama_chat_stream :: proc(client: net.TCP_Socket, body: string) {
 		ndjson_write(client, line)
 	}
 
-	// Decode the full accumulated text for tool-call parsing (not for streaming —
-	// streamed tokens were already emitted raw above).
-	full_text := decode_unicode_escapes(strings.to_string(gen_buf))
+	// raw_gen is what was streamed and what last_tokens decode to. full_text
+	// may rewrite literal \uXXXX for the parser; the continuation cache needs
+	// the raw bytes.
+	raw_gen := strings.to_string(gen_buf)
+	full_text := decode_unicode_escapes(raw_gen)
 
 	// When tools are present, parse for <tool_call> blocks
 	if has_tools {
 		tool_calls_json := parse_tool_calls(full_text)
 		if len(tool_calls_json) > 0 {
-			// Emit each tool_call as separate NDJSON line
+			// Emit each tool_call as separate NDJSON line. Ids are session-scoped
+			// (call_N never restarts) and remember the exact generation so a
+			// later history render can reproduce it.
 			for idx in 0 ..< len(tool_calls_json) {
 				tc := tool_calls_json[idx]
+				id := alloc_tool_call_id()
+				remember_tool_generation(id, raw_gen)
 				line := concat_json(
-					`{"message":{"role":"assistant","content":"","tool_calls":[{"index":`, fmt.tprintf("%d", idx), `,"id":"call_`, fmt.tprintf("%d", idx), `","function":`, tc, `}]},"done":false}`)
+					`{"message":{"role":"assistant","content":"","tool_calls":[{"index":`, fmt.tprintf("%d", idx), `,"id":"`, id, `","function":`, tc, `}]},"done":false}`)
 				ndjson_write(client, line)
 			}
 			finish_reason = "tool_calls"
@@ -2246,15 +2467,15 @@ index_from :: proc(s, sub: string, from: int) -> int {
 	return from + rel
 }
 
-// Extract all "content":"..." strings that are inside "role":"..." objects.
-// Very lenient: scans the messages array, extracts (role, content) pairs in
-// order. Ignores everything else (tool_calls, function_call, name, etc).
+// Extract (role, content, tool_calls) objects in order. Content may be a
+// string, JSON null, or absent — an assistant turn that only carries
+// tool_calls must still be kept, and the scan must not stop there.
 openai_extract_messages :: proc(json: string) -> []Message_Pair {
 	out: [dynamic]Message_Pair
 	out = make([dynamic]Message_Pair, 0, 8)
 	defer delete(out)
-	// Scan for "role" then next "content" — handles whitespace after colons
-	// (standard JSON: "role": "user" vs compact: "role":"user")
+	// Scan for "role" then the content in this message — handles whitespace
+	// after colons (standard JSON: "role": "user" vs compact: "role":"user")
 	i := 0
 	for i < len(json) - 6 {
 		role_idx := index_from(json, `"role"`, i)
@@ -2266,48 +2487,67 @@ openai_extract_messages :: proc(json: string) -> []Message_Pair {
 		r_end := index_from(json, `"`, r_val_start)
 		if r_end < 0 { break }
 		role := json[r_val_start:r_end]
+		// This message runs up to the next "role" key.
+		next_role := index_from(json, `"role"`, r_end + 1)
+		span_end := next_role >= 0 ? next_role : len(json)
+
+		content := ""
+		content_end := r_end
 		c_idx := index_from(json, `"content"`, r_end)
-		if c_idx < 0 { break }
-		c_val_start := c_idx + len(`"content"`)
-		for c_val_start < len(json) && (json[c_val_start] == ' ' || json[c_val_start] == '\t' || json[c_val_start] == ':') { c_val_start += 1 }
-		if c_val_start >= len(json) || json[c_val_start] != '"' { i = c_idx + 1; continue }
-		c_val_start += 1
-		j := c_val_start
-		content_buf: strings.Builder
-		strings.builder_init(&content_buf, context.temp_allocator)
-		for j < len(json) {
-			ch := json[j]
-			if ch == '\\' && j + 1 < len(json) {
-				j += 1
-				switch json[j] {
-				case 'n':  strings.write_byte(&content_buf, byte('\n'))
-				case 't':  strings.write_byte(&content_buf, byte('\t'))
-				case 'r':  strings.write_byte(&content_buf, byte('\r'))
-				case '"':  strings.write_byte(&content_buf, byte('"'))
-				case '\\': strings.write_byte(&content_buf, byte('\\'))
-				case '/':  strings.write_byte(&content_buf, byte('/'))
-				case 'u':  j += write_json_unicode_escape(&content_buf, json, j)
-				case:      strings.write_byte(&content_buf, json[j])
-				}
-			} else if ch == '"' {
-				break
-			} else {
-				strings.write_byte(&content_buf, ch)
+		if c_idx >= 0 && c_idx < span_end {
+			c_val_start := c_idx + len(`"content"`)
+			for c_val_start < len(json) && (json[c_val_start] == ' ' || json[c_val_start] == '\t' || json[c_val_start] == ':' || json[c_val_start] == '\n' || json[c_val_start] == '\r') {
+				c_val_start += 1
 			}
-			j += 1
+			if c_val_start < len(json) && json[c_val_start] == '"' {
+				c_val_start += 1
+				j := c_val_start
+				content_buf: strings.Builder
+				strings.builder_init(&content_buf, context.temp_allocator)
+				for j < len(json) {
+					ch := json[j]
+					if ch == '\\' && j + 1 < len(json) {
+						j += 1
+						switch json[j] {
+						case 'n':  strings.write_byte(&content_buf, byte('\n'))
+						case 't':  strings.write_byte(&content_buf, byte('\t'))
+						case 'r':  strings.write_byte(&content_buf, byte('\r'))
+						case '"':  strings.write_byte(&content_buf, byte('"'))
+						case '\\': strings.write_byte(&content_buf, byte('\\'))
+						case '/':  strings.write_byte(&content_buf, byte('/'))
+						case 'u':  j += write_json_unicode_escape(&content_buf, json, j)
+						case:      strings.write_byte(&content_buf, json[j])
+						}
+					} else if ch == '"' {
+						break
+					} else {
+						strings.write_byte(&content_buf, ch)
+					}
+					j += 1
+				}
+				content = strings.clone(strings.to_string(content_buf))
+				strings.builder_destroy(&content_buf)
+				content_end = j
+			} else if c_val_start + 4 <= len(json) && json[c_val_start:c_val_start + 4] == "null" {
+				content = strings.clone("")
+				content_end = c_val_start + 4
+			} else {
+				// Non-string content. Keep the message so tool_calls survive.
+				content = strings.clone("")
+				content_end = c_val_start
+			}
+		} else {
+			content = strings.clone("")
 		}
-		// Capture a "tool_calls" array belonging to THIS message (between the
-		// end of its content and the next message's "role" key).
+		// tool_calls may sit before or after content. Search the whole span.
 		tc_raw := ""
 		{
-			scan_end := index_from(json, `"role"`, j)
-			if scan_end < 0 { scan_end = len(json) }
-			tc_idx := index_from(json, `"tool_calls"`, j)
-			if tc_idx >= 0 && tc_idx < scan_end {
+			tc_idx := index_from(json, `"tool_calls"`, r_end)
+			if tc_idx >= 0 && tc_idx < span_end {
 				arr_start := tc_idx + len(`"tool_calls"`)
-				for arr_start < scan_end && (json[arr_start] == ' ' || json[arr_start] == '\t' ||
-					json[arr_start] == ':' || json[arr_start] == '\n') { arr_start += 1 }
-				if arr_start < scan_end && json[arr_start] == '[' {
+				for arr_start < span_end && (json[arr_start] == ' ' || json[arr_start] == '\t' ||
+					json[arr_start] == ':' || json[arr_start] == '\n' || json[arr_start] == '\r') { arr_start += 1 }
+				if arr_start < span_end && json[arr_start] == '[' {
 					if arr_end, ok := json_balanced_end(json, arr_start); ok {
 						tc_raw = strings.clone(json[arr_start:arr_end])
 					}
@@ -2316,11 +2556,10 @@ openai_extract_messages :: proc(json: string) -> []Message_Pair {
 		}
 		append(&out, Message_Pair{
 			role = role,
-			content = strings.clone(strings.to_string(content_buf)),
+			content = content,
 			tool_calls_raw = tc_raw,
 		})
-		strings.builder_destroy(&content_buf)
-		i = j + 1
+		i = max(content_end, r_end) + 1
 	}
 	result := make([]Message_Pair, len(out))
 	for k in 0 ..< len(out) { result[k] = out[k] }
@@ -2368,6 +2607,93 @@ json_balanced_end :: proc(s: string, start: int) -> (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+is_json_ws :: proc(c: u8) -> bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// Index span [lo, hi) of the array value for the first "key" that is a JSON
+// key (followed by ':') and whose key position is outside [skip_lo, skip_hi).
+// skip_hi <= skip_lo disables the skip.
+find_json_array :: proc(body, key: string, skip_lo, skip_hi: int) -> (lo: int, hi: int, ok: bool) {
+	// Stack needle. fmt.tprintf uses the temp allocator; delete() frees with
+	// context.allocator and segfaults when that is the heap (self-test).
+	buf: [80]u8
+	if len(key) + 2 > len(buf) { return 0, 0, false }
+	buf[0] = '"'
+	for i in 0 ..< len(key) {
+		buf[1 + i] = key[i]
+	}
+	buf[len(key) + 1] = '"'
+	needle := string(buf[:len(key) + 2])
+	search := 0
+	for search < len(body) {
+		rel := strings.index(body[search:], needle)
+		if rel < 0 { return 0, 0, false }
+		at := search + rel
+		search = at + len(needle)
+		if skip_hi > skip_lo && at >= skip_lo && at < skip_hi { continue }
+		i := at + len(needle)
+		for i < len(body) && is_json_ws(body[i]) { i += 1 }
+		if i >= len(body) || body[i] != ':' { continue }
+		i += 1
+		for i < len(body) && is_json_ws(body[i]) { i += 1 }
+		if i >= len(body) || body[i] != '[' { continue }
+		end, balanced := json_balanced_end(body, i)
+		if !balanced { continue }
+		return i, end, true
+	}
+	return 0, 0, false
+}
+
+// Index just past the JSON value that starts at s[start].
+json_value_end :: proc(s: string, start: int) -> (int, bool) {
+	if start >= len(s) { return 0, false }
+	switch s[start] {
+	case '"':
+		p := start + 1
+		for p < len(s) {
+			if s[p] == '\\' { p += 2; continue }
+			if s[p] == '"' { return p + 1, true }
+			p += 1
+		}
+		return 0, false
+	case '{', '[':
+		return json_balanced_end(s, start)
+	case:
+		p := start
+		for p < len(s) && s[p] != ',' && s[p] != '}' && s[p] != ']' && !is_json_ws(s[p]) {
+			p += 1
+		}
+		return p, p > start
+	}
+}
+
+// Raw value text of a depth-1 key. Nested objects are not searched, so an
+// arguments field named "name" is not mistaken for the function name.
+json_object_key :: proc(obj, want: string) -> (string, bool) {
+	if len(obj) == 0 || obj[0] != '{' { return "", false }
+	i := 1
+	for i < len(obj) {
+		for i < len(obj) && obj[i] != '"' && obj[i] != '}' { i += 1 }
+		if i >= len(obj) || obj[i] == '}' { break }
+		inner, next, ok := tcg_scan_json_string(obj, i)
+		if !ok { break }
+		i = next
+		for i < len(obj) && is_json_ws(obj[i]) { i += 1 }
+		if i >= len(obj) || obj[i] != ':' { break }
+		i += 1
+		for i < len(obj) && is_json_ws(obj[i]) { i += 1 }
+		if i >= len(obj) { break }
+		vend, vok := json_value_end(obj, i)
+		if !vok { break }
+		if inner == want {
+			return obj[i:vend], true
+		}
+		i = vend
+	}
+	return "", false
 }
 
 // Extract the raw (balanced) value text for "key" in a flat JSON object.
@@ -2436,17 +2762,50 @@ json_unescape_into :: proc(b: ^strings.Builder, lit: string) {
 	}
 }
 
-// Re-render one request-side tool_call element ({"id":..,"function":{...}})
-// for history. Empirically (probe: 4 template variants x greedy decode) this
-// model only recognizes a COMPLETED tool call when history shows the JSON
-// form — the native <function=...> form (what the model actually generates
-// under the tool-call grammar) pattern-matches as "about to call" and the
-// model re-calls the same tool forever. JSON form + a plain user-role result
-// breaks the loop. The function object is emitted verbatim (byte-stable).
-render_json_tool_calls :: proc(b: ^strings.Builder, raw_array: string) {
+content_has_tool_markup :: proc(s: string) -> bool {
+	return strings.contains(s, "<tool_call>") || strings.contains(s, "<function=")
+}
+
+// First stored generation whose id appears in this message's tool_calls.
+// Every id from one response maps to that response's full assistant text.
+lookup_stored_generation :: proc(raw_array: string) -> (string, bool) {
+	if g_tool_gen_text == nil || len(raw_array) == 0 {
+		return "", false
+	}
+	search := 0
+	for search < len(raw_array) {
+		rel := strings.index(raw_array[search:], `"id"`)
+		if rel < 0 { break }
+		at := search + rel
+		i := at + len(`"id"`)
+		for i < len(raw_array) && is_json_ws(raw_array[i]) { i += 1 }
+		if i >= len(raw_array) || raw_array[i] != ':' {
+			search = at + len(`"id"`)
+			continue
+		}
+		i += 1
+		for i < len(raw_array) && is_json_ws(raw_array[i]) { i += 1 }
+		if i >= len(raw_array) || raw_array[i] != '"' {
+			search = at + len(`"id"`)
+			continue
+		}
+		inner, next, ok := tcg_scan_json_string(raw_array, i)
+		if !ok { break }
+		if text, hit := g_tool_gen_text[inner]; hit {
+			return text, true
+		}
+		search = next
+	}
+	return "", false
+}
+
+// Native <tool_call><function=...><parameter=...> form, matching the grammar
+// literals the model emits (newline before each tag, value on its own lines).
+render_native_tool_calls :: proc(b: ^strings.Builder, raw_array: string) {
 	i := strings.index(raw_array, "[")
 	if i < 0 { return }
 	i += 1
+	first := true
 	for i < len(raw_array) {
 		for i < len(raw_array) && raw_array[i] != '{' && raw_array[i] != ']' { i += 1 }
 		if i >= len(raw_array) || raw_array[i] == ']' { break }
@@ -2455,12 +2814,129 @@ render_json_tool_calls :: proc(b: ^strings.Builder, raw_array: string) {
 		elem := raw_array[i:elem_end]
 		i = elem_end
 
-		fn_raw, fok := json_raw_value(elem, "function")
+		fn_raw, fok := json_object_key(elem, "function")
 		if !fok { continue }
-		strings.write_string(b, "<tool_call>\n")
-		strings.write_string(b, fn_raw)
-		strings.write_string(b, "\n</tool_call>")
+		name_lit, nok := json_object_key(fn_raw, "name")
+		if !nok || len(name_lit) < 2 || name_lit[0] != '"' { continue }
+		if !first {
+			strings.write_byte(b, '\n')
+		}
+		first = false
+		strings.write_string(b, "<tool_call>\n<function=")
+		json_unescape_into(b, name_lit)
+		strings.write_byte(b, '>')
+		if args_raw, aok := json_object_key(fn_raw, "arguments"); aok {
+			write_native_arguments(b, args_raw)
+		}
+		strings.write_string(b, "\n</function>\n</tool_call>")
 	}
+}
+
+write_native_arguments :: proc(b: ^strings.Builder, args_raw: string) {
+	if len(args_raw) >= 2 && args_raw[0] == '"' {
+		tmp: strings.Builder
+		strings.builder_init(&tmp, context.temp_allocator)
+		defer strings.builder_destroy(&tmp)
+		json_unescape_into(&tmp, args_raw)
+		write_native_arg_object(b, strings.to_string(tmp))
+		return
+	}
+	write_native_arg_object(b, args_raw)
+}
+
+write_native_arg_object :: proc(b: ^strings.Builder, obj: string) {
+	if len(obj) == 0 || obj[0] != '{' { return }
+	i := 1
+	for i < len(obj) {
+		for i < len(obj) && obj[i] != '"' && obj[i] != '}' { i += 1 }
+		if i >= len(obj) || obj[i] == '}' { break }
+		_, next, ok := tcg_scan_json_string(obj, i)
+		if !ok { break }
+		key_quoted := obj[i:next]
+		i = next
+		for i < len(obj) && is_json_ws(obj[i]) { i += 1 }
+		if i >= len(obj) || obj[i] != ':' { break }
+		i += 1
+		for i < len(obj) && is_json_ws(obj[i]) { i += 1 }
+		if i >= len(obj) { break }
+		vend, vok := json_value_end(obj, i)
+		if !vok { break }
+		val := obj[i:vend]
+		strings.write_string(b, "\n<parameter=")
+		json_unescape_into(b, key_quoted)
+		strings.write_string(b, ">\n")
+		if len(val) >= 2 && val[0] == '"' {
+			json_unescape_into(b, val)
+		} else {
+			strings.write_string(b, val)
+		}
+		strings.write_string(b, "\n</parameter>")
+		i = vend
+	}
+}
+
+// One assistant body. Markup already in content is the generation the client
+// echoed — do not append tool_calls again. Otherwise prefer the stored
+// generation (keyed by id) so a stripped " "/empty content still matches the
+// continuation cache; fall back to the native form reconstructed from
+// tool_calls.
+write_assistant_body :: proc(b: ^strings.Builder, m: Message_Pair) {
+	if content_has_tool_markup(m.content) {
+		strings.write_string(b, m.content)
+		return
+	}
+	if text, ok := lookup_stored_generation(m.tool_calls_raw); ok {
+		strings.write_string(b, text)
+		return
+	}
+	if len(m.tool_calls_raw) > 0 {
+		prose := strings.trim_space(m.content)
+		if len(prose) > 0 {
+			strings.write_string(b, prose)
+			if prose[len(prose) - 1] != '\n' {
+				strings.write_byte(b, '\n')
+			}
+		}
+		render_native_tool_calls(b, m.tool_calls_raw)
+		return
+	}
+	strings.write_string(b, m.content)
+}
+
+// Qwen3.5 chat template for /api/chat. Tool results stay a plain user turn
+// ("工具执行结果: ..."); the model does not consume a <tool_response> wrapper.
+render_ollama_prompt :: proc(msgs: []Message_Pair, has_tools: bool, tools_section: string) -> string {
+	prompt_buf: strings.Builder
+	strings.builder_init(&prompt_buf, context.allocator)
+	defer strings.builder_destroy(&prompt_buf)
+	for m in msgs {
+		role := m.role
+		if role == "tool" {
+			strings.write_string(&prompt_buf, "<|im_start|>user\n工具执行结果: ")
+			strings.write_string(&prompt_buf, m.content)
+			strings.write_string(&prompt_buf, "<|im_end|>\n")
+			continue
+		}
+		if role != "system" && role != "user" && role != "assistant" {
+			role = "user"
+		}
+		if role == "system" && has_tools {
+			strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>system\n%s%s<|im_end|>\n",
+				m.content, tools_section))
+			continue
+		}
+		if role == "assistant" {
+			// Same empty think stub as the generation prompt, so last_tokens
+			// and the next request share a prefix through "assistant\n".
+			strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
+			write_assistant_body(&prompt_buf, m)
+			strings.write_string(&prompt_buf, "<|im_end|>\n")
+			continue
+		}
+		strings.write_string(&prompt_buf, fmt.tprintf("<|im_start|>%s\n%s<|im_end|>\n", role, m.content))
+	}
+	strings.write_string(&prompt_buf, "<|im_start|>assistant\n<think>\n\n</think>\n")
+	return strings.clone(strings.to_string(prompt_buf))
 }
 
 
