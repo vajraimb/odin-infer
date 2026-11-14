@@ -167,6 +167,14 @@ g_count_launches: bool
 @(private)
 g_profile: bool
 @(private)
+g_profile_full: bool // ODINFER_CUDA_PROFILE=1 prints every kernel
+@(private)
+g_phase: bool // ODINFER_CUDA_PHASE=1 prints linear/attn/kv/norm/delta/other
+@(private)
+g_phase_ms: [6]f64
+@(private)
+g_phase_n: [6]int
+@(private)
 g_use_graph: bool
 @(private)
 g_capturing: bool
@@ -1468,11 +1476,10 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_tc2 = os.get_env("ODINFER_CUDA_TC2", context.temp_allocator) != "0"
 	// Wide tile lost to the scalar tile at 581 and 2000 tokens. Opt in.
 	g_tc2_wide = os.get_env("ODINFER_CUDA_TC2_WIDE", context.temp_allocator) == "1"
-	// Unmeasured. Same 64x64 tile as the scalar kernel, with the Q4/Q6 scale
-	// broadcast once per 32 weights. Off until a V100 A/B beats `tc`.
+	// V100S: about −26% vs the scalar tile, and the text diverged. Leave off.
 	g_tc2_block = os.get_env("ODINFER_CUDA_TC2_BLOCK", context.temp_allocator) == "1"
-	// Unmeasured. Same tc_w and the same WMMA order as the scalar tile, applied
-	// to both 64-token halves of a 128-token chunk. Off until a V100 A/B wins.
+	// V100S: bit-exact with the scalar tile, but slower (9B 581 tokens 198.6
+	// vs 208.3, 2000 tokens 192.4 vs 202.7; 27B 581 tokens 66.9 vs 70.8). Leave off.
 	g_tc2_reuse = os.get_env("ODINFER_CUDA_TC2_REUSE", context.temp_allocator) == "1"
 	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
 	// Side-buffer residual_norm was slower than accum GEMV + rmsnorm_q8
@@ -1481,12 +1488,20 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	g_q4_nc = os.get_env("ODINFER_CUDA_Q4_NC", context.temp_allocator) == "1"
 	g_q4_ilp = os.get_env("ODINFER_CUDA_Q4_ILP", context.temp_allocator) == "1"
 	g_count_launches = os.get_env("ODINFER_CUDA_LAUNCHES", context.temp_allocator) == "1"
-	g_profile = os.get_env("ODINFER_CUDA_PROFILE", context.temp_allocator) == "1"
+	g_profile_full = os.get_env("ODINFER_CUDA_PROFILE", context.temp_allocator) == "1"
+	// Same event records as PROFILE. One summary line, no per-kernel dump
+	// unless PROFILE is also set. Event sync means this run's tok/s is not
+	// the production number.
+	g_phase = os.get_env("ODINFER_CUDA_PHASE", context.temp_allocator) == "1"
+	g_profile = g_profile_full || g_phase
 	// Replay was slower than eager (9B 57.6 vs 63.0 tok/s): MemcpyHtoD_v2
 	// synced the device every token, and capture dropped split-K. =1 opts in.
 	g_use_graph = os.get_env("ODINFER_CUDA_GRAPH", context.temp_allocator) == "1"
 	if g_profile {
 		g_use_graph = false
+	}
+	if g_phase {
+		fmt.eprintln("cuda: phase on (ODINFER_CUDA_PHASE=1). Event sync is on, so tok/s from this process is not the production number. Buckets: linear attn kv norm delta other")
 	}
 	g_launches = 0
 	g_q8_valid = false
@@ -2052,6 +2067,10 @@ profile_begin :: proc() {
 	for i in 0 ..< len(g_bins) {
 		g_bins[i] = {}
 	}
+	for i in 0 ..< len(g_phase_ms) {
+		g_phase_ms[i] = 0
+		g_phase_n[i] = 0
+	}
 	if cu.gapi.event_record(g_prof_ev[0], nil) == cu.OK {
 		g_prof_name[0] = ""
 		g_prof_n = 1
@@ -2104,6 +2123,32 @@ profile_note :: proc(name: string, ms: f64) {
 	}
 	g_bins[slot].count += 1
 	g_bins[slot].ms += ms
+	if g_phase {
+		b := phase_bucket(name)
+		g_phase_ms[b] += ms
+		g_phase_n[b] += 1
+	}
+}
+
+// 0 linear (tc/gemv/mmq), 1 attn, 2 kv store, 3 norm, 4 linear-attn (delta), 5 other.
+@(private)
+phase_bucket :: proc(name: string) -> int {
+	if strings.has_prefix(name, "attn") {
+		return 1
+	}
+	if strings.has_prefix(name, "store") {
+		return 2
+	}
+	if strings.has_prefix(name, "delta") || name == "conv" || name == "l2norm" || name == "rmsnorm_gated" {
+		return 4
+	}
+	if strings.has_prefix(name, "rmsnorm") || name == "residual_norm" || name == "qnorm" {
+		return 3
+	}
+	if strings.has_prefix(name, "gemv") || strings.has_prefix(name, "tc") || name == "mmq" {
+		return 0
+	}
+	return 5
 }
 
 @(private)
@@ -2113,6 +2158,13 @@ profile_end :: proc(T, pos0: int, t0: time.Tick) {
 	}
 	profile_flush()
 	wall := time.duration_milliseconds(time.tick_diff(t0, time.tick_now()))
+	if g_phase {
+		fmt.eprintfln("cuda: phase T={} pos={} wall {:.2f} linear {:.2f} attn {:.2f} kv {:.2f} norm {:.2f} delta {:.2f} other {:.2f} ms ({} launches)",
+			T, pos0, wall, g_phase_ms[0], g_phase_ms[1], g_phase_ms[2], g_phase_ms[3], g_phase_ms[4], g_phase_ms[5], g_prof_launches)
+	}
+	if !g_profile_full {
+		return
+	}
 	nbin := g_prof_nbins
 	order := make([]int, nbin, context.temp_allocator)
 	for i in 0 ..< nbin {

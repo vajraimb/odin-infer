@@ -217,6 +217,8 @@ accumulate.
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | Peak used by `--bench-gemv` to print % of HBM |
 | `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` as one CUDA graph. The position is an async copy on the graph stream. MoE and prefill stay eager. `ODINFER_CUDA_PROFILE=1` turns the graph off |
 | `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for that forward, slowest first. The 8192-event ring is folded into name totals as it fills, so a long prefill is not truncated |
+| `ODINFER_CUDA_PHASE` | off | `=1` prints one line per forward: `linear attn kv norm delta other` milliseconds, from the same events as `PROFILE`. Tok/s in that process is not the production number. Does not change kernels |
+| `ODINFER_PHASE` | off | `=1` prints CPU milliseconds for the JSON grammar mask and the tool-call grammar mask on each sample. Zero when no grammar is installed |
 
 `cuda_selftest` also runs `residual_rmsnorm_q8` against a CPU residual add plus RMSNorm. Q4_K also runs `gemv2_q4nc_k` and `gemv2_q4x_k` (8 rows/warp, including split-K when K has at least two blocks). It runs the four-row kernel against the CPU fp32 dot for Q4_K,
 Q6_K, Q8_0, Q5_0, and Q5_K at 64×512 and at 6×256 (the tail that is not a

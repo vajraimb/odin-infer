@@ -136,6 +136,7 @@ main :: proc() {
 		}
 		defer delete(encoded)
 
+		fmt.eprintfln("cuda_smoke: bench prefill={} decode_req={} ctx={} temp=0", len(encoded) - 1, n_tokens, max_ctx)
 		t0 := time.now()
 		logits := q35.engine_forward_batch(&engine, encoded[:len(encoded) - 1], 0)
 		prefill_s := time.duration_seconds(time.diff(t0, time.now()))

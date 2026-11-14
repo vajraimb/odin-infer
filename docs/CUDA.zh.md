@@ -161,6 +161,8 @@ warp 槽。
 | `ODINFER_CUDA_PEAK_GBS` | `1134` | `--bench-gemv` 用来算峰值百分比 |
 | `ODINFER_CUDA_GRAPH` | 关 | `=1` 把稠密 `T==1` 收成一张 CUDA graph。位置用图所在 stream 上的异步拷贝。MoE 和预填充仍即时。`ODINFER_CUDA_PROFILE=1` 会关掉 graph |
 | `ODINFER_CUDA_PROFILE` | 关 | `=1` 打印这次 forward 每个内核的 GPU 时间，最慢的在前。8192 个 event 的环在写满时按内核名汇总，长 prompt 不会被截断 |
+| `ODINFER_CUDA_PHASE` | 关 | `=1` 每次 forward 打一行 `linear attn kv norm delta other` 毫秒。和 `PROFILE` 共用 event。这一进程的 tok/s 不是生产数字。不改内核 |
+| `ODINFER_PHASE` | 关 | `=1` 每次采样打印 JSON grammar 和 tool-call grammar 的 CPU 毫秒。没装 grammar 时为 0 |
 | `ODINFER_CUDA_FUSE_NORM` | 关 | `=1` 才把投影加进 `residual_rmsnorm_q8`。V100S 上比累加 GEMV 慢 |
 | `ODINFER_CUDA_Q4_NC` | 关 | `=1` 用 `ld.global.nc` 加载 Q4。V100S 上比普通 `ld.global` 慢 |
 | `ODINFER_CUDA_Q4_ILP` | 关 | `=1` 用 `gemv2_q4x`（每 warp 8 行、128 位加载、每次两个 super-block）。`--bench-gemv` 印成 `r8` |
