@@ -1,4 +1,5 @@
 *.gguf
+models/.parts/
 *.dSYM/
 *.log
 .DS_Store
