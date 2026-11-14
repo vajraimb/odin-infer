@@ -1726,7 +1726,9 @@ __device__ __forceinline__ unsigned short tc2m_elem(const unsigned char* blk, in
    step expands both nibble planes of a shared 32-byte qs group, and the
    fp16 tile is 16 KB, which is the same buffer the scalar kernel uses to
    store the WMMA result, so the SM warp cap does not drop. T<=64 stays on
-   tc2s. This kernel is ODINFER_CUDA_TC2_BLOCK=1 only. */
+   tc2s. This kernel is ODINFER_CUDA_TC2_BLOCK=1 only. On the V100S it was
+   slower than the scalar tile (9B 581 tokens 151 vs 208 tok/s) and it did
+   not match that tile's tokens. Leave it off. */
 template<int Q6>
 __device__ void tc2m_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
     const int BM = 64;
@@ -1798,6 +1800,108 @@ extern "C" __global__ void tc2m_q4_k(const unsigned char* wb, const float* x, fl
 }
 extern "C" __global__ void tc2m_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
     tc2m_run<1>(wb, x, out, n, d, T);
+}
+
+/* Same fill and the same WMMA order as tc_run. Two 64-token halves share one
+   weight tile, so a 128-token chunk dequants each weight once instead of
+   twice. No scale broadcast: that path (tc2m) was slower on the V100S and
+   disagreed with this dequant. */
+template<int KIND>
+__device__ void tc_fill_x(unsigned short* Xs, const float* x, int tid, int tbase, int k0, int n, int T) {
+    const int BM = 64;
+    const int BK = 32;
+    for (int i = tid; i < BM * BK; i += 512) {
+        int t = i / BK;
+        int kk = i - t * BK;
+        float v = 0.f;
+        if (tbase + t < T && k0 + kk < n) v = x[((size_t)tbase + t) * (size_t)n + (size_t)k0 + kk];
+        Xs[i] = f32_to_f16(v);
+    }
+}
+
+template<int KIND>
+__device__ void tc_fill_w(unsigned short* Ws, const unsigned char* wb, int tid, int n0, int k0, int n, int d) {
+    const int BN = 64;
+    const int BK = 32;
+    for (int i = tid; i < BN * BK; i += 512) {
+        int row = i / BK;
+        int kk = i - row * BK;
+        float v = 0.f;
+        if (n0 + row < d && k0 + kk < n) v = tc_w<KIND>(wb, n0 + row, k0 + kk, n);
+        Ws[i] = f32_to_f16(v);
+    }
+}
+
+__device__ void tc_mma_64(unsigned short* Xs, unsigned short* Ws, int warp,
+                          float& c0, float& c1, float& c2, float& c3, float& c4, float& c5, float& c6, float& c7) {
+    const int BK = 32;
+    int wm = warp >> 2;
+    int wn = warp & 3;
+    for (int kk = 0; kk < BK; kk += 16) {
+        unsigned a0, a1, a2, a3, a4, a5, a6, a7;
+        unsigned b0, b1, b2, b3, b4, b5, b6, b7;
+        wmma_load_a(a0, a1, a2, a3, a4, a5, a6, a7, Xs + (wm * 16) * BK + kk, BK);
+        wmma_load_b(b0, b1, b2, b3, b4, b5, b6, b7, Ws + (wn * 16) * BK + kk, BK);
+        wmma_mma(c0, c1, c2, c3, c4, c5, c6, c7, a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7);
+    }
+}
+
+__device__ void tc_flush(float* sm, float* out, int tid, int warp, int tbase, int n0, int T, int d,
+                         float c0, float c1, float c2, float c3, float c4, float c5, float c6, float c7) {
+    wmma_store(sm + warp * 256, 16, c0, c1, c2, c3, c4, c5, c6, c7);
+    __syncthreads();
+    for (int idx = tid; idx < 16 * 256; idx += 512) {
+        int w = idx >> 8;
+        int e = idx & 255;
+        int i = e >> 4;
+        int j = e & 15;
+        int tw = w >> 2;
+        int nw = w & 3;
+        int t = tbase + tw * 16 + i;
+        int row = n0 + nw * 16 + j;
+        if (t < T && row < d) out[(size_t)t * (size_t)d + row] = sm[idx];
+    }
+    __syncthreads();
+}
+
+/* Opt-in. T>64 only. ODINFER_CUDA_TC2_REUSE=1. A block owns 128 tokens by
+   64 rows and runs the scalar WMMA twice on one weight tile. */
+template<int KIND>
+__device__ void tc2r_run(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    const int BM = 64;
+    const int BN = 64;
+    const int BK = 32;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int t0 = (int)blockIdx.y * (BM * 2);
+    const int n0 = (int)blockIdx.x * BN;
+    if (t0 >= T || n0 >= d) return;
+
+    __shared__ __align__(16) unsigned char sm[16 * 256 * 4];
+    unsigned short* Xs = (unsigned short*)sm;
+    unsigned short* Xs2 = Xs + BM * BK;
+    unsigned short* Ws = Xs2 + BM * BK;
+
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f, a4 = 0.f, a5 = 0.f, a6 = 0.f, a7 = 0.f;
+    float b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f, b4 = 0.f, b5 = 0.f, b6 = 0.f, b7 = 0.f;
+    for (int k0 = 0; k0 < n; k0 += BK) {
+        tc_fill_x<KIND>(Xs, x, tid, t0, k0, n, T);
+        tc_fill_x<KIND>(Xs2, x, tid, t0 + BM, k0, n, T);
+        tc_fill_w<KIND>(Ws, wb, tid, n0, k0, n, d);
+        __syncthreads();
+        tc_mma_64(Xs, Ws, warp, a0, a1, a2, a3, a4, a5, a6, a7);
+        tc_mma_64(Xs2, Ws, warp, b0, b1, b2, b3, b4, b5, b6, b7);
+        __syncthreads();
+    }
+    tc_flush((float*)sm, out, tid, warp, t0, n0, T, d, a0, a1, a2, a3, a4, a5, a6, a7);
+    tc_flush((float*)sm, out, tid, warp, t0 + BM, n0, T, d, b0, b1, b2, b3, b4, b5, b6, b7);
+}
+
+extern "C" __global__ void tc2r_q4_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2r_run<9>(wb, x, out, n, d, T);
+}
+extern "C" __global__ void tc2r_q6_k(const unsigned char* wb, const float* x, float* out, int n, int d, int T) {
+    tc2r_run<11>(wb, x, out, n, d, T);
 }
 
 /* ---- bandwidth GEMV (T == 1) ------------------------------------------------

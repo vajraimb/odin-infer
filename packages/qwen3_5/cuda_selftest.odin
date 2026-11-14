@@ -732,6 +732,94 @@ run_tc2m :: proc(kind: ggml.GGML_Type, rows, cols, T: int, atol, rtol: f32) -> b
 	return s_report(fmt.tprintf("%s T=%d rows=%d cols=%d", name, T, rows, cols), st, atol, rtol)
 }
 
+// tc2r must match the scalar tc kernel bit for bit. A CPU tolerance of 5e-2
+// also passes kernels that disagree with each other by ~0.04, which is enough
+// to change a sampled token. This compare is the token-relevant check.
+// harsh=true uses a wider activation range so a later CPU compare is not only
+// the tiny (i%9) pattern.
+@(private)
+run_tc_pair :: proc(kind: ggml.GGML_Type, rows, cols, T: int, harsh: bool) -> bool {
+	tag := cuda_kind_tag(kind)
+	name := "tc2r_q4_k"
+	if kind == .Q6_K {
+		name = "tc2r_q6_k"
+	}
+	fn_r := s_fn(name)
+	fn_s := s_fn(fmt.tprintf("tc_%s", tag))
+	if fn_r == nil || fn_s == nil {
+		fmt.eprintf("cuda_selftest: missing %s or tc_%s\n", name, tag)
+		return false
+	}
+	raw := fill_weight(kind, rows, cols)
+	defer delete(raw)
+	x := make([]f32, T * cols)
+	defer delete(x)
+	for t in 0 ..< T {
+		for j in 0 ..< cols {
+			if harsh {
+				x[t * cols + j] = (f32((t * 13 + j * 7) % 251) - 125) * 0.5
+			} else {
+				x[t * cols + j] = (f32((t * 13 + j * 7) % 251) - 125) * 0.02
+			}
+		}
+	}
+	dw, _ := cu.alloc(len(raw))
+	dx, _ := cu.alloc(T * cols * 4)
+	dy, _ := cu.alloc(T * rows * 4)
+	dz, _ := cu.alloc(T * rows * 4)
+	defer cu.free(dw)
+	defer cu.free(dx)
+	defer cu.free(dy)
+	defer cu.free(dz)
+	cu.upload(dw, raw_data(raw), len(raw))
+	cu.upload(dx, raw_data(x), T * cols * 4)
+	wb, xx := dw, dx
+	nn, dd, tt := i32(cols), i32(rows), i32(T)
+	ys, yr := dy, dz
+	args_s := [?]rawptr{&wb, &xx, &ys, &nn, &dd, &tt}
+	args_r := [?]rawptr{&wb, &xx, &yr, &nn, &dd, &tt}
+	gx := u32((rows + 63) / 64)
+	gy_s := u32((T + 63) / 64)
+	gy_r := u32((T + 127) / 128)
+	if cu.memset(dy, 0, T * rows * 4) != cu.OK || cu.memset(dz, 0, T * rows * 4) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s memset failed\n", name)
+		return false
+	}
+	if cu.launch(fn_s, gx, gy_s, 1, 512, 1, 1, 0, args_s[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: tc_%s launch failed\n", tag)
+		return false
+	}
+	if cu.launch(fn_r, gx, gy_r, 1, 512, 1, 1, 0, args_r[:]) != cu.OK {
+		fmt.eprintf("cuda_selftest: %s launch failed\n", name)
+		return false
+	}
+	got_s := make([]f32, T * rows)
+	got_r := make([]f32, T * rows)
+	defer delete(got_s)
+	defer delete(got_r)
+	cu.download(raw_data(got_s), dy, T * rows * 4)
+	cu.download(raw_data(got_r), dz, T * rows * 4)
+	st: Case_Err
+	for i in 0 ..< T * rows {
+		s_note(&st, fmt.tprintf("%s vs tc [%d]", name, i), got_r[i], got_s[i], 0, 0)
+	}
+	// fp16 versus the fp32 CPU dot. This bound only catches a broken kernel.
+	// It is not a token-match guarantee; the bit-exact compare above is.
+	ref_atol, ref_rtol: f32 = 5e-2, 5e-2
+	if cols >= 1024 {
+		ref_atol, ref_rtol = 0.25, 0.05
+	}
+	ref := cpu_gemv(kind, raw, x[:cols], rows, cols)
+	defer delete(ref)
+	st_cpu: Case_Err
+	for i in 0 ..< rows {
+		s_note(&st_cpu, fmt.tprintf("tc %s cpu [%d]", tag, i), got_s[i], ref[i], ref_atol, ref_rtol)
+	}
+	ok_pair := s_report(fmt.tprintf("%s bit-exact vs tc T=%d rows=%d cols=%d", name, T, rows, cols), st, 0, 0)
+	ok_cpu := s_report(fmt.tprintf("tc %s vs cpu row0 T=%d rows=%d cols=%d", tag, T, rows, cols), st_cpu, ref_atol, ref_rtol)
+	return ok_pair && ok_cpu
+}
+
 @(private)
 run_elem :: proc() -> bool {
 	// RMSNorm
@@ -1370,6 +1458,26 @@ cuda_selftest :: proc() -> bool {
 		ok = false
 	}
 	if !run_tc2m(.Q6_K, 40, 512, 128, 5e-2, 5e-2) {
+		ok = false
+	}
+	// Partial rows, partial token tiles, K past one superblock, and a wide
+	// activation range. tc2r has to match scalar tc exactly on each of these.
+	pair_q4 := [?][3]int{{64, 256, 128}, {65, 512, 65}, {96, 1024, 127}, {130, 256, 129}, {40, 2048, 160}, {1, 256, 128}, {63, 512, 192}}
+	for shape in pair_q4 {
+		if !run_tc_pair(.Q4_K, shape[0], shape[1], shape[2], false) {
+			ok = false
+		}
+	}
+	if !run_tc_pair(.Q4_K, 80, 4096, 128, true) {
+		ok = false
+	}
+	pair_q6 := [?][3]int{{64, 256, 128}, {48, 512, 96}, {33, 768, 70}, {96, 1024, 200}}
+	for shape in pair_q6 {
+		if !run_tc_pair(.Q6_K, shape[0], shape[1], shape[2], false) {
+			ok = false
+		}
+	}
+	if !run_tc_pair(.Q6_K, 70, 2048, 129, true) {
 		ok = false
 	}
 	if !run_delta_chunk() {

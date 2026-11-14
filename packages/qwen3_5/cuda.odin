@@ -141,6 +141,8 @@ g_tc2_wide: bool // ODINFER_CUDA_TC2_WIDE=1: T>64 uses the 128-token tile
 @(private)
 g_tc2_block: bool // ODINFER_CUDA_TC2_BLOCK=1: T>64 uses the 64x64 block-scale tile
 @(private)
+g_tc2_reuse: bool // ODINFER_CUDA_TC2_REUSE=1: T>64 reuses one scalar weight tile across 128 tokens
+@(private)
 g_attn_batch: bool // prefill attention is one launch per chunk
 @(private)
 g_fuse_norm: bool // ODINFER_CUDA_FUSE_NORM=1: side-buffer residual_norm (slower)
@@ -205,7 +207,7 @@ k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v: cu.Func
 @(private)
 k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk: cu.Function
 @(private)
-k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6: cu.Function
+k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6: cu.Function
 
 Prof_Bin :: struct {
 	name:  string,
@@ -673,11 +675,23 @@ launch_tc :: proc(kind: ggml.GGML_Type, w, x, y: cu.Device_Ptr, n, d, tcount: in
 		// slower than the scalar tile (9B 581: 124.5 vs 138.9 tok/s, 2000:
 		// 71.9 vs 76.7; 27B 581: 50.9 vs 53.1), so the scalar tile is the
 		// default there. ODINFER_CUDA_TC2_WIDE=1 opts into tc2w.
-		// ODINFER_CUDA_TC2_BLOCK=1 opts into tc2m (same 64x64 shape, scale
-		// broadcast once per 32). Not measured. It wins if both are set.
+		// ODINFER_CUDA_TC2_BLOCK=1 is the rejected scale-broadcast tile.
+		// ODINFER_CUDA_TC2_REUSE=1 dequants the scalar tile once per 128 tokens.
 		use_small := tcount <= 64
-		use_wide := g_tc2_wide && tcount > 64 && !g_tc2_block
-		use_block := g_tc2_block && tcount > 64
+		use_reuse := g_tc2_reuse && tcount > 64
+		use_wide := g_tc2_wide && tcount > 64 && !g_tc2_block && !g_tc2_reuse
+		use_block := g_tc2_block && tcount > 64 && !g_tc2_reuse
+		if use_reuse {
+			fn := k_tc2r_q4
+			if kind == .Q6_K {
+				fn = k_tc2r_q6
+			}
+			if fn != nil {
+				gx := u32((d + 63) / 64)
+				gy := u32((tcount + 127) / 128)
+				return klaunch(fn, gx, gy, 1, 512, 1, 1, args[:], "tc2r")
+			}
+		}
 		if use_block {
 			fn := k_tc2m_q4
 			if kind == .Q6_K {
@@ -1106,6 +1120,8 @@ bind_kernels :: proc() -> bool {
 	k_tc2s_q6 = get_fn("tc2s_q6_k")
 	k_tc2m_q4 = get_fn("tc2m_q4_k")
 	k_tc2m_q6 = get_fn("tc2m_q6_k")
+	k_tc2r_q4 = get_fn("tc2r_q4_k")
+	k_tc2r_q6 = get_fn("tc2r_q6_k")
 	k_rmsgate = get_fn("rmsnorm_gated")
 	k_rmsgate_q = get_fn("rmsnorm_gated_quant")
 	k_moe_topk = get_fn("moe_softmax_topk")
@@ -1127,7 +1143,7 @@ bind_kernels :: proc() -> bool {
 		k_store_f16, k_attn_f16, k_store_q8, k_attn_q8, k_store_q8v, k_attn_q8v,
 		k_conv, k_l2, k_delta, k_delta_chunk, k_rmsgate, k_rmsgate_q, k_moe_topk,
 		k_gate_q, k_swiglu_q,
-		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6,
+		k_tc2_q4, k_tc2_q6, k_tc2s_q4, k_tc2s_q6, k_tc2m_q4, k_tc2m_q6, k_tc2r_q4, k_tc2r_q6,
 		k_quant, k_rmsnorm_q8, k_res_norm, k_gemv2_q4, k_gemv2_q4nc, k_gemv2_q4x, k_gemv2_q6, k_gemv2_q6s, k_gemv2_q5k, k_gemv2_q8, k_gemv2_q50,
 		k_gemv2r1_q4, k_gemv2r1_q6,
 	}
@@ -1455,6 +1471,9 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	// Unmeasured. Same 64x64 tile as the scalar kernel, with the Q4/Q6 scale
 	// broadcast once per 32 weights. Off until a V100 A/B beats `tc`.
 	g_tc2_block = os.get_env("ODINFER_CUDA_TC2_BLOCK", context.temp_allocator) == "1"
+	// Unmeasured. Same tc_w and the same WMMA order as the scalar tile, applied
+	// to both 64-token halves of a 128-token chunk. Off until a V100 A/B wins.
+	g_tc2_reuse = os.get_env("ODINFER_CUDA_TC2_REUSE", context.temp_allocator) == "1"
 	g_attn_batch = os.get_env("ODINFER_CUDA_ATTN_BATCH", context.temp_allocator) != "0"
 	// Side-buffer residual_norm was slower than accum GEMV + rmsnorm_q8
 	// (9B 1.99 vs 1.41 ms, 27B 4.96 vs 3.53). Opt in.
@@ -1668,8 +1687,10 @@ cuda_init :: proc(t: ^Transformer, model_path: string) -> bool {
 	}
 	fmt.eprintfln("cuda: tensor cores %s  WMMA 16x16x16 fp16, fp32 acc", tc_note)
 	if g_tc2 {
-		wide_note := "T<=64 is the 32-token tile; larger T uses the scalar tile (ODINFER_CUDA_TC2_BLOCK=1 is the 64x64 block-scale tile, ODINFER_CUDA_TC2_WIDE=1 is the 128-token tile)"
-		if g_tc2_block {
+		wide_note := "T<=64 is the 32-token tile; larger T uses the scalar tile (ODINFER_CUDA_TC2_REUSE=1 reuses that tile across 128 tokens)"
+		if g_tc2_reuse {
+			wide_note = "T<=64 is the 32-token tile, T>64 reuses one scalar weight tile across 128 tokens (ODINFER_CUDA_TC2_REUSE=1)"
+		} else if g_tc2_block {
 			wide_note = "T<=64 is the 32-token tile, T>64 is the 64x64 block-scale tile (ODINFER_CUDA_TC2_BLOCK=1)"
 		} else if g_tc2_wide {
 			wide_note = "T<=64 is the 32-token tile, T>64 is the 128-token tile"
