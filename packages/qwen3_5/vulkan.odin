@@ -105,6 +105,8 @@ g_on: bool
 @(private)
 g_exact: bool
 @(private)
+g_f32_up: bool
+@(private)
 g_info: vkr.Info
 @(private)
 g_act: vkr.Buffer
@@ -699,6 +701,13 @@ free_wref :: proc(w: ^Wref) {
 make_pipes :: proc() -> bool {
 	ex := os.get_env("ODINFER_VULKAN_EXACT", context.temp_allocator)
 	par := os.get_env("ODINFER_VULKAN_PARALLEL", context.temp_allocator)
+	// ODINFER_VULKAN_F32UP=1 dequantizes every weight to F32 on upload and runs
+	// the F32 GEMV instead of the native-quant kernels: the per-thread
+	// dst[256] dequant buffer in gemv.comp spills to scratch on real GPUs
+	// (lavapipe hides it), and a 248k-row output GEMV then exceeds the Windows
+	// 2s TDR — ERROR_DEVICE_LOST mid-generation. F32 costs 4x weight bytes but
+	// is memory-bound and TDR-safe.
+	g_f32_up = os.get_env("ODINFER_VULKAN_F32UP", context.temp_allocator) == "1"
 	g_exact = true
 	if ex != "" {
 		g_exact = ex != "0"
@@ -1027,7 +1036,7 @@ gpu_kind :: proc(k: ggml.GGML_Type, cols: int) -> (u32, bool) {
 upload_tensor :: proc(tensor: Tensor, rows, cols: int) -> Wref {
 	kind, okk := gpu_kind(tensor.kind, cols)
 	rb := ggml.row_byte_size(tensor.kind, cols)
-	if okk && len(tensor.data) >= rows * rb {
+	if okk && !g_f32_up && len(tensor.data) >= rows * rb {
 		src := tensor.data[:rows * rb]
 		return place_parts(src, nil, kind, rows, cols, rb)
 	}
