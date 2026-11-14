@@ -78,7 +78,13 @@ matmul_t :: proc(xout, x: []f32, w: ^Tensor, n, d: int) {
 	ensure_matmul()
 	rb := ggml.row_byte_size(w.kind, n)
 
-	ctx := Matmul_Context {
+	// Heap, not a stack local. pool_add_task is @(synchronizes=.Release) and
+	// stores the pointer for another thread; a stack address warns. The
+	// workers are joined before this returns, then the context is freed.
+	// The row split and the dot are unchanged.
+	ctx := new(Matmul_Context)
+	defer free(ctx)
+	ctx^ = Matmul_Context {
 		kind      = w.kind,
 		w         = w.data,
 		x         = x,
@@ -90,15 +96,15 @@ matmul_t :: proc(xout, x: []f32, w: ^Tensor, n, d: int) {
 	}
 
 	if matmul_num_threads <= 1 {
-		run_rows(&ctx, 0)
+		run_rows(ctx, 0)
 		return
 	}
 
 	for t in 0 ..< matmul_num_threads - 1 {
-		thread.pool_add_task(&matmul_pool, context.allocator, matmul_worker, &ctx, t)
+		thread.pool_add_task(&matmul_pool, context.allocator, matmul_worker, ctx, t)
 	}
 	// Calling thread does its share using the last scratch slot.
-	run_rows(&ctx, matmul_num_threads - 1)
+	run_rows(ctx, matmul_num_threads - 1)
 
 	for thread.pool_num_outstanding(&matmul_pool) > 0 {
 		thread.yield()

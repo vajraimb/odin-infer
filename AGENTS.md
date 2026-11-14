@@ -69,6 +69,18 @@ python3 server/serve_harness/test_tune.py   # first-run autotune + cache reuse
 > `server/serve_harness/.test-serve.bin`; **they rebuild only when serve.odin
 > or packages/*.odin is newer** (max-mtime check).
 
+Linux CPU builds use the same `./build.sh` (Metal sources are `#+build darwin`).
+The CUDA backend is a separate define, not the default:
+
+```sh
+# Linux, driver + NVRTC present, no nvcc needed at compile time
+./scripts/cuda_check.sh
+# or: -define:ODINFER_BACKEND="cuda"  -collection:cuda=packages
+```
+
+See [docs/CUDA.md](docs/CUDA.md). Hot path is `when GPU_METAL` / `when GPU_CUDA`;
+a binary never branches between the two.
+
 ## Run
 
 ```sh

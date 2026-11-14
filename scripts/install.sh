@@ -35,10 +35,26 @@ case "$MODEL_CHOICE" in
     MODEL="$MODEL_DIR/Qwen3.5-0.8B-MoE-A0.6B-Q4_K_M.gguf"
     ;;
   qwen9b)
-    echo "== downloading Qwen3.5-9B heretic (5.6 GB) =="
+    echo "== downloading Qwen3.5-9B heretic =="
+    echo "   Mac benchmark sha256 prefix is a692de95."
+    echo "   HF main (commit a713868aa6cd) is a re-quant, sha256 prefix b4363b57, 5780092768 bytes."
+    echo "   That blob is not pinned: it is not the cross-backend file."
     curl -fL -o "$MODEL_DIR/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf" \
       "https://huggingface.co/mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF/resolve/main/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf"
     MODEL="$MODEL_DIR/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf"
+    if command -v sha256sum >/dev/null 2>&1; then
+      SHA="$(sha256sum "$MODEL" | awk '{print $1}')"
+    else
+      SHA="$(shasum -a 256 "$MODEL" | awk '{print $1}')"
+    fi
+    echo "sha256 ${SHA}  ${MODEL}"
+    case "$SHA" in
+      a692de95*) echo "matches the Mac benchmark file" ;;
+      *)
+        echo "warning: this is not the Mac benchmark file (sha256 prefix a692de95)." >&2
+        echo "warning: do not compare tok/s against the Metal numbers with this file." >&2
+        ;;
+    esac
     ;;
   "")
     MODEL=""

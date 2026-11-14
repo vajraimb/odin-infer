@@ -38,6 +38,41 @@ Metal backend (`infer/metal.odin`) currently has no env-var knobs.
 `QPROF_*` are GPU-kernel timing ablations — they produce wrong output but let
 you isolate per-stage GPU time. Never enable in production.
 
+## CUDA backend (Linux, `-define:ODINFER_BACKEND="cuda"`)
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `ODINFER_NVRTC_PATH` | unset | Exclusive path to `libnvrtc.so.12` (sm_70) or `.13`, or the directory that contains it. CUDA 13 NVRTC cannot target compute_70; a V100 needs NVRTC 12.x (`pip install nvidia-cuda-nvrtc-cu12`). |
+| `NVRTC_DIR` | unset | Directory or soname path searched first when `ODINFER_NVRTC_PATH` is unset. For sm_70 a 13.x library there is skipped and the search continues to pip `libnvrtc.so.12` and the loader. |
+| `CUDA_DEVICE` | `0` | Device ordinal. |
+| `ODINFER_CUDA_TC` | auto | Prefill GEMM. Unset: Volta WMMA when `T≥16`. `1`: WMMA for every `T>1`. `0`: MMQ. Decode (`T==1`) stays GEMV. |
+| `ODINFER_CUDA_GEMV` | auto | Decode GEMV. Unset: dp4a bandwidth kernel; Q5_0 and Q8_0 under 16 MiB stay on the scalar kernel. `new`: bandwidth kernel for those small shapes too. `old` or `0`: scalar GEMV for everything. |
+| `ODINFER_CUDA_GEMV_ROWS` | `4` | Q4_K / Q6_K rows per warp. Unset is four. `1` selects the one-row kernel, which was slower on the V100S. |
+| `ODINFER_CUDA_GEMV_WARPS` | `8` | Warps per bandwidth-GEMV block, 1..16. V100S tuning knob. |
+| `ODINFER_CUDA_GEMV_SPLIT` | on | Q4_K / Q6_K decode with `rows≤8192` splits K four ways and `atomicAdd`s the partials. `=0` is one K range. |
+| `ODINFER_CUDA_TC2` | on | Q4_K / Q6_K prefill (K multiple of 256). `T<=64` uses the 32-token fp16 tile. `T>64` uses the scalar-dequant tile. `=0` uses the scalar tile at every T. |
+| `ODINFER_CUDA_TC2_WIDE` | off | `=1` uses the 128-token tile for `T>64`. Slower than the scalar tile at 581 and 2000 tokens on the V100S. |
+| `ODINFER_CUDA_TC2_BLOCK` | off | `=1` uses `tc2m`. Measured slower on the V100S and it changed a sampled token. Leave off. |
+| `ODINFER_CUDA_TC2_REUSE` | off | `=1` uses `tc2r` for `T>64` (profile name `tc2r`). The scalar tile's weight dequant is reused across 128 tokens. Unmeasured. If several `TC2_*` flags are set, this one is used. |
+| `ODINFER_CUDA_ATTN_BATCH` | on | Prefill full attention launches once per chunk (heads by tokens). `=0` launches once per token. |
+| `ODINFER_CUDA_FUSE_NORM` | off | `=1` writes the projection to a side buffer and fuses the add with the next RMSNorm and its q8 store. Slower than the accum GEMV plus `rmsnorm_q8` on the V100S. |
+| `ODINFER_CUDA_Q4_NC` | off | `=1` uses `ld.global.nc` for the Q4 GEMV. Slower than plain `ld.global` on the V100S. |
+| `ODINFER_CUDA_Q4_ILP` | off | `=1` uses `gemv2_q4x` (8 rows/warp, coherent 128-bit loads, two super-blocks per iteration). `--bench-gemv` prints it as `r8`. Not the decode default. |
+| `ODINFER_CUDA_Q6_STAGE` | auto | Unset stages a Q6 GEMV only when K≥16384 or rows>8192. `=1` stages every Q6 GEMV. `=0` uses direct loads. |
+| `ODINFER_CUDA_SMOKE_PREFILL` | unset | `cuda_smoke` only. `=N` prefills N tokens of a fixed repeated sentence instead of the short 2+2 prompt. |
+| `ODINFER_CUDA_GRAPH` | off | `=1` captures dense `T==1` decode as one CUDA graph. MoE and prefill stay eager. Off while `ODINFER_CUDA_PROFILE=1`. |
+| `ODINFER_CUDA_PROFILE` | off | `=1` prints per-kernel GPU time for each forward (disables the graph). The 8192-event ring is aggregated by kernel name as it fills, so a long prefill is complete. |
+| `ODINFER_CUDA_PHASE` | off | `=1` prints one `cuda: phase` line per forward (linear, attn, kv, norm, delta, other). Same events as `PROFILE`. Not a production tok/s. |
+| `ODINFER_PHASE` | off | `=1` prints CPU time for the grammar mask and the tool-call grammar mask on each sample. |
+| `ODINFER_CUDA_LAUNCHES` | off | `=1` prints the kernel launch count of each CUDA forward on stderr. A graph replay prints the captured count. |
+| `ODINFER_CUDA_PEAK_GBS` | `1134` | HBM peak for `cuda_kernel_test --bench-gemv` (percent of peak). |
+| `QTIMING` | off | `=1` prints per-chunk CUDA wall time on stderr. |
+| `KV_Q8` / `KV_V` | Q8 K + mixed V | Same switches as Metal. The on-disk KV snapshot format is shared. |
+| `METAL_FALLBACK` | off | `=1` lets a failed CUDA init fall back to CPU. `--cuda` / `--metal` / `-g 1` otherwise hard-error. |
+| `MOE_CPU` | off | `=1` forces the MoE path onto CPU. |
+
+`QGEMVSPEC`, `QMMQN`, `QFASTMATH`, and the tune cache are Metal-only. The CUDA build does not read them.
+
 ## CLI (`odin-infeer`)
 
 | Variable | Default | Effect                                  |

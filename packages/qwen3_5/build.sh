@@ -7,5 +7,6 @@ LIB="$(cd .. && pwd)"
 odin test . \
   -collection:ggml="$LIB" \
   -collection:qwen3_5="$LIB" \
+  -collection:cuda="$LIB" \
   -o:speed
 echo "qwen3_5 tests OK"

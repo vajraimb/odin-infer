@@ -4,9 +4,26 @@ package sampler
 
 import infer "infer:infer"
 
+import "core:fmt"
 import "core:math"
 import "core:mem"
+import "core:os"
 import "core:slice"
+import "core:time"
+
+@(private)
+g_phase_ready: bool
+@(private)
+g_phase: bool
+
+@(private)
+phase_on :: proc() -> bool {
+	if !g_phase_ready {
+		g_phase = os.get_env("ODINFER_PHASE", context.temp_allocator) == "1"
+		g_phase_ready = true
+	}
+	return g_phase
+}
 
 Prob_Index :: struct {
 	prob:  f32,
@@ -164,7 +181,14 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 
 	// Grammar-constrained: mask out tokens whose decoded bytes would violate
 	// the grammar. EOS is allowed when the grammar is in a completable state.
+	gram_ms := f64(0)
+	tool_ms := f64(0)
+	timed := phase_on()
 	if s.grammar != nil && s.token_bytes != nil {
+		t_g: time.Tick
+		if timed {
+			t_g = time.tick_now()
+		}
 		mask := make([]bool, s.vocab_size) // heap: delete() pairs with context.allocator
 		defer delete(mask)
 		compute_token_mask(s.grammar, s.vocab_size, s.token_bytes, mask)
@@ -172,11 +196,18 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 			mask[s.eos_token] = true
 		}
 		apply_mask(logits, mask)
+		if timed {
+			gram_ms = time.duration_milliseconds(time.tick_diff(t_g, time.tick_now()))
+		}
 	}
 
 	// Tool-call grammar: same masking scheme for native <tool_call> output.
 	// EOS is legal only in completable states (free prose outside a call).
 	if s.tool_grammar != nil && s.tool_grammar.enabled && s.token_bytes != nil {
+		t_g: time.Tick
+		if timed {
+			t_g = time.tick_now()
+		}
 		mask := make([]bool, s.vocab_size) // heap: delete() pairs with context.allocator
 		defer delete(mask)
 		tcg_compute_token_mask(s.tool_grammar, s.vocab_size, s.token_bytes, mask)
@@ -184,6 +215,12 @@ sample :: proc(s: ^Sampler, logits: []f32) -> int {
 			mask[s.eos_token] = tcg_is_completable(s.tool_grammar)
 		}
 		apply_mask(logits, mask)
+		if timed {
+			tool_ms = time.duration_milliseconds(time.tick_diff(t_g, time.tick_now()))
+		}
+	}
+	if timed {
+		fmt.eprintfln("phase: sample grammar {:.3f} ms  tool {:.3f} ms", gram_ms, tool_ms)
 	}
 
 	// Choose token

@@ -3,7 +3,7 @@
 BPE tokenizer for Qwen3.5 (Ornith-1.0-9B), sibling to the Qwen3 `tokenizer`
 package. Same GPT-2 byte-level BPE scheme; differs only in:
 
-- vocab (248,077 tokens: 248,044 BPE + 33 special, ids 248044..248076)
+- vocab (embedded file: 248,077 tokens: 248,044 BPE + 33 special, ids 248044..248076). `MAX_VOCAB` is 248,320 so a vocab file that fills the padded embedding table loads instead of stopping early
 - merges (247,587 rules)
 - the special-token set (33 Qwen3.5 control tokens)
 - O(1) merge lookup via a composite-key hash map (linear scan over 247k rules
@@ -11,8 +11,10 @@ package. Same GPT-2 byte-level BPE scheme; differs only in:
 - per-instance `unicode_to_byte` map (the Qwen3 package keeps it as a global,
   which races under parallel use)
 
-The embedding table is padded to 248,320; ids 248077..248319 are unused by the
-tokenizer (decode returns "" for them).
+The embedding table is padded to 248,320. With the embedded vocab, ids
+248077..248319 are unused (decode returns "" for them). A `vocab.txt` of
+248,320 lines is accepted; only a trailing newline is ignored, so token ids
+of the embedded file stay the same.
 
 ## Files
 

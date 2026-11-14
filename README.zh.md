@@ -97,11 +97,14 @@ M3 / 16GB，DeepSeek-V4-Pro-Qwen3.5-9B UNCENSORED heretic（Q4_K_M），单引�
   （`~/.odin-infer/<model>.tune`），M1/M2/M3/M4 各代自动适配
 - **内存预算**：启动打印 `mem: ... (36%) OK`，>85% 告警；16GB 机型配置见
   [docs/MEMORY.zh.md](docs/MEMORY.zh.md)
+- **Linux CUDA**（sm_70+，含 Tesla V100）：`-define:ODINFER_BACKEND="cuda"`
+  编译。驱动和 NVRTC 运行时加载。见 [docs/CUDA.zh.md](docs/CUDA.zh.md)。
+  macOS 构建仍走 Metal。
 
 ## 仓库结构
 
 ```
-packages/   ggml · infer(Qwen3 历史兼容) · qwen3_5 · qwen3_5_tokenizer · sampler · tokenizer
+packages/   ggml · infer(Qwen3 历史兼容) · qwen3_5 · qwen3_5_tokenizer · sampler · tokenizer · cuda
 server/     odin-serve（HTTP + MCP + dashboard + 集成测试）
 cli/        odin-cli
 tools/      gemm/delta/doctor/oracle harness + thermal_test.py + MoE 测试
@@ -114,6 +117,7 @@ docs/       MCP · THERMAL · MEMORY · 排障记录
 - [docs/MCP.zh.md](docs/MCP.zh.md) —— MCP 工具 schema 与客户端接入
 - [docs/MEMORY.zh.md](docs/MEMORY.zh.md) —— 内存预算配置
 - [docs/THERMAL.zh.md](docs/THERMAL.zh.md) —— 持续负载对照协议
+- [docs/CUDA.zh.md](docs/CUDA.zh.md) —— Linux CUDA 后端（sm_70+，V100）
 - [AGENTS.zh.md](AGENTS.zh.md) —— 给 AI agent 的构建/测试/使用速查
 
 ## 社区
