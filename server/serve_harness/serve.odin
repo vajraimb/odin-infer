@@ -2483,8 +2483,9 @@ handle_openai_chat :: proc(body: string) -> string {
 
 	// Optional: parse max_tokens (default 256), temperature (default 0.6)
 	max_tokens := parse_int_field(body, "max_tokens", 256)
-	temperature := parse_f32_field(body, "temperature", 0.6)
-	_ = temperature  // currently unused; could set on sampler
+	// Honor per-request temperature like the Ollama path below; 0 selects
+	// greedy argmax in the sampler.
+	g_state.samp.temperature = parse_f32_field(body, "temperature", 0.6)
 
 	// Render conversation as Qwen chat template (stateless per request)
 	prompt_buf: strings.Builder
